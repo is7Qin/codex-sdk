@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	coderws "github.com/coder/websocket"
@@ -87,8 +88,15 @@ type options struct {
 	compression  CompressionMode
 	readLimit    int64
 	pingInterval time.Duration
-	beta         string
+	beta         string // Responses WS beta 版本（默认 2026-02-04；HTTP 固定 responses=v1）
 	headers      http.Header
+
+	// 伪装层（Send 帧 / 升级与请求头）。
+	filtering    bool // Send 白名单过滤（默认开）
+	meta         *CodexMeta
+	trace        *TraceContext // 外部注入（优先于自动生成）
+	traceAuto    bool          // 自动生成 trace（默认开）
+	turnProvider func(turn uint64) string
 
 	// HTTP 专用。
 	timeout     time.Duration
@@ -101,6 +109,9 @@ func defaultOptions() options {
 		compression:  CompressionDisabled,
 		readLimit:    defaultReadLimit,
 		pingInterval: defaultPingInterval,
+		beta:         DefaultBetaWSV1,
+		filtering:    true,
+		traceAuto:    true,
 		maxLineSize:  defaultMaxLineSize,
 	}
 }
@@ -123,13 +134,17 @@ func WithPingInterval(d time.Duration) Option {
 	return func(o *options) { o.pingInterval = d }
 }
 
-// WithBeta 注入 OpenAI-Beta 头：WithBeta("2026-02-06") →
-// "OpenAI-Beta: responses_websockets=2026-02-06"。默认不注入任何上游版本参数。
+// WithBeta 设置 Responses WS 的 beta 版本（默认 DefaultBetaWSV1=2026-02-04；
+// V2 用 DefaultBetaWSV2=2026-02-06），注入
+// "OpenAI-Beta: responses_websockets=<version>"。
+// 仅作用于 WS——HTTP 路径固定注入 HTTPBetaResponsesV1，
+// 可用 WithHeader("OpenAI-Beta", ...) 覆盖。
 func WithBeta(version string) Option {
 	return func(o *options) { o.beta = version }
 }
 
-// WithHeader 注入附加请求头（WS 升级 / HTTP 请求通用）。
+// WithHeader 注入附加请求头（WS 升级 / HTTP 请求通用），覆盖默认头
+// （如 WithHeader("User-Agent", ...) 覆盖默认 codex UA）；同名多次调用为扩展。
 func WithHeader(key, value string) Option {
 	return func(o *options) {
 		if o.headers == nil {
@@ -137,6 +152,39 @@ func WithHeader(key, value string) Option {
 		}
 		o.headers.Add(key, value)
 	}
+}
+
+// WithPayloadFiltering 开关 Send 帧的顶层 key 白名单过滤（默认开；
+// 关闭后帧原样直写，零分配快速路径）。
+func WithPayloadFiltering(enabled bool) Option {
+	return func(o *options) { o.filtering = enabled }
+}
+
+// WithCodexMeta 设置 client_metadata 静态载体（值由调用方提供，
+// SDK 只组装不生成；帧内已存在的 key 不覆盖）。
+func WithCodexMeta(meta CodexMeta) Option {
+	return func(o *options) { o.meta = &meta }
+}
+
+// WithTraceContext 注入外部 trace context（WS 升级头 / HTTP 请求头 +
+// Send 帧 client_metadata 的 trace key；禁用自动生成）。
+func WithTraceContext(tc TraceContext) Option {
+	return func(o *options) { o.trace = &tc }
+}
+
+// WithTraceAuto 开关 trace 自动生成（默认开：WS 在 Dial 时生成并注入升级头，
+// 随后每个 Send 帧的 client_metadata trace key 与升级头保持一致；
+// HTTP 每请求生成并注入请求头）。
+func WithTraceAuto(enabled bool) Option {
+	return func(o *options) { o.traceAuto = enabled }
+}
+
+// WithTurnMetadata 设置 turn_metadata 内容提供回调：每次 Send 计一轮 turn
+// （从 1 起自增），以当前 turn 序号调用回调，返回值（协议约定格式的字符串，
+// 可为空=不注入）组装进 client_metadata."x-codex-turn-metadata"。
+// 优先级：帧内已存在 > CodexMeta.TurnMetadata > 本回调。
+func WithTurnMetadata(provider func(turn uint64) string) Option {
+	return func(o *options) { o.turnProvider = provider }
 }
 
 // WithTimeout 设置 HTTP 客户端总超时（http.Client.Timeout；默认 0 不设限）。
@@ -169,6 +217,13 @@ type Client struct {
 
 	pingInterval time.Duration
 
+	// 伪装层（Send 帧组装）。
+	filtering    bool
+	meta         *CodexMeta
+	trace        *TraceContext // 连接级 trace（Dial 时确定，与升级头一致）
+	turnProvider func(turn uint64) string
+	turn         atomic.Uint64
+
 	ctx       context.Context
 	cancel    context.CancelFunc
 	closeOnce sync.Once
@@ -192,16 +247,33 @@ func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, 
 		o(&cfg)
 	}
 
-	hdr := make(http.Header, 2)
+	hdr := make(http.Header, 8)
 	token, err := auth.Authorization(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
 	}
 	hdr.Set("Authorization", token)
-	if cfg.beta != "" {
-		hdr.Set("OpenAI-Beta", "responses_websockets="+cfg.beta)
+	// 伪装层默认头（WithHeader 可覆盖）。
+	hdr.Set("User-Agent", DefaultCodexUserAgent)
+	hdr.Set("Originator", DefaultOriginator)
+	hdr.Set("OpenAI-Beta", "responses_websockets="+cfg.beta)
+	// 连接级 trace：升级头与后续 Send 帧 client_metadata 的 trace key 保持一致。
+	var trace *TraceContext
+	if cfg.trace != nil {
+		trace = cfg.trace
+	} else if cfg.traceAuto {
+		t := NewTraceContext()
+		trace = &t
 	}
+	if trace != nil {
+		hdr.Set(HeaderTraceparent, trace.Traceparent)
+		if trace.Tracestate != "" {
+			hdr.Set(HeaderTracestate, trace.Tracestate)
+		}
+	}
+	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
 	for k, vals := range cfg.headers {
+		hdr.Del(k)
 		for _, v := range vals {
 			hdr.Add(k, v)
 		}
@@ -226,6 +298,10 @@ func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, 
 	c := &Client{
 		conn:         conn,
 		pingInterval: cfg.pingInterval,
+		filtering:    cfg.filtering,
+		meta:         cfg.meta,
+		trace:        trace,
+		turnProvider: cfg.turnProvider,
 		ctx:          cctx,
 		cancel:       cancel,
 	}
@@ -235,12 +311,62 @@ func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, 
 	return c, nil
 }
 
-// Send 发送一帧字节（文本帧）。frame 为完整事件体；SDK 不校验不解析，
-// Write 同步消费——Send 返回前不得复用 frame。零拷贝零额外分配。
+// Send 发送一帧字节（文本帧）。
+//
+// 伪装层默认生效（Options 可关）：白名单过滤（FilterCodexPayload，过滤后为空
+// 返回 ErrEmptyFrame 不入网）+ client_metadata 组装（CodexMeta 静态值 /
+// trace / turn_metadata；浅合并，帧内已存在的 key 不覆盖）。
+// 关闭过滤且无任何注入时为零拷贝零分配快速路径；Write 同步消费——
+// Send 返回前不得复用 frame。
 func (c *Client) Send(ctx context.Context, frame []byte) error {
+	frame, err := c.prepareFrame(frame)
+	if err != nil {
+		return err
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.conn.Write(ctx, coderws.MessageText, frame)
+}
+
+// prepareFrame 应用伪装层：白名单过滤 + client_metadata 组装。
+// 优先级：帧内已存在 > CodexMeta 静态值 > trace（连接级自动/外部）> turn 回调。
+// 全部禁用时零拷贝零分配原样返回。
+func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
+	if c.filtering {
+		var err error
+		frame, err = FilterCodexPayload(frame)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// 惰性组装 entries：无任何注入时零分配。
+	var entries []metadataEntry
+	appendEntry := func(key, value string) {
+		if value == "" {
+			return
+		}
+		if entries == nil {
+			entries = make([]metadataEntry, 0, 8)
+		}
+		entries = append(entries, metadataEntry{key, value})
+	}
+	if m := c.meta; m != nil {
+		appendEntry(codexMetaInstallationKey, m.InstallationID)
+		appendEntry(codexMetaWindowKey, m.WindowID)
+		appendEntry(codexMetaSubagentKey, m.Subagent)
+		appendEntry(codexMetaTurnMetadataKey, m.TurnMetadata)
+		appendEntry(codexMetaTraceparentKey, m.Traceparent)
+		appendEntry(codexMetaTracestateKey, m.Tracestate)
+	}
+	if c.trace != nil {
+		appendEntry(codexMetaTraceparentKey, c.trace.Traceparent)
+		appendEntry(codexMetaTracestateKey, c.trace.Tracestate)
+	}
+	if c.turnProvider != nil {
+		turn := c.turn.Add(1)
+		appendEntry(codexMetaTurnMetadataKey, c.turnProvider(turn))
+	}
+	return injectClientMetadataKeys(frame, entries), nil
 }
 
 // Recv 读取下一帧字节（文本/二进制帧原样透传，不区分帧类型不做解析）。
@@ -262,13 +388,24 @@ func (c *Client) Ping(ctx context.Context) error {
 }
 
 // Close 发起关闭握手（关闭码透传，如 StatusNormalClosure；reason ≤125 字节）。
-// 停用心跳。重复调用返回首次结果（幂等；对端已断开时返回 nil）。
+// 注意：关闭握手可能阻塞最多 ~10s（coder 写关闭帧 5s + 等对端关闭帧 5s），
+// 等不起时用 CloseNow。停用心跳。重复调用返回首次结果（幂等；
+// 对端已断开时返回 nil）。
 func (c *Client) Close(status StatusCode, reason string) error {
 	c.closeOnce.Do(func() {
 		c.cancel()
 		c.closeErr = c.conn.Close(status, reason)
 	})
 	return c.closeErr
+}
+
+// CloseNow 立即断开连接（跳过关闭握手，不等待对端），用于等不起 Close 阻塞的
+// 场景——如网关快速 failover、心跳死亡兜底。幂等；与 Close 互斥，先调用者生效。
+func (c *Client) CloseNow() {
+	c.closeOnce.Do(func() {
+		c.cancel()
+		c.closeErr = c.conn.CloseNow()
+	})
 }
 
 // heartbeat 周期性发送 WS 层 ping。Ping 失败（对端无 pong/连接已死）时
@@ -288,7 +425,7 @@ func (c *Client) heartbeat(ctx context.Context) {
 				if ctx.Err() != nil {
 					return // 本地关闭竞态：不再处理
 				}
-				_ = c.conn.CloseNow()
+				c.CloseNow()
 				return
 			}
 		}

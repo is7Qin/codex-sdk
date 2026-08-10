@@ -22,7 +22,7 @@ type HTTPClient struct {
 	auth    Auth
 	opts    options
 
-	once   sync.Once
+	mu     sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
 	client *http.Client
 }
 
@@ -37,10 +37,14 @@ func NewHTTPClient(baseURL string, auth Auth, opts ...Option) *HTTPClient {
 	return &HTTPClient{baseURL: baseURL, auth: auth, opts: cfg}
 }
 
-// CloseIdleConnections 关闭底层空闲连接（懒构建未使用时为零开销调用）。
+// CloseIdleConnections 关闭底层空闲连接（懒构建未使用时为零开销调用；
+// 与首个请求并发调用安全——内部加锁）。
 func (c *HTTPClient) CloseIdleConnections() {
-	if c.client != nil && c.client.Transport != nil {
-		if tc, ok := c.client.Transport.(*http.Transport); ok {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client != nil && client.Transport != nil {
+		if tc, ok := client.Transport.(*http.Transport); ok {
 			tc.CloseIdleConnections()
 		}
 	}
@@ -147,10 +151,25 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	}
 	req.Header.Set("Authorization", token)
 	req.Header.Set("Content-Type", "application/json")
-	if c.opts.beta != "" {
-		req.Header.Set("OpenAI-Beta", "responses_websockets="+c.opts.beta)
+	// 伪装层默认头（WithHeader 可覆盖）——HTTP 的 beta 值与 WS 不同：
+	// HTTP 固定 responses=v1，WithBeta 不作用于 HTTP。
+	req.Header.Set("User-Agent", DefaultCodexUserAgent)
+	req.Header.Set("Originator", DefaultOriginator)
+	req.Header.Set("OpenAI-Beta", HTTPBetaResponsesV1)
+	// 每请求独立 trace（外部注入优先，其次自动生成）。
+	switch {
+	case c.opts.trace != nil:
+		req.Header.Set(HeaderTraceparent, c.opts.trace.Traceparent)
+		if c.opts.trace.Tracestate != "" {
+			req.Header.Set(HeaderTracestate, c.opts.trace.Tracestate)
+		}
+	case c.opts.traceAuto:
+		tc := NewTraceContext()
+		req.Header.Set(HeaderTraceparent, tc.Traceparent)
 	}
+	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
 	for k, vals := range c.opts.headers {
+		req.Header.Del(k)
 		for _, v := range vals {
 			req.Header.Add(k, v)
 		}
@@ -163,8 +182,11 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 }
 
 // httpClient 懒构建：首次请求才创建（连接池复用；timeout/transport 可配）。
+// 加锁保证与 CloseIdleConnections 并发安全。
 func (c *HTTPClient) httpClient() *http.Client {
-	c.once.Do(func() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client == nil {
 		c.client = &http.Client{}
 		if c.opts.timeout > 0 {
 			c.client.Timeout = c.opts.timeout
@@ -172,7 +194,7 @@ func (c *HTTPClient) httpClient() *http.Client {
 		if c.opts.transport != nil {
 			c.client.Transport = c.opts.transport
 		}
-	})
+	}
 	return c.client
 }
 

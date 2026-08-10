@@ -6,21 +6,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 )
 
-// TestHTTPDoRaw：POST /v1/responses，鉴权/Beta/content-type 头注入 +
-// 非流式响应原样交付（StatusCode + Raw，不做字段解析）。
+// TestHTTPDoRaw：POST /v1/responses，鉴权/content-type 头注入 +
+// 默认 codex UA/originator + HTTP beta（responses=v1，与 WS 不同）+
+// 自动 trace 头 + 非流式响应原样交付（StatusCode + Raw，不做字段解析）。
 func TestHTTPDoRaw(t *testing.T) {
-	var gotAuth, gotBeta, gotContentType string
+	var gotAuth, gotBeta, gotContentType, gotUA, gotOriginator, gotTraceparent string
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotBeta = r.Header.Get("OpenAI-Beta")
 		gotContentType = r.Header.Get("Content-Type")
+		gotUA = r.Header.Get("User-Agent")
+		gotOriginator = r.Header.Get("Originator")
+		gotTraceparent = r.Header.Get("traceparent")
 		if r.URL.Path != "/v1/responses" {
 			http.Error(w, "bad path: "+r.URL.Path, http.StatusNotFound)
 			return
@@ -32,7 +37,7 @@ func TestHTTPDoRaw(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL+"/v1", PAT("pat-http"), WithBeta("2026-02-06"))
+	hc := NewHTTPClient(srv.URL+"/v1", PAT("pat-http"))
 	resp, err := hc.Do(context.Background(), []byte(`{"model":"gpt-5","input":"hi"}`))
 	if err != nil {
 		t.Fatalf("Do: %v", err)
@@ -40,11 +45,20 @@ func TestHTTPDoRaw(t *testing.T) {
 	if gotAuth != "Bearer pat-http" {
 		t.Fatalf("Authorization = %q", gotAuth)
 	}
-	if gotBeta != "responses_websockets=2026-02-06" {
-		t.Fatalf("OpenAI-Beta = %q", gotBeta)
+	if gotBeta != HTTPBetaResponsesV1 {
+		t.Fatalf("OpenAI-Beta = %q, 期望 %q（HTTP 与 WS 的 beta 值不同）", gotBeta, HTTPBetaResponsesV1)
 	}
 	if gotContentType != "application/json" {
 		t.Fatalf("Content-Type = %q", gotContentType)
+	}
+	if gotUA != DefaultCodexUserAgent {
+		t.Fatalf("User-Agent = %q, 期望默认 codex UA", gotUA)
+	}
+	if gotOriginator != DefaultOriginator {
+		t.Fatalf("Originator = %q, 期望 %q", gotOriginator, DefaultOriginator)
+	}
+	if !traceparentRe.MatchString(gotTraceparent) {
+		t.Fatalf("traceparent 格式不符: %q", gotTraceparent)
 	}
 	if string(gotBody) != `{"model":"gpt-5","input":"hi"}` {
 		t.Fatalf("body = %s", gotBody)
@@ -54,6 +68,25 @@ func TestHTTPDoRaw(t *testing.T) {
 	}
 	if !bytes.Equal(resp.Raw, []byte(`{"id":"resp_123","type":"response","model":"gpt-5"}`)) {
 		t.Fatalf("Raw 应原样交付完整响应体: %s", resp.Raw)
+	}
+}
+
+// TestHTTPBetaOverride：WithHeader 可覆盖 HTTP 默认 beta 头。
+func TestHTTPBetaOverride(t *testing.T) {
+	var gotBeta string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBeta = r.Header.Get("OpenAI-Beta")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(srv.URL, PAT("t"), WithHeader("OpenAI-Beta", "responses=v2"))
+	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if gotBeta != "responses=v2" {
+		t.Fatalf("OpenAI-Beta = %q, 期望覆盖为 responses=v2", gotBeta)
 	}
 }
 
@@ -198,5 +231,45 @@ func TestHTTPNilAuth(t *testing.T) {
 	hc := NewHTTPClient(srv.URL, nil)
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err == nil {
 		t.Fatal("auth 为 nil 应报错")
+	}
+}
+
+// countingListener 统计 TCP 连接数。
+type countingListener struct {
+	net.Listener
+	accepts *atomic.Int32
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.accepts.Add(1)
+	}
+	return conn, err
+}
+
+// TestHTTPConnectionReuse：同一 HTTPClient 顺序请求复用连接（keep-alive）。
+func TestHTTPConnectionReuse(t *testing.T) {
+	var accepts atomic.Int32
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x"}`))
+	}))
+	srv.Listener = &countingListener{Listener: base, accepts: &accepts}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(srv.URL, PAT("t"))
+	for i := 0; i < 3; i++ {
+		if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
+			t.Fatalf("Do #%d: %v", i, err)
+		}
+	}
+	if n := accepts.Load(); n != 1 {
+		t.Fatalf("TCP 连接数 = %d, 期望 1（keep-alive 复用）", n)
 	}
 }
