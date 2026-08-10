@@ -88,14 +88,16 @@ type options struct {
 	compression  CompressionMode
 	readLimit    int64
 	pingInterval time.Duration
-	beta         string // Responses WS beta 版本（默认 2026-02-04；HTTP 固定 responses=v1）
+	beta         string // Responses WS beta 版本（默认 DefaultBetaWS=2026-02-06，现役唯一真实值）
 	headers      http.Header
 
 	// 伪装层（Send 帧 / 升级与请求头）。
 	filtering    bool // Send 白名单过滤（默认开）
 	meta         *CodexMeta
-	trace        *TraceContext // 外部注入（优先于自动生成）
-	traceAuto    bool          // 自动生成 trace（默认开）
+	session      *Session      // 会话标识（握手头 + 帧内 metadata）
+	trace        *TraceContext // 外部注入（WS 帧 metadata，优先于自动生成）
+	traceAuto    bool          // 每帧自动生成 trace（默认开，WS 专用）
+	turnAuto     bool          // 每帧自动生成 turn_id（默认开）
 	turnProvider func(turn uint64) string
 
 	// HTTP 专用。
@@ -109,9 +111,10 @@ func defaultOptions() options {
 		compression:  CompressionDisabled,
 		readLimit:    defaultReadLimit,
 		pingInterval: defaultPingInterval,
-		beta:         DefaultBetaWSV1,
+		beta:         DefaultBetaWS,
 		filtering:    true,
 		traceAuto:    true,
+		turnAuto:     true,
 		maxLineSize:  defaultMaxLineSize,
 	}
 }
@@ -134,11 +137,10 @@ func WithPingInterval(d time.Duration) Option {
 	return func(o *options) { o.pingInterval = d }
 }
 
-// WithBeta 设置 Responses WS 的 beta 版本（默认 DefaultBetaWSV1=2026-02-04；
-// V2 用 DefaultBetaWSV2=2026-02-06），注入
-// "OpenAI-Beta: responses_websockets=<version>"。
-// 仅作用于 WS——HTTP 路径固定注入 HTTPBetaResponsesV1，
-// 可用 WithHeader("OpenAI-Beta", ...) 覆盖。
+// WithBeta 设置 Responses WS 的 beta 版本（默认 DefaultBetaWS=2026-02-06，
+// 现役唯一真实值），注入 "OpenAI-Beta: responses_websockets=<version>"。
+// 仅作用于 WS 握手——HTTP 默认不发 OpenAI-Beta，
+// 需要时以 WithHeader("OpenAI-Beta", ...) 显式注入。
 func WithBeta(version string) Option {
 	return func(o *options) { o.beta = version }
 }
@@ -166,17 +168,33 @@ func WithCodexMeta(meta CodexMeta) Option {
 	return func(o *options) { o.meta = &meta }
 }
 
-// WithTraceContext 注入外部 trace context（WS 升级头 / HTTP 请求头 +
-// Send 帧 client_metadata 的 trace key；禁用自动生成）。
+// WithTraceContext 注入外部 trace context（每帧注入 Send 帧
+// client_metadata 的 trace key；禁用自动生成）。仅作用于 WS——
+// 真实客户端握手头与 HTTP 请求均不发 trace。
 func WithTraceContext(tc TraceContext) Option {
 	return func(o *options) { o.trace = &tc }
 }
 
-// WithTraceAuto 开关 trace 自动生成（默认开：WS 在 Dial 时生成并注入升级头，
-// 随后每个 Send 帧的 client_metadata trace key 与升级头保持一致；
-// HTTP 每请求生成并注入请求头）。
+// WithTraceAuto 开关每帧 trace 自动生成（默认开：每个 Send 帧生成新的
+// W3C traceparent 并注入 client_metadata，与真实客户端每请求新 span 一致）。
+// 仅作用于 WS。
 func WithTraceAuto(enabled bool) Option {
 	return func(o *options) { o.traceAuto = enabled }
+}
+
+// WithTurnAuto 开关 turn_id 自动生成（默认开：每个 Send 帧生成新的 UUIDv7
+// 注入 client_metadata.turn_id；CodexMeta.TurnID 静态值优先）。
+// 关闭后（且无静态值）帧内不带 turn_id。
+func WithTurnAuto(enabled bool) Option {
+	return func(o *options) { o.turnAuto = enabled }
+}
+
+// WithSession 设置会话级标识（真实客户端 WS 握手恒带
+// x-client-request-id / session-id / thread-id / x-codex-window-id）：
+// 注入握手头，并补齐帧内 client_metadata 的 session_id / thread_id /
+// x-codex-window-id（CodexMeta 中同 key 优先）。会话内稳定。
+func WithSession(s Session) Option {
+	return func(o *options) { o.session = &s }
 }
 
 // WithTurnMetadata 设置 turn_metadata 内容提供回调：每次 Send 计一轮 turn
@@ -220,9 +238,13 @@ type Client struct {
 	// 伪装层（Send 帧组装）。
 	filtering    bool
 	meta         *CodexMeta
-	trace        *TraceContext // 连接级 trace（Dial 时确定，与升级头一致）
+	session      *Session      // 会话标识（握手头 + 帧内 metadata）
+	trace        *TraceContext // 外部注入（每帧静态，优先于自动生成）
+	traceAuto    bool          // 每帧自动生成 trace
+	turnAuto     bool          // 每帧自动生成 turn_id
 	turnProvider func(turn uint64) string
 	turn         atomic.Uint64
+	turnState    atomic.Value // string；x-codex-turn-state 回传值
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -247,7 +269,7 @@ func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, 
 		o(&cfg)
 	}
 
-	hdr := make(http.Header, 8)
+	hdr := make(http.Header, 10)
 	token, err := auth.Authorization(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
@@ -257,18 +279,23 @@ func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, 
 	hdr.Set("User-Agent", DefaultCodexUserAgent)
 	hdr.Set("Originator", DefaultOriginator)
 	hdr.Set("OpenAI-Beta", "responses_websockets="+cfg.beta)
-	// 连接级 trace：升级头与后续 Send 帧 client_metadata 的 trace key 保持一致。
-	var trace *TraceContext
-	if cfg.trace != nil {
-		trace = cfg.trace
-	} else if cfg.traceAuto {
-		t := NewTraceContext()
-		trace = &t
-	}
-	if trace != nil {
-		hdr.Set(HeaderTraceparent, trace.Traceparent)
-		if trace.Tracestate != "" {
-			hdr.Set(HeaderTracestate, trace.Tracestate)
+	// 会话标识握手头（真实客户端恒带；trace 不进握手头，只进帧内 metadata）。
+	if s := cfg.session; s != nil {
+		if s.SessionID != "" {
+			hdr.Set(HeaderSessionID, s.SessionID)
+		}
+		if s.ThreadID != "" {
+			hdr.Set(HeaderThreadID, s.ThreadID)
+		}
+		clientRequestID := s.ClientRequestID
+		if clientRequestID == "" {
+			clientRequestID = s.ThreadID
+		}
+		if clientRequestID != "" {
+			hdr.Set(HeaderClientRequestID, clientRequestID)
+		}
+		if s.WindowID != "" {
+			hdr.Set(HeaderWindowID, s.WindowID)
 		}
 	}
 	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
@@ -300,10 +327,21 @@ func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, 
 		pingInterval: cfg.pingInterval,
 		filtering:    cfg.filtering,
 		meta:         cfg.meta,
-		trace:        trace,
+		session:      cfg.session,
+		trace:        cfg.trace,
+		traceAuto:    cfg.traceAuto,
+		turnAuto:     cfg.turnAuto,
 		turnProvider: cfg.turnProvider,
 		ctx:          cctx,
 		cancel:       cancel,
+	}
+	// x-codex-turn-state 回传：上游在握手响应头签发 → SDK 缓存 →
+	// 后续 Send 帧 client_metadata 自动回传（跨轮不得回传，网关在轮结束时
+	// SetTurnState("") 清除）。
+	if resp != nil {
+		if v := resp.Header.Get(HeaderTurnState); v != "" {
+			c.SetTurnState(v)
+		}
 	}
 	if cfg.pingInterval > 0 {
 		go c.heartbeat(cctx)
@@ -329,7 +367,8 @@ func (c *Client) Send(ctx context.Context, frame []byte) error {
 }
 
 // prepareFrame 应用伪装层：白名单过滤 + client_metadata 组装。
-// 优先级：帧内已存在 > CodexMeta 静态值 > trace（连接级自动/外部）> turn 回调。
+// 优先级：帧内已存在 > CodexMeta 静态值 > WithSession > turn-state 回传 >
+// 自动机制（turn_id / trace）> turn_metadata 回调。
 // 全部禁用时零拷贝零分配原样返回。
 func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 	if c.filtering {
@@ -352,21 +391,55 @@ func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 	}
 	if m := c.meta; m != nil {
 		appendEntry(codexMetaInstallationKey, m.InstallationID)
+		appendEntry(codexMetaSessionKey, m.SessionID)
+		appendEntry(codexMetaThreadKey, m.ThreadID)
+		appendEntry(codexMetaTurnKey, m.TurnID)
 		appendEntry(codexMetaWindowKey, m.WindowID)
 		appendEntry(codexMetaSubagentKey, m.Subagent)
 		appendEntry(codexMetaTurnMetadataKey, m.TurnMetadata)
 		appendEntry(codexMetaTraceparentKey, m.Traceparent)
 		appendEntry(codexMetaTracestateKey, m.Tracestate)
 	}
+	if s := c.session; s != nil {
+		appendEntry(codexMetaSessionKey, s.SessionID)
+		appendEntry(codexMetaThreadKey, s.ThreadID)
+		appendEntry(codexMetaWindowKey, s.WindowID)
+	}
+	if ts := c.TurnState(); ts != "" {
+		appendEntry(codexMetaTurnStateKey, ts)
+	}
+	// 自动 turn_id：每轮新 UUIDv7（CodexMeta.TurnID 静态优先，帧内已存在不覆盖）。
+	if c.turnAuto && (c.meta == nil || c.meta.TurnID == "") {
+		appendEntry(codexMetaTurnKey, NewUUIDv7())
+	}
+	// 每帧 trace：外部 WithTraceContext 静态值优先，否则每帧自动生成
+	// （真实客户端每请求新 span，同轮多请求 traceparent 不同）。
 	if c.trace != nil {
 		appendEntry(codexMetaTraceparentKey, c.trace.Traceparent)
 		appendEntry(codexMetaTracestateKey, c.trace.Tracestate)
+	} else if c.traceAuto {
+		tc := NewTraceContext()
+		appendEntry(codexMetaTraceparentKey, tc.Traceparent)
+		appendEntry(codexMetaTracestateKey, tc.Tracestate)
 	}
 	if c.turnProvider != nil {
 		turn := c.turn.Add(1)
 		appendEntry(codexMetaTurnMetadataKey, c.turnProvider(turn))
 	}
 	return injectClientMetadataKeys(frame, entries), nil
+}
+
+// SetTurnState 设置 x-codex-turn-state 回传值（服务端签发 → 后续 Send 帧
+// client_metadata 自动回传）。轮结束时传空串清除——跨轮不得回传。
+// 网关也可在别处观测到该值时显式设置。
+func (c *Client) SetTurnState(state string) {
+	c.turnState.Store(state)
+}
+
+// TurnState 返回当前缓存的 x-codex-turn-state（Dial 时自动捕获握手响应头）。
+func (c *Client) TurnState() string {
+	v, _ := c.turnState.Load().(string)
+	return v
 }
 
 // Recv 读取下一帧字节（文本/二进制帧原样透传，不区分帧类型不做解析）。

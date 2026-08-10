@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -15,7 +16,7 @@ import (
 
 // TestFilterCodexPayload：顶层 key 白名单过滤（纯函数）。
 func TestFilterCodexPayload(t *testing.T) {
-	in := []byte(`{"type":"response.create","model":"gpt-5","input":"hi","evil":"x","foo":{"bar":1}}`)
+	in := []byte(`{"type":"response.create","model":"gpt-5","input":"hi","stream_options":{"reasoning_summary_delivery":"sequential_cutoff"},"evil":"x","foo":{"bar":1}}`)
 	out, err := FilterCodexPayload(in)
 	if err != nil {
 		t.Fatalf("FilterCodexPayload: %v", err)
@@ -27,6 +28,10 @@ func TestFilterCodexPayload(t *testing.T) {
 		gjson.GetBytes(out, "model").String() != "gpt-5" ||
 		gjson.GetBytes(out, "input").String() != "hi" {
 		t.Fatalf("白名单字段应保留: %s", out)
+	}
+	// stream_options 属真实 response.create 字段，应保留
+	if v := gjson.GetBytes(out, "stream_options.reasoning_summary_delivery").String(); v != "sequential_cutoff" {
+		t.Fatalf("stream_options 应保留: %s", out)
 	}
 
 	// 过滤后为空 → ErrEmptyFrame（空结果帧不入网）
@@ -179,40 +184,44 @@ func TestNewTraceContext(t *testing.T) {
 	}
 }
 
-// TestTraceInjection：trace 默认自动生成并注入（升级头 + client_metadata 对齐），
-// 可注入外部值或关闭。
+// TestTraceInjection：每帧自动生成新 trace 注入帧内 client_metadata
+// （握手头与 HTTP 请求不发 trace）；外部 WithTraceContext 静态覆盖；
+// WithTraceAuto(false) 关闭。
 func TestTraceInjection(t *testing.T) {
-	// 自动：升级头 traceparent 与帧内 client_metadata 的 trace key 值一致
+	// 自动：每帧新 traceparent，帧间不同；握手头无 trace
 	url, st := startEchoServer(t, "")
 	c, err := Dial(context.Background(), url, PAT("t"))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer c.Close(StatusGoingAway, "")
-	waitFor(t, func() bool {
-		st.mu.Lock()
-		defer st.mu.Unlock()
-		return st.traceparent != ""
-	})
-	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
-		t.Fatalf("Send: %v", err)
+	frame := []byte(`{"type":"response.create","model":"gpt-5"}`)
+	for i := 0; i < 2; i++ {
+		if err := c.Send(context.Background(), frame); err != nil {
+			t.Fatalf("Send #%d: %v", i, err)
+		}
 	}
 	waitFor(t, func() bool {
 		st.mu.Lock()
 		defer st.mu.Unlock()
-		return len(st.texts) >= 1
+		return len(st.texts) >= 2
 	})
-	headerTP := func() string { st.mu.Lock(); defer st.mu.Unlock(); return st.traceparent }()
-	metaTP := func() string {
-		st.mu.Lock()
-		defer st.mu.Unlock()
-		return gjson.GetBytes(st.texts[0], "client_metadata.ws_request_header_traceparent").String()
-	}()
-	if metaTP != headerTP {
-		t.Fatalf("metadata trace 应等于升级头 trace: header=%s metadata=%s", headerTP, metaTP)
+	st.mu.Lock()
+	tp0 := gjson.GetBytes(st.texts[0], "client_metadata.ws_request_header_traceparent").String()
+	tp1 := gjson.GetBytes(st.texts[1], "client_metadata.ws_request_header_traceparent").String()
+	noHeaderTrace := st.traceparent == ""
+	st.mu.Unlock()
+	if !traceparentRe.MatchString(tp0) || !traceparentRe.MatchString(tp1) {
+		t.Fatalf("帧内 traceparent 格式不符: %q / %q", tp0, tp1)
+	}
+	if tp0 == tp1 {
+		t.Fatal("每帧应生成新的 traceparent（真实客户端同轮多请求 traceparent 不同）")
+	}
+	if !noHeaderTrace {
+		t.Fatal("WS 握手不应带 traceparent 头")
 	}
 
-	// 外部注入
+	// 外部注入：静态值每帧一致
 	url2, st2 := startEchoServer(t, "")
 	external := TraceContext{Traceparent: "00-11111111111111111111111111111111-2222222222222222-01", Tracestate: "vendor=1"}
 	c2, err := Dial(context.Background(), url2, PAT("t"), WithTraceContext(external))
@@ -220,26 +229,32 @@ func TestTraceInjection(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer c2.Close(StatusGoingAway, "")
+	for i := 0; i < 2; i++ {
+		if err := c2.Send(context.Background(), frame); err != nil {
+			t.Fatalf("Send #%d: %v", i, err)
+		}
+	}
 	waitFor(t, func() bool {
 		st2.mu.Lock()
 		defer st2.mu.Unlock()
-		return st2.traceparent != ""
+		return len(st2.texts) >= 2
 	})
-	if got := func() string { st2.mu.Lock(); defer st2.mu.Unlock(); return st2.traceparent }(); got != external.Traceparent {
-		t.Fatalf("外部 traceparent 注入失败: %s", got)
-	}
-	if got := func() string { st2.mu.Lock(); defer st2.mu.Unlock(); return st2.tracestate }(); got != external.Tracestate {
-		t.Fatalf("外部 tracestate 注入失败: %s", got)
+	st2.mu.Lock()
+	gotTP := gjson.GetBytes(st2.texts[0], "client_metadata.ws_request_header_traceparent").String()
+	gotTS := gjson.GetBytes(st2.texts[0], "client_metadata.ws_request_header_tracestate").String()
+	st2.mu.Unlock()
+	if gotTP != external.Traceparent || gotTS != external.Tracestate {
+		t.Fatalf("外部 trace 注入失败: %q / %q", gotTP, gotTS)
 	}
 
-	// 关闭自动生成：无 trace 头，帧内无 trace key
+	// 关闭自动生成：帧内无 trace key
 	url3, st3 := startEchoServer(t, "")
 	c3, err := Dial(context.Background(), url3, PAT("t"), WithTraceAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer c3.Close(StatusGoingAway, "")
-	if err := c3.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
+	if err := c3.Send(context.Background(), frame); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	waitFor(t, func() bool {
@@ -247,12 +262,75 @@ func TestTraceInjection(t *testing.T) {
 		defer st3.mu.Unlock()
 		return len(st3.texts) >= 1
 	})
-	if got := func() string { st3.mu.Lock(); defer st3.mu.Unlock(); return st3.traceparent }(); got != "" {
-		t.Fatalf("关闭自动生成后不应有 traceparent 头: %q", got)
-	}
 	got3 := func() string { st3.mu.Lock(); defer st3.mu.Unlock(); return string(st3.texts[0]) }()
 	if gjson.Get(got3, "client_metadata.ws_request_header_traceparent").Exists() {
 		t.Fatalf("关闭自动生成后不应有 trace key: %s", got3)
+	}
+}
+
+// uuidv7Re 是 UUIDv7 格式（版本 7 + 变体 10）。
+var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// TestNewUUIDv7：UUIDv7 格式 + 每次调用新值。
+func TestNewUUIDv7(t *testing.T) {
+	a := NewUUIDv7()
+	b := NewUUIDv7()
+	if !uuidv7Re.MatchString(a) || !uuidv7Re.MatchString(b) {
+		t.Fatalf("UUIDv7 格式不符: %q / %q", a, b)
+	}
+	if a == b {
+		t.Fatal("两次调用应生成不同 UUID")
+	}
+}
+
+// TestTurnIDAuto：每帧自动生成新 turn_id（UUIDv7）；CodexMeta.TurnID 静态优先。
+func TestTurnIDAuto(t *testing.T) {
+	url, st := startEchoServer(t, "")
+	c, err := Dial(context.Background(), url, PAT("t"))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close(StatusGoingAway, "")
+	frame := []byte(`{"type":"response.create","model":"gpt-5"}`)
+	for i := 0; i < 2; i++ {
+		if err := c.Send(context.Background(), frame); err != nil {
+			t.Fatalf("Send #%d: %v", i, err)
+		}
+	}
+	waitFor(t, func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return len(st.texts) >= 2
+	})
+	st.mu.Lock()
+	t0 := gjson.GetBytes(st.texts[0], "client_metadata.turn_id").String()
+	t1 := gjson.GetBytes(st.texts[1], "client_metadata.turn_id").String()
+	st.mu.Unlock()
+	if !uuidv7Re.MatchString(t0) || !uuidv7Re.MatchString(t1) {
+		t.Fatalf("turn_id 应为 UUIDv7: %q / %q", t0, t1)
+	}
+	if t0 == t1 {
+		t.Fatal("每帧应生成新的 turn_id")
+	}
+
+	// 静态 TurnID 优先
+	url2, st2 := startEchoServer(t, "")
+	c2, err := Dial(context.Background(), url2, PAT("t"), WithCodexMeta(CodexMeta{TurnID: "static-turn"}))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c2.Close(StatusGoingAway, "")
+	if err := c2.Send(context.Background(), frame); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitFor(t, func() bool {
+		st2.mu.Lock()
+		defer st2.mu.Unlock()
+		return len(st2.texts) >= 1
+	})
+	got := func() string { st2.mu.Lock(); defer st2.mu.Unlock(); return string(st2.texts[0]) }()
+	if v := gjson.Get(got, "client_metadata.turn_id").String(); v != "static-turn" {
+		t.Fatalf("静态 TurnID 应优先, got %q", v)
 	}
 }
 

@@ -14,22 +14,27 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/tidwall/gjson"
 )
 
 // echoState 记录 echo server 观测到的连接事件。
 type echoState struct {
-	mu           sync.Mutex
-	authHeader   string
-	userAgent    string
-	originator   string
-	betaHeader   string
-	customHeader string
-	traceparent  string
-	tracestate   string
-	texts        [][]byte
-	binaryCount  int
-	closeCode    websocket.StatusCode
-	closeReason  string
+	mu              sync.Mutex
+	authHeader      string
+	userAgent       string
+	originator      string
+	betaHeader      string
+	customHeader    string
+	traceparent     string
+	tracestate      string
+	sessionID       string
+	threadID        string
+	clientRequestID string
+	windowID        string
+	texts           [][]byte
+	binaryCount     int
+	closeCode       websocket.StatusCode
+	closeReason     string
 }
 
 // startEchoServer 起本地 WS echo server（收什么回什么）。
@@ -46,6 +51,10 @@ func startEchoServer(t *testing.T, wantAuth string) (string, *echoState) {
 		st.customHeader = r.Header.Get("x-custom")
 		st.traceparent = r.Header.Get("traceparent")
 		st.tracestate = r.Header.Get("tracestate")
+		st.sessionID = r.Header.Get(HeaderSessionID)
+		st.threadID = r.Header.Get(HeaderThreadID)
+		st.clientRequestID = r.Header.Get(HeaderClientRequestID)
+		st.windowID = r.Header.Get(HeaderWindowID)
 		st.mu.Unlock()
 		if wantAuth != "" && r.Header.Get("Authorization") != wantAuth {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -121,7 +130,7 @@ func startReader(t *testing.T, c *Client) chan []byte {
 func TestDialPATAuthAndRoundtrip(t *testing.T) {
 	url, st := startEchoServer(t, "")
 	c, err := Dial(context.Background(), url, PAT("test-pat"),
-		WithPayloadFiltering(false), WithTraceAuto(false))
+		WithPayloadFiltering(false), WithTraceAuto(false), WithTurnAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -224,13 +233,13 @@ func TestWSDefaultHeadersAndOverride(t *testing.T) {
 		defer st.mu.Unlock()
 		return st.userAgent == DefaultCodexUserAgent &&
 			st.originator == DefaultOriginator &&
-			st.betaHeader == "responses_websockets="+DefaultBetaWSV1
+			st.betaHeader == "responses_websockets="+DefaultBetaWS
 	})
 
-	// 覆盖：自定义 UA + beta V2
+	// 覆盖：自定义 UA + beta 任意值（现役唯一真实值 DefaultBetaWS=2026-02-06）
 	url2, st2 := startEchoServer(t, "")
 	c2, err := Dial(context.Background(), url2, PAT("t"),
-		WithHeader("User-Agent", "custom-ua"), WithBeta(DefaultBetaWSV2))
+		WithHeader("User-Agent", "custom-ua"), WithBeta("2026-02-04"))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -238,7 +247,7 @@ func TestWSDefaultHeadersAndOverride(t *testing.T) {
 	waitFor(t, func() bool {
 		st2.mu.Lock()
 		defer st2.mu.Unlock()
-		return st2.userAgent == "custom-ua" && st2.betaHeader == "responses_websockets="+DefaultBetaWSV2
+		return st2.userAgent == "custom-ua" && st2.betaHeader == "responses_websockets=2026-02-04"
 	})
 }
 
@@ -246,7 +255,7 @@ func TestWSDefaultHeadersAndOverride(t *testing.T) {
 func TestBetaAndCustomHeaders(t *testing.T) {
 	url, st := startEchoServer(t, "")
 	c, err := Dial(context.Background(), url, PAT("t"),
-		WithBeta(DefaultBetaWSV2), WithHeader("x-custom", "abc"))
+		WithBeta("2026-02-04"), WithHeader("x-custom", "abc"))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -254,7 +263,7 @@ func TestBetaAndCustomHeaders(t *testing.T) {
 	waitFor(t, func() bool {
 		st.mu.Lock()
 		defer st.mu.Unlock()
-		return st.betaHeader == "responses_websockets=2026-02-06" && st.customHeader == "abc"
+		return st.betaHeader == "responses_websockets=2026-02-04" && st.customHeader == "abc"
 	})
 }
 
@@ -262,7 +271,7 @@ func TestBetaAndCustomHeaders(t *testing.T) {
 func TestPing(t *testing.T) {
 	url, _ := startEchoServer(t, "")
 	c, err := Dial(context.Background(), url, PAT("t"),
-		WithPayloadFiltering(false), WithTraceAuto(false))
+		WithPayloadFiltering(false), WithTraceAuto(false), WithTurnAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -440,7 +449,7 @@ func TestBinaryFrameRecv(t *testing.T) {
 func TestRecvBufferOwnership(t *testing.T) {
 	url, _ := startEchoServer(t, "")
 	c, err := Dial(context.Background(), url, PAT("t"),
-		WithPayloadFiltering(false), WithTraceAuto(false))
+		WithPayloadFiltering(false), WithTraceAuto(false), WithTurnAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -473,7 +482,7 @@ func TestRecvBufferOwnership(t *testing.T) {
 // traceparentRe 是 W3C traceparent 格式（00-32hex-16hex-01）。
 var traceparentRe = regexp.MustCompile(`^00-[0-9a-f]{32}-[0-9a-f]{16}-01$`)
 
-// TestWSTraceHeaders：WS 升级默认注入自动生成的 traceparent/tracestate 头。
+// TestWSTraceHeaders：WS 握手不发 trace 头（trace 只进帧内 client_metadata）。
 func TestWSTraceHeaders(t *testing.T) {
 	url, st := startEchoServer(t, "")
 	c, err := Dial(context.Background(), url, PAT("t"))
@@ -481,15 +490,127 @@ func TestWSTraceHeaders(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer c.Close(StatusGoingAway, "")
+	// 等握手请求被服务端处理：发一帧等 echo
+	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := c.Recv(context.Background()); err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.traceparent != "" || st.tracestate != "" {
+		t.Fatalf("WS 握手不应带 trace 头: %q %q", st.traceparent, st.tracestate)
+	}
+}
+
+// TestSessionHeaders：WithSession 注入握手头 + 帧内 client_metadata
+// （session_id/thread_id/x-codex-window-id）。
+func TestSessionHeaders(t *testing.T) {
+	url, st := startEchoServer(t, "")
+	sess := Session{SessionID: "s-1", ThreadID: "t-1", WindowID: "t-1:0"}
+	c, err := Dial(context.Background(), url, PAT("t"), WithSession(sess))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close(StatusGoingAway, "")
 	waitFor(t, func() bool {
 		st.mu.Lock()
 		defer st.mu.Unlock()
-		return st.traceparent != ""
+		return st.sessionID == "s-1" && st.threadID == "t-1" &&
+			st.clientRequestID == "t-1" && st.windowID == "t-1:0"
 	})
-	if !traceparentRe.MatchString(st.traceparent) {
-		t.Fatalf("traceparent 格式不符: %q", st.traceparent)
+
+	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
+		t.Fatalf("Send: %v", err)
 	}
-	if st.tracestate != "" {
-		t.Fatalf("自动生成的 tracestate 应为空, got %q", st.tracestate)
+	waitFor(t, func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return len(st.texts) >= 1
+	})
+	st.mu.Lock()
+	got := st.texts[0]
+	st.mu.Unlock()
+	if v := gjson.GetBytes(got, "client_metadata.session_id").String(); v != "s-1" {
+		t.Fatalf("metadata session_id = %q, 期望 s-1", v)
+	}
+	if v := gjson.GetBytes(got, "client_metadata.thread_id").String(); v != "t-1" {
+		t.Fatalf("metadata thread_id = %q, 期望 t-1", v)
+	}
+	if v := gjson.GetBytes(got, "client_metadata.x-codex-window-id").String(); v != "t-1:0" {
+		t.Fatalf("metadata x-codex-window-id = %q, 期望 t-1:0", v)
+	}
+
+	// ClientRequestID 显式提供
+	url2, st2 := startEchoServer(t, "")
+	sess2 := Session{SessionID: "s-2", ThreadID: "t-2", ClientRequestID: "cr-2"}
+	c2, err := Dial(context.Background(), url2, PAT("t"), WithSession(sess2))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c2.Close(StatusGoingAway, "")
+	waitFor(t, func() bool {
+		st2.mu.Lock()
+		defer st2.mu.Unlock()
+		return st2.clientRequestID == "cr-2"
+	})
+}
+
+// TestWSTurnState：握手响应头 x-codex-turn-state → SDK 缓存 → 帧内回传；
+// SetTurnState("") 清除（跨轮不得回传）。
+func TestWSTurnState(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HeaderTurnState, "st-1")
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		for {
+			typ, data, err := c.Read(r.Context())
+			if err != nil {
+				var ce websocket.CloseError
+				if errors.As(err, &ce) {
+					_ = c.Close(ce.Code, "")
+				}
+				return
+			}
+			_ = c.Write(r.Context(), typ, data)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := Dial(context.Background(), srv.URL, PAT("t"))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close(StatusGoingAway, "")
+
+	if got := c.TurnState(); got != "st-1" {
+		t.Fatalf("TurnState = %q, 期望 st-1（握手响应头自动捕获）", got)
+	}
+	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev, err := c.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if v := gjson.GetBytes(ev, "client_metadata.x-codex-turn-state").String(); v != "st-1" {
+		t.Fatalf("帧内应回传 x-codex-turn-state=st-1, got %q", v)
+	}
+
+	// 轮结束清除：不再回传
+	c.SetTurnState("")
+	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev2, err := c.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if gjson.GetBytes(ev2, "client_metadata.x-codex-turn-state").Exists() {
+		t.Fatal("清除后不应回传 x-codex-turn-state")
 	}
 }

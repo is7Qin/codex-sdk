@@ -14,8 +14,8 @@ import (
 )
 
 // TestHTTPDoRaw：POST /v1/responses，鉴权/content-type 头注入 +
-// 默认 codex UA/originator + HTTP beta（responses=v1，与 WS 不同）+
-// 自动 trace 头 + 非流式响应原样交付（StatusCode + Raw，不做字段解析）。
+// 默认 codex UA/originator + 不发 OpenAI-Beta 与 trace 头（真实客户端行为）
+// + 非流式响应原样交付（StatusCode + Raw，不做字段解析）。
 func TestHTTPDoRaw(t *testing.T) {
 	var gotAuth, gotBeta, gotContentType, gotUA, gotOriginator, gotTraceparent string
 	var gotBody []byte
@@ -45,8 +45,11 @@ func TestHTTPDoRaw(t *testing.T) {
 	if gotAuth != "Bearer pat-http" {
 		t.Fatalf("Authorization = %q", gotAuth)
 	}
-	if gotBeta != HTTPBetaResponsesV1 {
-		t.Fatalf("OpenAI-Beta = %q, 期望 %q（HTTP 与 WS 的 beta 值不同）", gotBeta, HTTPBetaResponsesV1)
+	if gotBeta != "" {
+		t.Fatalf("HTTP 默认不应发 OpenAI-Beta, got %q", gotBeta)
+	}
+	if gotTraceparent != "" {
+		t.Fatalf("HTTP 默认不应发 traceparent, got %q", gotTraceparent)
 	}
 	if gotContentType != "application/json" {
 		t.Fatalf("Content-Type = %q", gotContentType)
@@ -56,9 +59,6 @@ func TestHTTPDoRaw(t *testing.T) {
 	}
 	if gotOriginator != DefaultOriginator {
 		t.Fatalf("Originator = %q, 期望 %q", gotOriginator, DefaultOriginator)
-	}
-	if !traceparentRe.MatchString(gotTraceparent) {
-		t.Fatalf("traceparent 格式不符: %q", gotTraceparent)
 	}
 	if string(gotBody) != `{"model":"gpt-5","input":"hi"}` {
 		t.Fatalf("body = %s", gotBody)
@@ -71,7 +71,7 @@ func TestHTTPDoRaw(t *testing.T) {
 	}
 }
 
-// TestHTTPBetaOverride：WithHeader 可覆盖 HTTP 默认 beta 头。
+// TestHTTPBetaOverride：WithHeader 显式注入 HTTP OpenAI-Beta（默认不发）。
 func TestHTTPBetaOverride(t *testing.T) {
 	var gotBeta string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -271,5 +271,69 @@ func TestHTTPConnectionReuse(t *testing.T) {
 	}
 	if n := accepts.Load(); n != 1 {
 		t.Fatalf("TCP 连接数 = %d, 期望 1（keep-alive 复用）", n)
+	}
+}
+
+// TestHTTPTurnStateEcho：响应头 x-codex-turn-state → SDK 缓存 → 下一请求
+// 自动回传；SetTurnState("") 清除（跨轮不得回传）。
+func TestHTTPTurnStateEcho(t *testing.T) {
+	var gotEcho string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEcho = r.Header.Get(HeaderTurnState)
+		w.Header().Set(HeaderTurnState, "st-http")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(srv.URL, PAT("t"))
+	resp, err := hc.Do(context.Background(), []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Do #1: %v", err)
+	}
+	if gotEcho != "" {
+		t.Fatalf("首次请求不应回传 x-codex-turn-state, got %q", gotEcho)
+	}
+	if resp.TurnState != "st-http" {
+		t.Fatalf("HTTPResponse.TurnState = %q, 期望 st-http", resp.TurnState)
+	}
+	if hc.TurnState() != "st-http" {
+		t.Fatalf("TurnState = %q, 期望 st-http（响应头自动捕获）", hc.TurnState())
+	}
+
+	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("Do #2: %v", err)
+	}
+	if gotEcho != "st-http" {
+		t.Fatalf("第二次请求应回传 st-http, got %q", gotEcho)
+	}
+
+	// 轮结束清除：不再回传
+	hc.SetTurnState("")
+	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("Do #3: %v", err)
+	}
+	if gotEcho != "" {
+		t.Fatalf("清除后不应回传 x-codex-turn-state, got %q", gotEcho)
+	}
+}
+
+// TestHTTPStreamCapturesTurnState：Stream 响应头同样捕获 turn-state。
+func TestHTTPStreamCapturesTurnState(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HeaderTurnState, "st-stream")
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(srv.URL, PAT("t"))
+	if err := hc.Stream(context.Background(), []byte(`{"stream":true}`), func(raw []byte) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if hc.TurnState() != "st-stream" {
+		t.Fatalf("Stream 响应头应捕获 turn-state, got %q", hc.TurnState())
 	}
 }

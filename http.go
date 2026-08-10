@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // defaultMaxLineSize HTTP SSE 单行上限（与 WS ReadLimit 同量级）。
@@ -17,13 +18,18 @@ const defaultMaxLineSize = 16 * 1024 * 1024
 
 // HTTPClient 是 Responses HTTP 客户端（懒构建：NewHTTPClient 零开销，
 // 首次 Do/Stream 才创建 http.Client，连接池复用）。
+//
+// 会话级状态：x-codex-turn-state 由响应头自动捕获并缓存，下一个请求自动
+// 以请求头回传（同轮回传）；轮结束时网关 SetTurnState("") 清除——跨轮不得
+// 回传。同会话请求串行使用（并发请求共享状态，最后写入者生效）。
 type HTTPClient struct {
 	baseURL string // 上游 base URL
 	auth    Auth
 	opts    options
 
-	mu     sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
-	client *http.Client
+	mu        sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
+	client    *http.Client
+	turnState atomic.Value // string；x-codex-turn-state 回传值
 }
 
 // NewHTTPClient 创建 Responses HTTP 客户端。baseURL 为上游 base URL
@@ -55,6 +61,7 @@ func (c *HTTPClient) CloseIdleConnections() {
 type HTTPResponse struct {
 	StatusCode int
 	Raw        []byte // 完整响应体
+	TurnState  string // 响应头 x-codex-turn-state（服务端签发，同轮回传）
 }
 
 // HTTPError 是上游非 2xx 响应（状态码 + 错误体原样交付，error 信封由网关解析）。
@@ -82,7 +89,12 @@ func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, err
 	if resp.StatusCode >= 400 {
 		return nil, &HTTPError{StatusCode: resp.StatusCode, Raw: body}
 	}
-	return &HTTPResponse{StatusCode: resp.StatusCode, Raw: body}, nil
+	c.captureTurnState(resp)
+	return &HTTPResponse{
+		StatusCode: resp.StatusCode,
+		Raw:        body,
+		TurnState:  resp.Header.Get(HeaderTurnState),
+	}, nil
 }
 
 // Stream 发送 POST 请求并提取 SSE 事件帧：逐 data: 行交付原始字节（零拷贝
@@ -100,6 +112,7 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 		body, _ := io.ReadAll(resp.Body)
 		return &HTTPError{StatusCode: resp.StatusCode, Raw: body}
 	}
+	c.captureTurnState(resp)
 
 	maxLine := c.opts.maxLineSize
 	if maxLine <= 0 {
@@ -151,21 +164,13 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	}
 	req.Header.Set("Authorization", token)
 	req.Header.Set("Content-Type", "application/json")
-	// 伪装层默认头（WithHeader 可覆盖）——HTTP 的 beta 值与 WS 不同：
-	// HTTP 固定 responses=v1，WithBeta 不作用于 HTTP。
+	// 伪装层默认头（WithHeader 可覆盖）。HTTP 不发 OpenAI-Beta 与 trace 头
+	// （真实客户端行为）；需要 beta 时调用方以 WithHeader 显式注入。
 	req.Header.Set("User-Agent", DefaultCodexUserAgent)
 	req.Header.Set("Originator", DefaultOriginator)
-	req.Header.Set("OpenAI-Beta", HTTPBetaResponsesV1)
-	// 每请求独立 trace（外部注入优先，其次自动生成）。
-	switch {
-	case c.opts.trace != nil:
-		req.Header.Set(HeaderTraceparent, c.opts.trace.Traceparent)
-		if c.opts.trace.Tracestate != "" {
-			req.Header.Set(HeaderTracestate, c.opts.trace.Tracestate)
-		}
-	case c.opts.traceAuto:
-		tc := NewTraceContext()
-		req.Header.Set(HeaderTraceparent, tc.Traceparent)
+	// x-codex-turn-state 同轮回传（响应头签发 → 缓存 → 下一请求回传）。
+	if ts := c.TurnState(); ts != "" {
+		req.Header.Set(HeaderTurnState, ts)
 	}
 	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
 	for k, vals := range c.opts.headers {
@@ -179,6 +184,27 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 		return nil, fmt.Errorf("codexsdk: 上游请求失败: %w", err)
 	}
 	return resp, nil
+}
+
+// SetTurnState 设置 x-codex-turn-state 回传值（响应头自动捕获后也可显式
+// 覆盖）。轮结束时传空串清除——跨轮不得回传。
+func (c *HTTPClient) SetTurnState(state string) {
+	c.turnState.Store(state)
+}
+
+// TurnState 返回当前缓存的 x-codex-turn-state（由最近一次响应头自动捕获）。
+func (c *HTTPClient) TurnState() string {
+	v, _ := c.turnState.Load().(string)
+	return v
+}
+
+// captureTurnState 从响应头捕获 x-codex-turn-state（非空才覆盖）。
+func (c *HTTPClient) captureTurnState(resp *http.Response) {
+	if resp != nil {
+		if v := resp.Header.Get(HeaderTurnState); v != "" {
+			c.turnState.Store(v)
+		}
+	}
 }
 
 // httpClient 懒构建：首次请求才创建（连接池复用；timeout/transport 可配）。
