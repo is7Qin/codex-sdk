@@ -13,7 +13,8 @@
 //     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata 组装（8 key 恒发：
 //     installation_id/session_id/thread_id/turn_id/window_id/turn-metadata/
 //     traceparent/tracestate）、会话标识握手头（WithSession）、x-codex-turn-state
-//     响应头回传、每帧新 trace 与 turn_id（UUIDv7）
+//     （WS：升级响应头签发 → 帧内 client_metadata 回传；HTTP：仅响应侧捕获，
+//     请求不带头）、每帧新 trace 与 turn_id（UUIDv7）
 //
 // SDK 零协议解析：type / usage / 事件构造与业务语义（计费、透传编排、failover、
 // 会话粘性、内容审核）全部在网关侧（go-proxy-mini）——网关在 SDK 交付的完整
@@ -42,8 +43,10 @@
 // 2026-02-06，仅 WS 握手注入；HTTP 默认不发 OpenAI-Beta，需要时 WithHeader
 // 显式注入）。真实客户端行为对齐：WS 握手与 HTTP 请求均不发 trace 头（trace
 // 只进每帧 client_metadata，每帧新值）；session-id/thread-id/x-client-request-id/
-// x-codex-window-id 会话级握手头；x-codex-turn-state 由响应头签发、同轮回传
-// （跨轮不得回传，网关 SetTurnState("") 清除）。
+// x-codex-window-id 会话级握手头；x-codex-turn-state 仅响应侧捕获：WS 路径
+// 升级响应头签发 → 帧内 client_metadata 回传（Client.TurnState 缓存 + 网关
+// SetTurnState("") 清除，跨轮不得回传）；HTTP 路径请求不携带该头，捕获后经
+// TurnState() 暴露。
 // 传输常量对齐参考实现：16MiB ReadLimit（coder 默认 32KB 过小）、
 // CompressionContextTakeover 压缩、WS 层 ping 心跳（30s 间隔 + 2s 超时）、
 // data: SSE 行提取与 [DONE] 终止、response.create 18 字段白名单、

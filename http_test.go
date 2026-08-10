@@ -274,9 +274,10 @@ func TestHTTPConnectionReuse(t *testing.T) {
 	}
 }
 
-// TestHTTPTurnStateEcho：响应头 x-codex-turn-state → SDK 缓存 → 下一请求
-// 自动回传；SetTurnState("") 清除（跨轮不得回传）。
-func TestHTTPTurnStateEcho(t *testing.T) {
+// TestHTTPTurnStateNoEcho：HTTP 请求绝不携带 x-codex-turn-state 头（真实
+// codex 客户端行为——turn-state 仅响应侧）；响应头签发 → 自动捕获，经
+// HTTPResponse.TurnState / TurnState() 暴露，不回传为请求头（头回传仅 WS 路径）。
+func TestHTTPTurnStateNoEcho(t *testing.T) {
 	var gotEcho string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEcho = r.Header.Get(HeaderTurnState)
@@ -287,34 +288,20 @@ func TestHTTPTurnStateEcho(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(srv.URL, PAT("t"))
-	resp, err := hc.Do(context.Background(), []byte(`{}`))
-	if err != nil {
-		t.Fatalf("Do #1: %v", err)
-	}
-	if gotEcho != "" {
-		t.Fatalf("首次请求不应回传 x-codex-turn-state, got %q", gotEcho)
-	}
-	if resp.TurnState != "st-http" {
-		t.Fatalf("HTTPResponse.TurnState = %q, 期望 st-http", resp.TurnState)
-	}
-	if hc.TurnState() != "st-http" {
-		t.Fatalf("TurnState = %q, 期望 st-http（响应头自动捕获）", hc.TurnState())
-	}
-
-	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
-		t.Fatalf("Do #2: %v", err)
-	}
-	if gotEcho != "st-http" {
-		t.Fatalf("第二次请求应回传 st-http, got %q", gotEcho)
-	}
-
-	// 轮结束清除：不再回传
-	hc.SetTurnState("")
-	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
-		t.Fatalf("Do #3: %v", err)
-	}
-	if gotEcho != "" {
-		t.Fatalf("清除后不应回传 x-codex-turn-state, got %q", gotEcho)
+	for i := 0; i < 3; i++ {
+		resp, err := hc.Do(context.Background(), []byte(`{}`))
+		if err != nil {
+			t.Fatalf("Do #%d: %v", i, err)
+		}
+		if gotEcho != "" {
+			t.Fatalf("第 %d 次请求不应携带 x-codex-turn-state, got %q", i+1, gotEcho)
+		}
+		if resp.TurnState != "st-http" {
+			t.Fatalf("HTTPResponse.TurnState = %q, 期望 st-http", resp.TurnState)
+		}
+		if hc.TurnState() != "st-http" {
+			t.Fatalf("TurnState = %q, 期望 st-http（响应头自动捕获）", hc.TurnState())
+		}
 	}
 }
 

@@ -19,9 +19,9 @@ const defaultMaxLineSize = 16 * 1024 * 1024
 // HTTPClient 是 Responses HTTP 客户端（懒构建：NewHTTPClient 零开销，
 // 首次 Do/Stream 才创建 http.Client，连接池复用）。
 //
-// 会话级状态：x-codex-turn-state 由响应头自动捕获并缓存，下一个请求自动
-// 以请求头回传（同轮回传）；轮结束时网关 SetTurnState("") 清除——跨轮不得
-// 回传。同会话请求串行使用（并发请求共享状态，最后写入者生效）。
+// x-codex-turn-state 仅响应侧（真实 codex 客户端行为）：响应头/SSE 中的
+// turn-state 自动捕获，经 TurnState() / HTTPResponse.TurnState 暴露给网关；
+// HTTP 请求不携带 x-codex-turn-state 头（头回传仅 WS 路径，见 Client）。
 type HTTPClient struct {
 	baseURL string // 上游 base URL
 	auth    Auth
@@ -29,7 +29,7 @@ type HTTPClient struct {
 
 	mu        sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
 	client    *http.Client
-	turnState atomic.Value // string；x-codex-turn-state 回传值
+	turnState atomic.Value // string；x-codex-turn-state 响应侧捕获值
 }
 
 // NewHTTPClient 创建 Responses HTTP 客户端。baseURL 为上游 base URL
@@ -61,7 +61,7 @@ func (c *HTTPClient) CloseIdleConnections() {
 type HTTPResponse struct {
 	StatusCode int
 	Raw        []byte // 完整响应体
-	TurnState  string // 响应头 x-codex-turn-state（服务端签发，同轮回传）
+	TurnState  string // 响应头 x-codex-turn-state（服务端签发，仅响应侧暴露）
 }
 
 // HTTPError 是上游非 2xx 响应（状态码 + 错误体原样交付，error 信封由网关解析）。
@@ -168,10 +168,8 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	// （真实客户端行为）；需要 beta 时调用方以 WithHeader 显式注入。
 	req.Header.Set("User-Agent", DefaultCodexUserAgent)
 	req.Header.Set("Originator", DefaultOriginator)
-	// x-codex-turn-state 同轮回传（响应头签发 → 缓存 → 下一请求回传）。
-	if ts := c.TurnState(); ts != "" {
-		req.Header.Set(HeaderTurnState, ts)
-	}
+	// 注意：HTTP 请求不携带 x-codex-turn-state 头（真实客户端行为——
+	// turn-state 仅响应侧，WS 路径才回传，见 Client）。
 	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
 	for k, vals := range c.opts.headers {
 		req.Header.Del(k)
@@ -186,13 +184,8 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	return resp, nil
 }
 
-// SetTurnState 设置 x-codex-turn-state 回传值（响应头自动捕获后也可显式
-// 覆盖）。轮结束时传空串清除——跨轮不得回传。
-func (c *HTTPClient) SetTurnState(state string) {
-	c.turnState.Store(state)
-}
-
-// TurnState 返回当前缓存的 x-codex-turn-state（由最近一次响应头自动捕获）。
+// TurnState 返回最近一次响应捕获的 x-codex-turn-state（仅响应侧暴露——
+// HTTP 请求不携带该头，头回传仅 WS 路径）。
 func (c *HTTPClient) TurnState() string {
 	v, _ := c.turnState.Load().(string)
 	return v
