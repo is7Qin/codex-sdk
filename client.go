@@ -92,13 +92,14 @@ type options struct {
 	headers      http.Header
 
 	// 伪装层（Send 帧 / 升级与请求头）。
-	filtering    bool // Send 白名单过滤（默认开）
-	meta         *CodexMeta
-	session      *Session      // 会话标识（握手头 + 帧内 metadata）
-	trace        *TraceContext // 外部注入（WS 帧 metadata，优先于自动生成）
-	traceAuto    bool          // 每帧自动生成 trace（默认开，WS 专用）
-	turnAuto     bool          // 每帧自动生成 turn_id（默认开）
-	turnProvider func(turn uint64) string
+	filtering       bool // Send 白名单过滤（默认开）
+	meta            *CodexMeta
+	metaPassthrough []metadataEntry // WithClientMetadata 透传项（WS client_metadata 任意键，只透传不解析）
+	session         *Session        // 会话标识（握手头 + 帧内 metadata）
+	trace           *TraceContext   // 外部注入（WS 帧 metadata，优先于自动生成）
+	traceAuto       bool            // 每帧自动生成 trace（默认开，WS 专用）
+	turnAuto        bool            // 每帧自动生成 turn_id（默认开）
+	turnProvider    func(turn uint64) string
 
 	// HTTP 专用。
 	timeout     time.Duration
@@ -166,6 +167,16 @@ func WithPayloadFiltering(enabled bool) Option {
 // SDK 只组装不生成；帧内已存在的 key 不覆盖）。
 func WithCodexMeta(meta CodexMeta) Option {
 	return func(o *options) { o.meta = &meta }
+}
+
+// WithClientMetadata 注入 client_metadata 任意键值（透传面：SDK 只透传不解析，
+// 键名由调用方自定或引用 Meta* 常量，如 MetaResponsesLiteKey="true"）。
+// 与其余注入同优先级——帧内已存在的 key 不覆盖；多次调用为多键注入。
+// 仅作用于 WS——HTTP 无 client_metadata，对应请求头透传用 WithHeader。
+func WithClientMetadata(key, value string) Option {
+	return func(o *options) {
+		o.metaPassthrough = append(o.metaPassthrough, metadataEntry{key, value})
+	}
 }
 
 // WithTraceContext 注入外部 trace context（每帧注入 Send 帧
@@ -236,15 +247,16 @@ type Client struct {
 	pingInterval time.Duration
 
 	// 伪装层（Send 帧组装）。
-	filtering    bool
-	meta         *CodexMeta
-	session      *Session      // 会话标识（握手头 + 帧内 metadata）
-	trace        *TraceContext // 外部注入（每帧静态，优先于自动生成）
-	traceAuto    bool          // 每帧自动生成 trace
-	turnAuto     bool          // 每帧自动生成 turn_id
-	turnProvider func(turn uint64) string
-	turn         atomic.Uint64
-	turnState    atomic.Value // string；x-codex-turn-state 回传值
+	filtering       bool
+	meta            *CodexMeta
+	metaPassthrough []metadataEntry // WithClientMetadata 透传项（只透传不解析）
+	session         *Session        // 会话标识（握手头 + 帧内 metadata）
+	trace           *TraceContext   // 外部注入（每帧静态，优先于自动生成）
+	traceAuto       bool            // 每帧自动生成 trace
+	turnAuto        bool            // 每帧自动生成 turn_id
+	turnProvider    func(turn uint64) string
+	turn            atomic.Uint64
+	turnState       atomic.Value // string；x-codex-turn-state 回传值
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -323,17 +335,18 @@ func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, 
 
 	cctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
-		conn:         conn,
-		pingInterval: cfg.pingInterval,
-		filtering:    cfg.filtering,
-		meta:         cfg.meta,
-		session:      cfg.session,
-		trace:        cfg.trace,
-		traceAuto:    cfg.traceAuto,
-		turnAuto:     cfg.turnAuto,
-		turnProvider: cfg.turnProvider,
-		ctx:          cctx,
-		cancel:       cancel,
+		conn:            conn,
+		pingInterval:    cfg.pingInterval,
+		filtering:       cfg.filtering,
+		meta:            cfg.meta,
+		metaPassthrough: cfg.metaPassthrough,
+		session:         cfg.session,
+		trace:           cfg.trace,
+		traceAuto:       cfg.traceAuto,
+		turnAuto:        cfg.turnAuto,
+		turnProvider:    cfg.turnProvider,
+		ctx:             cctx,
+		cancel:          cancel,
 	}
 	// x-codex-turn-state 回传：上游在握手响应头签发 → SDK 缓存 →
 	// 后续 Send 帧 client_metadata 自动回传（跨轮不得回传，网关在轮结束时
@@ -368,7 +381,7 @@ func (c *Client) Send(ctx context.Context, frame []byte) error {
 
 // prepareFrame 应用伪装层：白名单过滤 + client_metadata 组装。
 // 优先级：帧内已存在 > CodexMeta 静态值 > WithSession > turn-state 回传 >
-// 自动机制（turn_id / trace）> turn_metadata 回调。
+// WithClientMetadata 透传 > 自动机制（turn_id / trace）> turn_metadata 回调。
 // 全部禁用时零拷贝零分配原样返回。
 func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 	if c.filtering {
@@ -407,6 +420,11 @@ func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 	}
 	if ts := c.TurnState(); ts != "" {
 		appendEntry(codexMetaTurnStateKey, ts)
+	}
+	// 调用方透传键（WithClientMetadata）：只透传不解析，帧内已有同 key 不覆盖
+	// （注入顺序在自动机制之前，同 key 不会覆盖静态/会话值）。
+	for _, e := range c.metaPassthrough {
+		appendEntry(e.key, e.value)
 	}
 	// turn_id 透传优先：帧内已有 client_metadata.turn_id 时原值透传（零生成——
 	// turn_id 有身份语义，透传保持 turn 链一致；常态路径省掉每帧 UUIDv7 生成）；

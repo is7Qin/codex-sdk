@@ -90,6 +90,36 @@ func TestHTTPBetaOverride(t *testing.T) {
 	}
 }
 
+// TestHTTPResponsesLiteHeader：responses-lite internal 头透传（WithHeader）——
+// 默认不带（非 lite 无此头），SDK 只透传不解析。
+func TestHTTPResponsesLiteHeader(t *testing.T) {
+	var gotLite string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLite = r.Header.Get(HeaderResponsesLite)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	// 默认：不带 lite 头
+	hc := NewHTTPClient(srv.URL, PAT("t"))
+	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("Do（默认）: %v", err)
+	}
+	if gotLite != "" {
+		t.Fatalf("默认请求不应携带 %s, got %q", HeaderResponsesLite, gotLite)
+	}
+
+	// WithHeader 透传
+	hc = NewHTTPClient(srv.URL, PAT("t"), WithHeader(HeaderResponsesLite, "true"))
+	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("Do（lite）: %v", err)
+	}
+	if gotLite != "true" {
+		t.Fatalf("lite 头透传失败, got %q", gotLite)
+	}
+}
+
 // TestHTTPDoErrorStatus：非 2xx 返回 *HTTPError（状态码 + 错误体原样交付）。
 func TestHTTPDoErrorStatus(t *testing.T) {
 	errorBody := []byte(`{"error":{"type":"invalid_request_error","message":"bad token"}}`)

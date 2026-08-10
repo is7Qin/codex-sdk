@@ -169,6 +169,47 @@ func TestCodexMetaInjection(t *testing.T) {
 	}
 }
 
+// TestClientMetadataPassthrough：WithClientMetadata 透传任意 client_metadata 键
+// （responses-lite 键 MetaResponsesLiteKey，只透传不解析）；
+// 帧内已有同 key 时不覆盖。
+func TestClientMetadataPassthrough(t *testing.T) {
+	url, st := startEchoServer(t, "")
+	c, err := Dial(context.Background(), url, PAT("t"),
+		WithClientMetadata(MetaResponsesLiteKey, "true"))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close(StatusGoingAway, "")
+
+	frame := []byte(`{"type":"response.create","model":"gpt-5"}`)
+	if err := c.Send(context.Background(), frame); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// 帧内已有同 key：原值保留（透传不覆盖）
+	existing := []byte(`{"type":"response.create","model":"gpt-5","client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"false"}}`)
+	if err := c.Send(context.Background(), existing); err != nil {
+		t.Fatalf("Send #2: %v", err)
+	}
+	waitFor(t, func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return len(st.texts) >= 2
+	})
+	st.mu.Lock()
+	got0 := st.texts[0]
+	got1 := st.texts[1]
+	st.mu.Unlock()
+
+	if v := gjson.GetBytes(got0, "client_metadata."+MetaResponsesLiteKey).String(); v != "true" {
+		t.Fatalf("透传键 %s 缺失或值不符, got %q: %s", MetaResponsesLiteKey, v, got0)
+	}
+	if v := gjson.GetBytes(got1, "client_metadata."+MetaResponsesLiteKey).String(); v != "false" {
+		t.Fatalf("帧内已有同 key 应保留原值 false, got %q: %s", v, got1)
+	}
+	// 该键只进 client_metadata：Dial 只组装默认/会话/WithHeader 握手头，
+	// 透传键按构造不可能泄漏为握手头。
+}
+
 // TestNewTraceContext：W3C traceparent 格式 + 每次调用新链路 id。
 func TestNewTraceContext(t *testing.T) {
 	a := NewTraceContext()

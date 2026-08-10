@@ -12,9 +12,11 @@
 //     codex-tui UA/originator（0.147.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
 //     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata 组装（8 key 恒发：
 //     installation_id/session_id/thread_id/turn_id/window_id/turn-metadata/
-//     traceparent/tracestate）、会话标识握手头（WithSession）、x-codex-turn-state
-//     （WS：升级响应头签发 → 帧内 client_metadata 回传；HTTP：仅响应侧捕获，
-//     请求不带头）、每帧新 trace 与 turn_id（UUIDv7）
+//     traceparent/tracestate）、透传（HTTP 头 WithHeader / WS client_metadata
+//     任意键 WithClientMetadata，只透传不解析——如 responses-lite 标记
+//     HeaderResponsesLite / MetaResponsesLiteKey）、会话标识握手头（WithSession）、
+//     x-codex-turn-state（WS：升级响应头签发 → 帧内 client_metadata 回传；
+//     HTTP：仅响应侧捕获，请求不带头）、每帧新 trace 与 turn_id（UUIDv7）
 //
 // SDK 零协议解析：type / usage / 事件构造与业务语义（计费、透传编排、failover、
 // 会话粘性、内容审核）全部在网关侧（go-proxy-mini）——网关在 SDK 交付的完整
@@ -46,7 +48,10 @@
 // x-codex-window-id 会话级握手头；x-codex-turn-state 仅响应侧捕获：WS 路径
 // 升级响应头签发 → 帧内 client_metadata 回传（Client.TurnState 缓存 + 网关
 // SetTurnState("") 清除，跨轮不得回传）；HTTP 路径请求不携带该头，捕获后经
-// TurnState() 暴露。
+// TurnState() 暴露。responses-lite 非独立端点：与 /responses 同端点同事件集，
+// 仅 internal 标记区分——HTTP 头 x-openai-internal-codex-responses-lite（WithHeader
+// 透传）与 WS client_metadata 键 ws_request_header_x_openai_internal_codex_responses_lite
+// （WithClientMetadata 透传），SDK 只透传不解析。
 // 传输常量对齐参考实现：16MiB ReadLimit（coder 默认 32KB 过小）、
 // CompressionContextTakeover 压缩、WS 层 ping 心跳（30s 间隔 + 2s 超时）、
 // data: SSE 行提取与 [DONE] 终止、response.create 18 字段白名单、

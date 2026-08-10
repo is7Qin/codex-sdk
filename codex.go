@@ -52,6 +52,10 @@ const (
 	HeaderOAIAAttestation = "x-oai-attestation"
 	HeaderTraceparent     = "traceparent"
 	HeaderTracestate      = "tracestate"
+	// HeaderResponsesLite 是 responses-lite internal 标记头（值 "true"；
+	// 仅 gpt-5.6-sol/terra/luna 等 lite 模型触发）：HTTP 请求以
+	// WithHeader 透传，SDK 只透传不解析（lite 触发与请求体形态由网关决定）。
+	HeaderResponsesLite = "x-openai-internal-codex-responses-lite"
 )
 
 // client_metadata 内的 key 名（对齐真实 client_metadata()：
@@ -68,6 +72,10 @@ const (
 	codexMetaTurnStateKey    = "x-codex-turn-state"
 	codexMetaTraceparentKey  = "ws_request_header_traceparent"
 	codexMetaTracestateKey   = "ws_request_header_tracestate"
+	// MetaResponsesLiteKey 是 responses-lite 的 client_metadata 键（值 "true"；
+	// 服务端约定把 ws_request_header_ 前缀键还原为请求头，与 HeaderResponsesLite
+	// 同一标记）。以 WithClientMetadata 透传，SDK 只透传不解析。
+	MetaResponsesLiteKey = "ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
 // CodexPayloadFields 是 response.create 顶层 key 白名单（18 字段 + type，
