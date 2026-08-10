@@ -408,16 +408,20 @@ func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 	if ts := c.TurnState(); ts != "" {
 		appendEntry(codexMetaTurnStateKey, ts)
 	}
-	// 自动 turn_id：每轮新 UUIDv7（CodexMeta.TurnID 静态优先，帧内已存在不覆盖）。
-	if c.turnAuto && (c.meta == nil || c.meta.TurnID == "") {
+	// turn_id 透传优先：帧内已有 client_metadata.turn_id 时原值透传（零生成——
+	// turn_id 有身份语义，透传保持 turn 链一致；常态路径省掉每帧 UUIDv7 生成）；
+	// 无则自动生成 UUIDv7 兜底（CodexMeta.TurnID 静态值优先）。
+	// 与 turn 计数联动不变：计数仍每帧自增，仅 id 值优先透传。
+	if c.turnAuto && (c.meta == nil || c.meta.TurnID == "") && !hasClientMetadataKey(frame, codexMetaTurnKey) {
 		appendEntry(codexMetaTurnKey, NewUUIDv7())
 	}
 	// 每帧 trace：外部 WithTraceContext 静态值优先，否则每帧自动生成
-	// （真实客户端每请求新 span，同轮多请求 traceparent 不同）。
+	// （真实客户端每请求新 span，同轮多请求 traceparent 不同；
+	// 帧内已有 traceparent 时同样透传零生成）。
 	if c.trace != nil {
 		appendEntry(codexMetaTraceparentKey, c.trace.Traceparent)
 		appendEntry(codexMetaTracestateKey, c.trace.Tracestate)
-	} else if c.traceAuto {
+	} else if c.traceAuto && !hasClientMetadataKey(frame, codexMetaTraceparentKey) {
 		tc := NewTraceContext()
 		appendEntry(codexMetaTraceparentKey, tc.Traceparent)
 		appendEntry(codexMetaTracestateKey, tc.Tracestate)

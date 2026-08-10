@@ -204,6 +204,12 @@ func randomBytes(n int) []byte {
 	return b
 }
 
+// hasClientMetadataKey 判断帧内 client_metadata 是否已含 key
+// （透传优先预检：帧内已有值时零生成直接透传）。
+func hasClientMetadataKey(frame []byte, key string) bool {
+	return gjson.GetBytes(frame, "client_metadata."+key).Exists()
+}
+
 // metadataEntry 是 client_metadata 注入项（key 值均由调用方/机制提供）。
 type metadataEntry struct {
 	key   string

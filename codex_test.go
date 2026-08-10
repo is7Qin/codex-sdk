@@ -408,3 +408,47 @@ func TestTurnMetadataProviderConcurrent(t *testing.T) {
 		seen[v] = true
 	}
 }
+
+// TestTurnIDPassthrough：帧内已有 client_metadata.turn_id 时原值透传（零生成）；
+// 无值帧自动生成 UUIDv7 兜底。
+func TestTurnIDPassthrough(t *testing.T) {
+	url, st := startEchoServer(t, "")
+	c, err := Dial(context.Background(), url, PAT("t"))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close(StatusGoingAway, "")
+
+	// 帧内已有 turn_id：原值透传，其余 metadata key 仍可注入
+	withTurn := []byte(`{"type":"response.create","model":"gpt-5","client_metadata":{"turn_id":"existing-turn","user":{"a":1}}}`)
+	if err := c.Send(context.Background(), withTurn); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// 无值帧：自动生成 UUIDv7
+	withoutTurn := []byte(`{"type":"response.create","model":"gpt-5"}`)
+	if err := c.Send(context.Background(), withoutTurn); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitFor(t, func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return len(st.texts) >= 2
+	})
+	st.mu.Lock()
+	got0 := st.texts[0]
+	got1 := st.texts[1]
+	st.mu.Unlock()
+
+	if v := gjson.GetBytes(got0, "client_metadata.turn_id").String(); v != "existing-turn" {
+		t.Fatalf("帧内 turn_id 应原值透传, got %q", v)
+	}
+	if v := gjson.GetBytes(got0, "client_metadata.user.a").Int(); v != 1 {
+		t.Fatalf("帧内其余 metadata 应保留: %s", got0)
+	}
+	if v := gjson.GetBytes(got1, "client_metadata.turn_id").String(); !uuidv7Re.MatchString(v) {
+		t.Fatalf("无值帧应自动生成 UUIDv7 turn_id, got %q", v)
+	}
+	if v := gjson.GetBytes(got1, "client_metadata.turn_id").String(); v == "existing-turn" {
+		t.Fatal("透传值不应泄漏到无值帧")
+	}
+}
