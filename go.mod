@@ -1,4 +1,4 @@
-module codex-sdk
+module github.com/is7Qin/codex-sdk
 
 go 1.26.5
 
