@@ -9,7 +9,7 @@
 //   - Responses HTTP：POST /v1/responses 请求构造 / 非流式响应 / 流式 SSE 事件帧提取
 //   - 升级与请求鉴权注入（PAT 静态 / OAuth 刷新回调，Auth 接口）
 //   - 伪装层（真实 codex 客户端形态对齐，对照见 IMPERSONATION.md）：默认
-//     codex_cli_rs UA/originator、beta 头（现役唯一 2026-02-06）、头常量导出、
+//     codex-tui UA/originator（0.147.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
 //     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata 组装（8 key 恒发：
 //     installation_id/session_id/thread_id/turn_id/window_id/turn-metadata/
 //     traceparent/tracestate）、会话标识握手头（WithSession）、x-codex-turn-state
