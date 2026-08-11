@@ -178,17 +178,22 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	if resp.StatusCode != http.StatusUnauthorized {
 		return resp, nil
 	}
-	// 401：判死分类 + 自动轮转（鉴权面，SDK 边界内——每次 401 都先判死分类，
-	// 判死与重试策略解耦）。
+	// 401：判死分类 + 自动轮转（鉴权面，SDK 边界内——判死分类与重试策略
+	// 解耦，每次 401 都先判死分类）。判死分类属 OAuth AT 概念：
+	// PAT/oauthAuth 不实现轮转接口 → 不判死不重试，401 原样返回（现状保持）。
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if fatal := classifyAT401(body); fatal != nil {
-		c.auth.Fatal(fatal)
-		return nil, fatal // 判死：Fatal 态 + 透传，不重试
-	}
 	trigger, ok := c.auth.(refreshTrigger)
 	if !ok {
-		return respWithBody(resp, http.StatusUnauthorized, body), nil // PAT/oauthAuth：原样返回 401
+		return respWithBody(resp, http.StatusUnauthorized, body), nil
+	}
+	if fatal := classifyAT401(body); fatal != nil {
+		// 判死：Fatal 态 + OnAuthFatal 至多一次（私有接口 authFatalTrigger，
+		// 与 refreshTrigger 同实现者）+ 透传，不重试。
+		if f, ok := c.auth.(authFatalTrigger); ok {
+			f.authFatal(fatal)
+		}
+		return nil, fatal
 	}
 	if err := trigger.refresh(ctx); err != nil {
 		return nil, err // refresh 失败（fatal / RefreshError）透传
@@ -204,7 +209,9 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 		// 二次 401：同样过判死分类（并发吊销不错过判死），非判死则原样返回
 		// （防重试风暴）。
 		if fatal := classifyAT401(body2); fatal != nil {
-			c.auth.Fatal(fatal)
+			if f, ok := c.auth.(authFatalTrigger); ok {
+				f.authFatal(fatal)
+			}
 			return nil, fatal
 		}
 		return respWithBody(resp2, http.StatusUnauthorized, body2), nil

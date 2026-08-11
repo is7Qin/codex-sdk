@@ -64,11 +64,16 @@ const (
 // 提供 refresh_token 材料，经 WithOnTokenRotated 接收新 at+rt、经
 // WithOnAuthFatal 接收账号级终止通知。
 //
-// refreshToken 必传（构造期即拒绝空值——防空 rt 永久失败）；WithInitialAccessToken
+// refreshToken 必传——空值构造 panic（构造器返回 Auth 接口无 error 通道，
+// panic 是签名约束下唯一选择，防空 rt 永久失败）；WithInitialAccessToken
 // 可预置初始 at（传了直接用、401/失效才轮转，不传则首请求前先用 rt 换取）。
 // 构造器直接返回 Auth 接口（具体类型不外露，防 copylocks：接口拷贝共享同一
 // 装箱数据，单飞锁随指针共享）；多 client 共享同一 Auth 时状态天然共享
 // （并发 401 单飞恰一次 refresh）。
+//
+// refresh 请求走 http.DefaultClient（env override CODEX_REFRESH_TOKEN_URL_OVERRIDE
+// 换端点）——不受 SDK WithTransport / WithTimeout 影响（传输层注入不做，
+// 观测/代理需求以 env override 或自定义 RoundTripper 换 DefaultClient 实现）。
 //
 // 与 OAuth(tokenProvider) 低层回调的关系：后者保留（自定义 token 源），
 // 前者覆盖 RT 轮转协议面。PAT(token) 无轮转语义，不受影响。
@@ -199,6 +204,14 @@ func (r *rotationAuth) setFatal(err error) {
 	}
 }
 
+// authFatal 是 AT 401 判死路径的终止入口（私有接口 authFatalTrigger）：与
+// 公开 Fatal(err)（网关显式终止，不触发回调）的区别是走 setFatal——
+// 触发 OnAuthFatal 至多一次 + Fatal 态。spec 2b：AT 判死码命中同样要
+// 一次性回调通知网关（与 RT 判死路径对称）。
+func (r *rotationAuth) authFatal(err error) {
+	r.setFatal(err)
+}
+
 // refresh 是单飞入口（refreshTrigger 接口）：并发调用共享一次 refresh，
 // 结果一致返回；调用方 ctx 取消只退出本调用（不污染单飞——下次可再试）。
 func (r *rotationAuth) refresh(ctx context.Context) error {
@@ -249,13 +262,15 @@ func (r *rotationAuth) doRefresh(ctx context.Context) error {
 	v := "Bearer " + at // 缓存完整头值（每轮转计算一次）
 	r.at.Store(&v)
 	if r.onTokenRotated != nil {
-		if err := r.callRotate(at, rt); err != nil {
+		// 回调传保留后的有效值（r.rt 内存值——SDK 下次 refresh 将使用的 rt）：
+		// 响应缺 refresh_token 时回调收到旧 rt，网关盲写 upsert 也不会落空。
+		if err := r.callRotate(at, r.rt); err != nil {
 			// D4：回调失败不阻塞请求——本次 at 放行，记 pending 下次 refresh 前重试。
-			r.pendingAt, r.pendingRt = at, rt
+			r.pendingAt, r.pendingRt = at, r.rt
 			r.pendingSet = true
 			r.callbackFails++
 			if r.callbackFails >= r.tokenRotatedRetry {
-				fatalErr := fmt.Errorf("codexsdk: 轮转回调连续失败 %d 次（%v），令牌持久化中断", r.callbackFails, err)
+				fatalErr := &CallbackDeliveryError{Attempts: r.callbackFails, Err: err}
 				r.setFatal(fatalErr)
 				return fatalErr
 			}
@@ -274,14 +289,15 @@ func (r *rotationAuth) deliverPendingRotate() error {
 		r.pendingSet = false
 		return nil // 无回调可交付：清 pending
 	}
-	if err := r.callRotate(r.pendingAt, r.pendingRt); err == nil {
+	cbErr := r.callRotate(r.pendingAt, r.pendingRt)
+	if cbErr == nil {
 		r.pendingSet = false
 		r.callbackFails = 0
 		return nil
 	}
 	r.callbackFails++
 	if r.callbackFails >= r.tokenRotatedRetry {
-		fatalErr := fmt.Errorf("codexsdk: 轮转回调连续失败 %d 次，令牌持久化中断", r.callbackFails)
+		fatalErr := &CallbackDeliveryError{Attempts: r.callbackFails, Err: cbErr}
 		r.setFatal(fatalErr)
 		return fatalErr
 	}
@@ -568,9 +584,10 @@ func WithInitialAccessToken(at string) OAuthOption {
 
 // WithOnTokenRotated 设置轮转回调：每次 refresh 成功产出新 at+rt 时同步调用
 // （成功投递时每轮转至多一次；回调在单飞内执行，阻塞并发等待者——应快速
-// 返回，本地 upsert 毫秒级）。回调失败（panic）不阻塞请求：本次 at 放行，
-// 下次 refresh 前重试投递（幂等 upsert 由调用方保证），连续失败达
-// WithTokenRotatedRetry 阈值 → OnAuthFatal。
+// 返回，本地 upsert 毫秒级）。rt 为 SDK 内存有效值——响应缺 refresh_token
+// 时保留旧 rt，回调收到该保留值（网关盲写 upsert 不落空，幂等）。回调失败
+// （panic）不阻塞请求：本次 at 放行，下次 refresh 前重试投递，连续失败达
+// WithTokenRotatedRetry 阈值 → OnAuthFatal（CallbackDeliveryError）。
 func WithOnTokenRotated(fn func(at, rt string)) OAuthOption {
 	return func(c *oauthConfig) { c.onTokenRotated = fn }
 }
@@ -609,4 +626,11 @@ func WithTokenRotatedRetry(max int) OAuthOption {
 // 无自动轮转（PAT 场景 401 原样返回，现状保持）。
 type refreshTrigger interface {
 	refresh(ctx context.Context) error
+}
+
+// authFatalTrigger 是 AT 401 判死路径的通知接口（私有）：rotationAuth 实现为
+// authFatal（setFatal——Fatal 态 + OnAuthFatal 至多一次，与 RT 判死路径对称）。
+// oauthAuth/patAuth 不实现——PAT 场景 401 原样返回，本无判死分类。
+type authFatalTrigger interface {
+	authFatal(err error)
 }

@@ -521,7 +521,8 @@ func TestHTTP401AutoRotate(t *testing.T) {
 		}
 	})
 
-	t.Run("首次 401 判死码不重试", func(t *testing.T) {
+	t.Run("首次 401 判死码不重试且 OnAuthFatal 至多一次", func(t *testing.T) {
+		var fatalCalls atomic.Int32
 		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"x"}`})
 		var reqs atomic.Int32
 		respSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -531,7 +532,8 @@ func TestHTTP401AutoRotate(t *testing.T) {
 		}))
 		t.Cleanup(respSrv.Close)
 
-		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
+		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"),
+			WithOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
 		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
 		var are *AuthPermanentlyRevokedError
@@ -544,6 +546,9 @@ func TestHTTP401AutoRotate(t *testing.T) {
 		if m.callCount() != 0 || reqs.Load() != 1 {
 			t.Fatalf("判死不 refresh 不重试: refresh=%d reqs=%d", m.callCount(), reqs.Load())
 		}
+		if fatalCalls.Load() != 1 {
+			t.Fatalf("AT 判死应触发 OnAuthFatal 恰一次（与 RT 判死路径对称）, got %d", fatalCalls.Load())
+		}
 		// Fatal 态：第二次 Do 请求未发出（Authorization 直接报错）
 		_, err = hc.Do(context.Background(), []byte(`{}`))
 		if !errors.As(err, &are) {
@@ -552,9 +557,13 @@ func TestHTTP401AutoRotate(t *testing.T) {
 		if reqs.Load() != 1 {
 			t.Fatalf("Fatal 态后不应发请求, reqs = %d", reqs.Load())
 		}
+		if fatalCalls.Load() != 1 {
+			t.Fatalf("OnAuthFatal 应至多一次, got %d", fatalCalls.Load())
+		}
 	})
 
-	t.Run("二次 401 判死码仍判死", func(t *testing.T) {
+	t.Run("二次 401 判死码仍判死且 OnAuthFatal 至多一次", func(t *testing.T) {
+		var fatalCalls atomic.Int32
 		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new"}`})
 		var reqs atomic.Int32
 		respSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -569,7 +578,8 @@ func TestHTTP401AutoRotate(t *testing.T) {
 		}))
 		t.Cleanup(respSrv.Close)
 
-		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
+		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"),
+			WithOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
 		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
 		var are *AuthPermanentlyRevokedError
@@ -581,6 +591,32 @@ func TestHTTP401AutoRotate(t *testing.T) {
 		}
 		if m.callCount() != 1 || reqs.Load() != 2 {
 			t.Fatalf("应恰一次 refresh + 两次请求: refresh=%d reqs=%d", m.callCount(), reqs.Load())
+		}
+		if fatalCalls.Load() != 1 {
+			t.Fatalf("二次 401 判死应触发 OnAuthFatal 恰一次, got %d", fatalCalls.Load())
+		}
+	})
+
+	t.Run("PAT 401 含判死码体原样返回不判死", func(t *testing.T) {
+		// 判死分类属 OAuth AT 概念：PAT 无轮转无状态，401 一律原样 HTTPError
+		//（即便响应体含 token_revoked），分类不执行（现状保持）。
+		respSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"token_revoked"}}`))
+		}))
+		t.Cleanup(respSrv.Close)
+
+		hc := NewHTTPClient(PAT("p"), WithBaseURL(respSrv.URL))
+		_, err := hc.Do(context.Background(), []byte(`{}`))
+		var he *HTTPError
+		if !errors.As(err, &he) {
+			t.Fatalf("PAT 场景应原样返回 *HTTPError, got %T: %v", err, err)
+		}
+		if he.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("StatusCode = %d, 期望 401", he.StatusCode)
+		}
+		if _, ok := err.(*AuthPermanentlyRevokedError); ok {
+			t.Fatal("PAT 场景不应做 AT 判死分类")
 		}
 	})
 }
@@ -773,15 +809,23 @@ func TestPATAndOAuthNoop(t *testing.T) {
 }
 
 // TestRotationRTMissingTokenRetained：RefreshResponse 缺 refresh_token 时
-// 内存旧 rt 保留（仅非空覆盖，防空 rt 永久失败）。
+// 内存旧 rt 保留（仅非空覆盖，防空 rt 永久失败）——回调与后续 refresh 均用
+// 保留值（网关盲写 upsert 不落空）。
 func TestRotationRTMissingTokenRetained(t *testing.T) {
 	m := newMockRefresh(t,
 		refreshStep{status: 200, body: `{"access_token":"at-1"}`}, // 无 refresh_token
 		refreshStep{status: 200, body: `{"access_token":"at-2","refresh_token":"rt-2"}`},
 	)
-	auth := OAuthWithRotation("rt-original")
+	var cbAt, cbRt string
+	auth := OAuthWithRotation("rt-original", WithOnTokenRotated(func(at, rt string) {
+		cbAt, cbRt = at, rt
+	}))
 	if h, err := auth.Authorization(context.Background()); err != nil || h != "Bearer at-1" {
 		t.Fatalf("Authorization: %q %v", h, err)
+	}
+	// 回调应收到保留后的旧 rt（而非响应原始空值）
+	if cbAt != "at-1" || cbRt != "rt-original" {
+		t.Fatalf("回调收到 (%q, %q), 期望 (at-1, rt-original)——缺 rt 时应传保留值", cbAt, cbRt)
 	}
 	auth.Invalidate()
 	if h, err := auth.Authorization(context.Background()); err != nil || h != "Bearer at-2" {
@@ -847,11 +891,15 @@ func TestRotationCallbackRetry(t *testing.T) {
 		}
 
 		// Invalidate → refresh 2：先重试 pending（第 2 次失败）→ 新轮转回调（第 3 次失败）
-		// → 达阈值 → OnAuthFatal + Fatal 态
+		// → 达阈值 → OnAuthFatal + Fatal 态（*CallbackDeliveryError，errors.As 可区分）
 		auth.Invalidate()
 		_, err = auth.Authorization(context.Background())
-		if err == nil {
-			t.Fatal("回调达阈值应返回错误")
+		var cde *CallbackDeliveryError
+		if !errors.As(err, &cde) {
+			t.Fatalf("回调达阈值应返回 *CallbackDeliveryError, got %T: %v", err, err)
+		}
+		if cde.Attempts != 3 {
+			t.Fatalf("Attempts = %d, 期望 3", cde.Attempts)
 		}
 		if cbCalls.Load() != 3 || fatalCalls.Load() != 1 {
 			t.Fatalf("cb=%d fatal=%d, 期望 cb=3 fatal=1", cbCalls.Load(), fatalCalls.Load())

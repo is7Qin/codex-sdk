@@ -34,11 +34,15 @@
 // OAuthWithRotation 边界：refresh 轮转协议 / 响应解析 / 判死分类 / 退避重试
 // 属鉴权面，SDK 自包含（"零协议解析"纪律指 responses 业务协议——type/usage/
 // 事件构造/计费语义不解析，鉴权错误分类不在此列）。RefreshResponse 仅非空覆盖
-// （缺 refresh_token 保留旧 rt）；refresh 退避 SDK 自有默认（base 200ms / cap
-// 30s / 上限 3 次，WithBackoff 可调）；token 端点 401 无条件判死、RT 判死码
-// 10 个（大小写不敏感）、账号禁用类（400 org disabled / KYC / 402）→
-// OnAuthFatal 一次性 + Fatal 态；网络/5xx/429/其他非 2xx 退避重试，耗尽 →
-// RefreshError（非 fatal，下次可再试）。
+// （缺 refresh_token 保留旧 rt，回调与后续 refresh 均用保留值）；refresh 退避
+// SDK 自有默认（base 200ms / cap 30s / 上限 3 次，WithBackoff 可调）；token
+// 端点 401 无条件判死、RT 判死码 10 个（大小写不敏感）、账号禁用类（400 org
+// disabled / KYC / 402）、AT 401 判死码（token_invalidated / token_revoked /
+// detail:"Unauthorized"）→ OnAuthFatal 一次性 + Fatal 态；网络/5xx/429/其他
+// 非 2xx 退避重试，耗尽 → RefreshError（非 fatal，下次可再试）。空 refreshToken
+// 构造 panic（构造器返回 Auth 接口无 error 通道，签名约束下唯一选择）。
+// refresh 请求走 http.DefaultClient（env override 换端点），不受 WithTransport /
+// WithTimeout 影响。
 //
 // # 性能语义（性能优先：懒构建 + 热路径低分配）
 //
