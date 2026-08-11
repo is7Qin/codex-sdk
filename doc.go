@@ -6,8 +6,17 @@
 // 本库只负责协议 / 传输 / 鉴权 / 伪装：
 //   - Responses WebSocket：Dial / 帧字节收发（文本与二进制帧原样透传）/ 心跳保活 /
 //     关闭码透传（Close(status, reason)，急断 CloseNow）
-//   - Responses HTTP：POST /v1/responses 请求构造 / 非流式响应 / 流式 SSE 事件帧提取
-//   - 升级与请求鉴权注入（PAT 静态 / OAuth 刷新回调，Auth 接口）
+//   - Responses HTTP：POST 请求构造 / 非流式响应 / 流式 SSE 事件帧提取
+//   - 上游 URL 内置维护：默认 DefaultResponsesURL（完整 responses 端点直用，
+//     不再拼 /responses）；WS 由该端点派生（http→ws / https→wss 换 scheme，
+//     path/query 保留，对齐真实客户端 provider.rs:92-103）；WithBaseURL 覆盖
+//     （覆盖值按完整端点语义直用）、WithQuery 追加 query（HTTP/WS 双形态）
+//   - 升级与请求鉴权注入（PAT 静态 / OAuth 刷新回调 / OAuthWithRotation 轮转
+//     状态机，Auth 接口）：401 自动轮转（判死分类 + 单飞 refresh + 重试一次，
+//     WS 升级 401 自动重连一次并带 DialError.Refreshed 标记）、RT 判死码集 /
+//     token 端点 401 / 账号禁用类 → 账号级终止（导出错误类型 errors.As 区分，
+//     OnAuthFatal 通知），Invalidate() / Fatal(err) 显式入口（网关解析 WS 判死
+//     事件帧时调用）
 //   - 伪装层（真实 codex 客户端形态对齐，对照见 IMPERSONATION.md）：默认
 //     codex-tui UA/originator（0.147.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
 //     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata 组装（8 key 恒发：
@@ -21,6 +30,15 @@
 // SDK 零协议解析：type / usage / 事件构造与业务语义（计费、透传编排、failover、
 // 会话粘性、内容审核）全部在网关侧（go-proxy-mini）——网关在 SDK 交付的完整
 // 字节上自行解析。不做事件层、不做模式枚举、不做任何业务钩子。
+//
+// OAuthWithRotation 边界：refresh 轮转协议 / 响应解析 / 判死分类 / 退避重试
+// 属鉴权面，SDK 自包含（"零协议解析"纪律指 responses 业务协议——type/usage/
+// 事件构造/计费语义不解析，鉴权错误分类不在此列）。RefreshResponse 仅非空覆盖
+// （缺 refresh_token 保留旧 rt）；refresh 退避 SDK 自有默认（base 200ms / cap
+// 30s / 上限 3 次，WithBackoff 可调）；token 端点 401 无条件判死、RT 判死码
+// 10 个（大小写不敏感）、账号禁用类（400 org disabled / KYC / 402）→
+// OnAuthFatal 一次性 + Fatal 态；网络/5xx/429/其他非 2xx 退避重试，耗尽 →
+// RefreshError（非 fatal，下次可再试）。
 //
 // # 性能语义（性能优先：懒构建 + 热路径低分配）
 //

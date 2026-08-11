@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,6 +73,11 @@ func (m CompressionMode) coder() coderws.CompressionMode {
 type DialError struct {
 	StatusCode int
 	Err        error
+	// Refreshed 表示 SDK 已尝试过 OAuth 轮转刷新后仍失败（WS 升级 401 →
+	// 单飞 refresh → 自动重连一次仍失败）。网关据此知道已轮转过，避免
+	// 与 SDK 各自轮转造成双份刷新。仅 401 路径可置 true；PAT/oauthAuth
+	// 不轮转，恒为 false。
+	Refreshed bool
 }
 
 func (e *DialError) Error() string {
@@ -85,6 +91,9 @@ func (e *DialError) Unwrap() error { return e.Err }
 
 // options 是 Dial / NewHTTPClient 的共享配置（无关字段按形态忽略）。
 type options struct {
+	baseURL string     // 上游 responses 端点（默认 DefaultResponsesURL；WithBaseURL 覆盖）
+	query   url.Values // WithQuery 注入的 URL query 参数（HTTP/WS 双形态）
+
 	compression  CompressionMode
 	readLimit    int64
 	pingInterval time.Duration
@@ -109,6 +118,7 @@ type options struct {
 
 func defaultOptions() options {
 	return options{
+		baseURL:      DefaultResponsesURL,
 		compression:  CompressionDisabled,
 		readLimit:    defaultReadLimit,
 		pingInterval: defaultPingInterval,
@@ -122,6 +132,28 @@ func defaultOptions() options {
 
 // Option 配置 Dial / NewHTTPClient。
 type Option func(*options)
+
+// WithBaseURL 覆盖内置上游 URL（默认 DefaultResponsesURL）——覆盖值按完整
+// responses 端点语义直用：SDK 不再自动拼接 /responses（与旧版 baseURL 参数
+// 语义不同，显式行为变更——自建上游传 https://selfhost/v1 将打 /v1 而非
+// /v1/responses，避免静默 404 请传完整端点）。HTTP 与 WS（Dial 由该值派生
+// scheme）双形态生效。
+func WithBaseURL(u string) Option {
+	return func(o *options) { o.baseURL = u }
+}
+
+// WithQuery 注入 URL query 参数（HTTP 请求与 WS 升级 URL 双形态生效；
+// 与 WithBaseURL 同用时拼接到覆盖 URL；base URL 自带 query 时追加而非覆盖）。
+// 保留面非对齐面——真实客户端 Responses 本无 query 版本参数
+// （IMPERSONATION.md:130），本选项为既有调用方注入能力（beta 等）的延续。
+func WithQuery(key, value string) Option {
+	return func(o *options) {
+		if o.query == nil {
+			o.query = make(url.Values)
+		}
+		o.query.Add(key, value)
+	}
+}
 
 // WithCompression 设置 WS 压缩模式（默认 CompressionDisabled）。
 func WithCompression(mode CompressionMode) Option {
@@ -264,15 +296,23 @@ type Client struct {
 	closeErr  error
 }
 
-// Dial 建立到 url 的 Responses WebSocket 连接（url 为 wss://...，上游版本
-// 参数可由调用方以 query 注入或 WithBeta 以请求头注入，默认不带）。
+// Dial 建立到内置上游的 Responses WebSocket 连接：URL 由 SDK 维护——
+// 默认 DefaultResponsesURL 派生（http→ws / https→wss 换 scheme，path/query
+// 保留，对齐真实客户端 provider.rs:92-103），WithBaseURL / WithQuery 可覆盖
+// 与追加（query 与 WithBaseURL 同用时拼接到覆盖 URL）。
 //
 // auth 注入升级请求的 Authorization 头（PAT 静态 / OAuth 每次升级取新 token）。
+//
+// WS 升级 401 自动轮转（OAuthWithRotation 专属）：DialError{401}（升级无
+// 响应体不可判死）→ SDK 内单飞 refresh → 自动重连一次；仍 401 → 返回
+// DialError 且 Refreshed=true（网关据此知道已轮转过）。PAT/oauthAuth 不轮转
+// （401 直接返回 DialError，现状保持）；refresh 失败（fatal / RefreshError）
+// 经本方法透传，不被 DialError 包层吞掉（errors.As 可区分）。
 //
 // 连接建立后启动心跳：每 pingInterval 发送 WS 层 ping（默认 30s）。心跳依赖
 // 调用方的常驻 Recv 循环处理 pong（见 Client 并发语义）。心跳失败视为连接
 // 已死：立即 CloseNow 解除阻塞中的 Recv（返回网络错误），网关据此触发重连。
-func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, error) {
+func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 	if auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
@@ -280,56 +320,87 @@ func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, 
 	for _, o := range opts {
 		o(&cfg)
 	}
-
-	hdr := make(http.Header, 10)
-	token, err := auth.Authorization(ctx)
+	wsURL, err := wsURLOf(cfg.baseURL, cfg.query)
 	if err != nil {
-		return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
-	}
-	hdr.Set("Authorization", token)
-	// 伪装层默认头（WithHeader 可覆盖）。
-	hdr.Set("User-Agent", DefaultCodexUserAgent)
-	hdr.Set("Originator", DefaultOriginator)
-	hdr.Set("OpenAI-Beta", "responses_websockets="+cfg.beta)
-	// 会话标识握手头（真实客户端恒带；trace 不进握手头，只进帧内 metadata）。
-	if s := cfg.session; s != nil {
-		if s.SessionID != "" {
-			hdr.Set(HeaderSessionID, s.SessionID)
-		}
-		if s.ThreadID != "" {
-			hdr.Set(HeaderThreadID, s.ThreadID)
-		}
-		clientRequestID := s.ClientRequestID
-		if clientRequestID == "" {
-			clientRequestID = s.ThreadID
-		}
-		if clientRequestID != "" {
-			hdr.Set(HeaderClientRequestID, clientRequestID)
-		}
-		if s.WindowID != "" {
-			hdr.Set(HeaderWindowID, s.WindowID)
-		}
-	}
-	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
-	for k, vals := range cfg.headers {
-		hdr.Del(k)
-		for _, v := range vals {
-			hdr.Add(k, v)
-		}
+		return nil, err
 	}
 
-	dopts := &coderws.DialOptions{HTTPHeader: hdr}
-	if cfg.compression != CompressionDisabled {
-		dopts.CompressionMode = cfg.compression.coder()
-		dopts.CompressionThreshold = defaultCompressionThreshold
-	}
-	conn, resp, err := coderws.Dial(ctx, url, dopts)
-	if err != nil {
-		status := 0
-		if resp != nil {
-			status = resp.StatusCode
+	// 升级头组装（重连时以新 at 重取）。
+	buildHeaders := func(ctx context.Context) (http.Header, error) {
+		hdr := make(http.Header, 10)
+		token, err := auth.Authorization(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
 		}
-		return nil, &DialError{StatusCode: status, Err: err}
+		hdr.Set("Authorization", token)
+		// 伪装层默认头（WithHeader 可覆盖）。
+		hdr.Set("User-Agent", DefaultCodexUserAgent)
+		hdr.Set("Originator", DefaultOriginator)
+		hdr.Set("OpenAI-Beta", "responses_websockets="+cfg.beta)
+		// 会话标识握手头（真实客户端恒带；trace 不进握手头，只进帧内 metadata）。
+		if s := cfg.session; s != nil {
+			if s.SessionID != "" {
+				hdr.Set(HeaderSessionID, s.SessionID)
+			}
+			if s.ThreadID != "" {
+				hdr.Set(HeaderThreadID, s.ThreadID)
+			}
+			clientRequestID := s.ClientRequestID
+			if clientRequestID == "" {
+				clientRequestID = s.ThreadID
+			}
+			if clientRequestID != "" {
+				hdr.Set(HeaderClientRequestID, clientRequestID)
+			}
+			if s.WindowID != "" {
+				hdr.Set(HeaderWindowID, s.WindowID)
+			}
+		}
+		// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
+		for k, vals := range cfg.headers {
+			hdr.Del(k)
+			for _, v := range vals {
+				hdr.Add(k, v)
+			}
+		}
+		return hdr, nil
+	}
+
+	dialWS := func(ctx context.Context) (*coderws.Conn, *http.Response, error) {
+		hdr, err := buildHeaders(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		dopts := &coderws.DialOptions{HTTPHeader: hdr}
+		if cfg.transport != nil {
+			dopts.HTTPClient = &http.Client{Transport: cfg.transport}
+		}
+		if cfg.compression != CompressionDisabled {
+			dopts.CompressionMode = cfg.compression.coder()
+			dopts.CompressionThreshold = defaultCompressionThreshold
+		}
+		return coderws.Dial(ctx, wsURL, dopts)
+	}
+
+	conn, resp, err := dialWS(ctx)
+	if err != nil {
+		status := dialStatus(resp)
+		if status == http.StatusUnauthorized {
+			// WS 升级 401（无响应体不可判死）→ 可轮转：单飞 refresh → 自动重连一次。
+			if tr, ok := auth.(refreshTrigger); ok {
+				if rerr := tr.refresh(ctx); rerr != nil {
+					return nil, rerr // refresh 失败（fatal / RefreshError）透传
+				}
+				conn, resp, err = dialWS(ctx)
+				if err != nil {
+					return nil, &DialError{StatusCode: dialStatus(resp), Err: err, Refreshed: true}
+				}
+			} else {
+				return nil, &DialError{StatusCode: status, Err: err} // PAT/oauthAuth：原样返回
+			}
+		} else {
+			return nil, &DialError{StatusCode: status, Err: err}
+		}
 	}
 	conn.SetReadLimit(cfg.readLimit)
 
@@ -360,6 +431,61 @@ func Dial(ctx context.Context, url string, auth Auth, opts ...Option) (*Client, 
 		go c.heartbeat(cctx)
 	}
 	return c, nil
+}
+
+// buildURL 解析 base + 追加 WithQuery 参数（base URL 自带 query 时追加而非覆盖）。
+func buildURL(base string, query url.Values) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("codexsdk: 解析上游 URL %q 失败: %w", base, err)
+	}
+	appendQuery(u, query)
+	return u.String(), nil
+}
+
+// wsURLOf 由 responses HTTP 端点派生 WS 端点：scheme 替换（http→ws /
+// https→wss；ws/wss 原样保留），path/query 保留 + 追加 WithQuery 参数
+// （对齐真实客户端 provider.rs:92-103 url_for_path 的 scheme 替换与
+// query 双形态拼接）。
+func wsURLOf(base string, query url.Values) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("codexsdk: 解析上游 URL %q 失败: %w", base, err)
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+		// 原样保留
+	default:
+		return "", fmt.Errorf("codexsdk: 不支持的上游 scheme %q（期望 http/https）", u.Scheme)
+	}
+	appendQuery(u, query)
+	return u.String(), nil
+}
+
+// appendQuery 把 WithQuery 参数追加到 URL（已存在同 key 时为多值追加）。
+func appendQuery(u *url.URL, query url.Values) {
+	if len(query) == 0 {
+		return
+	}
+	q := u.Query()
+	for k, vs := range query {
+		for _, v := range vs {
+			q.Add(k, v)
+		}
+	}
+	u.RawQuery = q.Encode()
+}
+
+// dialStatus 提取升级失败响应状态码（coderws 非 101 时返回响应）。
+func dialStatus(resp *http.Response) int {
+	if resp != nil {
+		return resp.StatusCode
+	}
+	return 0
 }
 
 // Send 发送一帧字节（文本帧）。

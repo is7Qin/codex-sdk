@@ -16,3 +16,9 @@ type patAuth struct {
 func (a patAuth) Authorization(context.Context) (string, error) {
 	return "Bearer " + a.token, nil
 }
+
+// Invalidate：PAT 无轮转状态，no-op。
+func (a patAuth) Invalidate() {}
+
+// Fatal：PAT 无轮转状态（失效判定归网关 whoami 复核制），no-op。
+func (a patAuth) Fatal(error) {}

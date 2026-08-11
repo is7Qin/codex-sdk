@@ -37,7 +37,9 @@ func TestHTTPDoRaw(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL+"/v1", PAT("pat-http"))
+	// 内置上游 URL 下沉：WithBaseURL 覆盖值按完整 responses 端点语义直用
+	// （不再自动拼接 /responses），故测试传完整端点 srv.URL+"/v1/responses"。
+	hc := NewHTTPClient(PAT("pat-http"), WithBaseURL(srv.URL+"/v1/responses"))
 	resp, err := hc.Do(context.Background(), []byte(`{"model":"gpt-5","input":"hi"}`))
 	if err != nil {
 		t.Fatalf("Do: %v", err)
@@ -81,7 +83,7 @@ func TestHTTPBetaOverride(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL, PAT("t"), WithHeader("OpenAI-Beta", "responses=v2"))
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL), WithHeader("OpenAI-Beta", "responses=v2"))
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
@@ -102,7 +104,7 @@ func TestHTTPResponsesLiteHeader(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	// 默认：不带 lite 头
-	hc := NewHTTPClient(srv.URL, PAT("t"))
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
 		t.Fatalf("Do（默认）: %v", err)
 	}
@@ -111,7 +113,7 @@ func TestHTTPResponsesLiteHeader(t *testing.T) {
 	}
 
 	// WithHeader 透传
-	hc = NewHTTPClient(srv.URL, PAT("t"), WithHeader(HeaderResponsesLite, "true"))
+	hc = NewHTTPClient(PAT("t"), WithBaseURL(srv.URL), WithHeader(HeaderResponsesLite, "true"))
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
 		t.Fatalf("Do（lite）: %v", err)
 	}
@@ -130,7 +132,7 @@ func TestHTTPDoErrorStatus(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL, PAT("wrong"))
+	hc := NewHTTPClient(PAT("wrong"), WithBaseURL(srv.URL))
 	_, err := hc.Do(context.Background(), []byte(`{}`))
 	var he *HTTPError
 	if !errors.As(err, &he) {
@@ -168,10 +170,10 @@ func TestHTTPStreamSSE(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	var providerCalls atomic.Int32
-	hc := NewHTTPClient(srv.URL, OAuth(func(ctx context.Context) (string, error) {
+	hc := NewHTTPClient(OAuth(func(ctx context.Context) (string, error) {
 		providerCalls.Add(1)
 		return "oauth-1", nil
-	}))
+	}), WithBaseURL(srv.URL))
 
 	// 回调内的原始字节引用 scanner 复用缓冲（仅在回调执行期间有效）——回调内拷贝。
 	var got []string
@@ -205,7 +207,7 @@ func TestHTTPStreamErrorStatus(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL, PAT("t"))
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
 	err := hc.Stream(context.Background(), []byte(`{"stream":true}`), func(raw []byte) error { return nil })
 	var he *HTTPError
 	if !errors.As(err, &he) || he.StatusCode != http.StatusTooManyRequests {
@@ -223,7 +225,7 @@ func TestHTTPCallbackErrorAbortsStream(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL, PAT("t"))
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
 	sentinel := errors.New("stop")
 	err := hc.Stream(context.Background(), []byte(`{}`), func(raw []byte) error {
 		return sentinel
@@ -233,8 +235,11 @@ func TestHTTPCallbackErrorAbortsStream(t *testing.T) {
 	}
 }
 
-// TestHTTPBaseURLResponsesSuffix：baseURL 已含 /responses 时不重复拼接。
-func TestHTTPBaseURLResponsesSuffix(t *testing.T) {
+// TestHTTPBaseURLFullEndpointSemantics：WithBaseURL 覆盖值按完整端点语义直用
+// ——不再自动拼接 /responses（与旧版 baseURL 参数语义不同，显式行为变更）：
+// 传 srv.URL+"/v1" 打 /v1 而非 /v1/responses；传完整端点原样命中。
+func TestHTTPBaseURLFullEndpointSemantics(t *testing.T) {
+	// 完整端点原样命中
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/custom/responses" {
 			http.Error(w, "bad path: "+r.URL.Path, http.StatusNotFound)
@@ -245,9 +250,25 @@ func TestHTTPBaseURLResponsesSuffix(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL+"/custom/responses", PAT("t"))
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL+"/custom/responses"))
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
-		t.Fatalf("Do: %v", err)
+		t.Fatalf("Do（完整端点）: %v", err)
+	}
+
+	// 不自动拼接 /responses：/v1 打 /v1
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1" {
+			http.Error(w, "bad path: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x"}`))
+	}))
+	t.Cleanup(srv2.Close)
+
+	hc2 := NewHTTPClient(PAT("t"), WithBaseURL(srv2.URL+"/v1"))
+	if _, err := hc2.Do(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("Do（/v1 应直用不拼接）: %v", err)
 	}
 }
 
@@ -258,7 +279,7 @@ func TestHTTPNilAuth(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL, nil)
+	hc := NewHTTPClient(nil, WithBaseURL(srv.URL))
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err == nil {
 		t.Fatal("auth 为 nil 应报错")
 	}
@@ -293,7 +314,7 @@ func TestHTTPConnectionReuse(t *testing.T) {
 	srv.Start()
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL, PAT("t"))
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
 	for i := 0; i < 3; i++ {
 		if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
 			t.Fatalf("Do #%d: %v", i, err)
@@ -317,7 +338,7 @@ func TestHTTPTurnStateNoEcho(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL, PAT("t"))
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
 	for i := 0; i < 3; i++ {
 		resp, err := hc.Do(context.Background(), []byte(`{}`))
 		if err != nil {
@@ -346,7 +367,7 @@ func TestHTTPStreamCapturesTurnState(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(srv.URL, PAT("t"))
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
 	if err := hc.Stream(context.Background(), []byte(`{"stream":true}`), func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}

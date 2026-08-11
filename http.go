@@ -8,13 +8,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
 
 // defaultMaxLineSize HTTP SSE 单行上限（与 WS ReadLimit 同量级）。
 const defaultMaxLineSize = 16 * 1024 * 1024
+
+// DefaultResponsesURL 是内置默认上游 responses 完整端点（用户拍板 2026-08-12：
+// SDK 内维护请求 url，网关不传 url；完整端点直用，SDK 不再拼 /responses）。
+// WS 由该端点派生（http→ws / https→wss 换 scheme，path/query 保留）。
+// WithBaseURL 可覆盖。
+const DefaultResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 
 // HTTPClient 是 Responses HTTP 客户端（懒构建：NewHTTPClient 零开销，
 // 首次 Do/Stream 才创建 http.Client，连接池复用）。
@@ -23,7 +28,7 @@ const defaultMaxLineSize = 16 * 1024 * 1024
 // turn-state 自动捕获，经 TurnState() / HTTPResponse.TurnState 暴露给网关；
 // HTTP 请求不携带 x-codex-turn-state 头（头回传仅 WS 路径，见 Client）。
 type HTTPClient struct {
-	baseURL string // 上游 base URL
+	baseURL string // 上游 responses 端点（默认 DefaultResponsesURL）
 	auth    Auth
 	opts    options
 
@@ -32,15 +37,18 @@ type HTTPClient struct {
 	turnState atomic.Value // string；x-codex-turn-state 响应侧捕获值
 }
 
-// NewHTTPClient 创建 Responses HTTP 客户端。baseURL 为上游 base URL
-// （如 https://api.openai.com/v1），不含 /responses 后缀时自动拼接，已含则
-// 原样使用。上游版本参数可由 WithBeta 注入或拼入 baseURL。
-func NewHTTPClient(baseURL string, auth Auth, opts ...Option) *HTTPClient {
+// NewHTTPClient 创建 Responses HTTP 客户端。上游 URL 由 SDK 内置维护：
+// 默认 DefaultResponsesURL（完整 responses 端点，不再自动拼接 /responses），
+// WithBaseURL 可覆盖（覆盖值同样按完整端点语义直用——传 https://selfhost/v1
+// 将打 /v1 而非 /v1/responses，与旧版 baseURL 语义不同，显式行为变更；
+// 自建上游请传完整 responses 端点 URL）。WithQuery 注入的 query 参数
+// 拼接到最终 URL。
+func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 	cfg := defaultOptions()
 	for _, o := range opts {
 		o(&cfg)
 	}
-	return &HTTPClient{baseURL: baseURL, auth: auth, opts: cfg}
+	return &HTTPClient{baseURL: cfg.baseURL, auth: auth, opts: cfg}
 }
 
 // CloseIdleConnections 关闭底层空闲连接（懒构建未使用时为零开销调用；
@@ -74,8 +82,16 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("codexsdk: upstream HTTP %d", e.StatusCode)
 }
 
-// Do 发送 POST <base>/responses 请求（payload 为完整 JSON 请求体，调用方
+// Do 发送 POST <responses 端点> 请求（payload 为完整 JSON 请求体，调用方
 // 决定 stream 等字段），原样返回非流式响应。非 2xx 返回 *HTTPError。
+//
+// 401 自动轮转（OAuthWithRotation 专属）：每次 401 先做判死分类（响应体
+// error_code/error_type/detail，大小写不敏感）——判死码 → Fatal 态 +
+// 返回 *AuthPermanentlyRevokedError（不重试）；非判死 → 单飞 refresh →
+// 自动重试一次；二次 401 同样过判死分类后原样返回。PAT/oauthAuth 不轮转
+// （401 原样返回 HTTPError，现状保持）。fatal 类错误（refresh 路径
+// RefreshOAuthError / AccountDisabledError 等）经本方法透传，不被 HTTPError
+// 包层吞掉（errors.As 可区分）。
 func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, error) {
 	resp, err := c.do(ctx, payload)
 	if err != nil {
@@ -101,7 +117,8 @@ func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, err
 // 行切片——回调内的字节引用 scanner 复用缓冲，仅在回调执行期间有效；
 // 跨回调保留需自行拷贝），[DONE] 标记流正常终止。
 //
-// fn 返回错误立即终止读取并透传该错误。非 2xx 返回 *HTTPError。
+// fn 返回错误立即终止读取并透传该错误。非 2xx 返回 *HTTPError；
+// 401 自动轮转语义同 Do。
 func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []byte) error) error {
 	resp, err := c.do(ctx, payload)
 	if err != nil {
@@ -150,10 +167,53 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	targetURL := strings.TrimRight(c.baseURL, "/")
-	if !strings.HasSuffix(targetURL, "/responses") {
-		targetURL += "/responses"
+	targetURL, err := buildURL(c.baseURL, c.opts.query)
+	if err != nil {
+		return nil, err
 	}
+	resp, err := c.sendRequest(ctx, targetURL, payload)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+	// 401：判死分类 + 自动轮转（鉴权面，SDK 边界内——每次 401 都先判死分类，
+	// 判死与重试策略解耦）。
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if fatal := classifyAT401(body); fatal != nil {
+		c.auth.Fatal(fatal)
+		return nil, fatal // 判死：Fatal 态 + 透传，不重试
+	}
+	trigger, ok := c.auth.(refreshTrigger)
+	if !ok {
+		return respWithBody(resp, http.StatusUnauthorized, body), nil // PAT/oauthAuth：原样返回 401
+	}
+	if err := trigger.refresh(ctx); err != nil {
+		return nil, err // refresh 失败（fatal / RefreshError）透传
+	}
+	// 自动重试一次（新 at）。
+	resp2, err := c.sendRequest(ctx, targetURL, payload)
+	if err != nil {
+		return nil, err
+	}
+	if resp2.StatusCode == http.StatusUnauthorized {
+		body2, _ := io.ReadAll(resp2.Body)
+		_ = resp2.Body.Close()
+		// 二次 401：同样过判死分类（并发吊销不错过判死），非判死则原样返回
+		// （防重试风暴）。
+		if fatal := classifyAT401(body2); fatal != nil {
+			c.auth.Fatal(fatal)
+			return nil, fatal
+		}
+		return respWithBody(resp2, http.StatusUnauthorized, body2), nil
+	}
+	return resp2, nil
+}
+
+// sendRequest 构造 POST 请求并执行（伪装层默认头 + 调用方 WithHeader 覆盖）。
+func (c *HTTPClient) sendRequest(ctx context.Context, targetURL string, payload []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 构造请求失败: %w", err)
@@ -182,6 +242,17 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 		return nil, fmt.Errorf("codexsdk: 上游请求失败: %w", err)
 	}
 	return resp, nil
+}
+
+// respWithBody 用已读出的 body 构造可重读响应（401 分类后 body 已消费，
+// Do/Stream 按原逻辑重读并组装 HTTPError）。
+func respWithBody(orig *http.Response, status int, body []byte) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     orig.Header,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Request:    orig.Request,
+	}
 }
 
 // TurnState 返回最近一次响应捕获的 x-codex-turn-state（仅响应侧暴露——

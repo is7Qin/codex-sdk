@@ -129,7 +129,7 @@ func startReader(t *testing.T, c *Client) chan []byte {
 // （关闭伪装层，纯传输路径字节全等断言）。
 func TestDialPATAuthAndRoundtrip(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("test-pat"),
+	c, err := Dial(context.Background(), PAT("test-pat"), WithBaseURL(url),
 		WithPayloadFiltering(false), WithTraceAuto(false), WithTurnAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -158,7 +158,7 @@ func TestDialPATAuthAndRoundtrip(t *testing.T) {
 // TestDialRejectsBadAuth：升级 401 时返回 DialError（携带状态码）。
 func TestDialRejectsBadAuth(t *testing.T) {
 	url, _ := startEchoServer(t, "Bearer correct")
-	_, err := Dial(context.Background(), url, PAT("wrong"))
+	_, err := Dial(context.Background(), PAT("wrong"), WithBaseURL(url))
 	var de *DialError
 	if !errors.As(err, &de) {
 		t.Fatalf("期望 *DialError, got %T: %v", err, err)
@@ -176,7 +176,7 @@ func TestOAuthProviderCalledPerDial(t *testing.T) {
 		calls.Add(1)
 		return "oauth-1", nil
 	}
-	c1, err := Dial(context.Background(), url, OAuth(provider))
+	c1, err := Dial(context.Background(), OAuth(provider), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestOAuthProviderCalledPerDial(t *testing.T) {
 		t.Fatalf("provider 调用次数 = %d, 期望 1", calls.Load())
 	}
 
-	c2, err := Dial(context.Background(), url, OAuth(provider))
+	c2, err := Dial(context.Background(), OAuth(provider), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("第二次 Dial: %v", err)
 	}
@@ -203,9 +203,9 @@ func TestOAuthProviderCalledPerDial(t *testing.T) {
 // TestOAuthProviderErrorAbortsDial：provider 错误透传且不发起升级。
 func TestOAuthProviderErrorAbortsDial(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	_, err := Dial(context.Background(), url, OAuth(func(ctx context.Context) (string, error) {
+	_, err := Dial(context.Background(), OAuth(func(ctx context.Context) (string, error) {
 		return "", errors.New("token expired")
-	}))
+	}), WithBaseURL(url))
 	if err == nil || !strings.Contains(err.Error(), "token expired") {
 		t.Fatalf("期望鉴权错误透传, got %v", err)
 	}
@@ -214,7 +214,7 @@ func TestOAuthProviderErrorAbortsDial(t *testing.T) {
 // TestDialNilAuth：auth 为 nil 直接报错。
 func TestDialNilAuth(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	if _, err := Dial(context.Background(), url, nil); err == nil {
+	if _, err := Dial(context.Background(), nil, WithBaseURL(url)); err == nil {
 		t.Fatal("auth 为 nil 应报错")
 	}
 }
@@ -223,7 +223,7 @@ func TestDialNilAuth(t *testing.T) {
 // WithHeader / WithBeta 可覆盖。
 func TestWSDefaultHeadersAndOverride(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestWSDefaultHeadersAndOverride(t *testing.T) {
 
 	// 覆盖：自定义 UA + beta 任意值（现役唯一真实值 DefaultBetaWS=2026-02-06）
 	url2, st2 := startEchoServer(t, "")
-	c2, err := Dial(context.Background(), url2, PAT("t"),
+	c2, err := Dial(context.Background(), PAT("t"), WithBaseURL(url2),
 		WithHeader("User-Agent", "custom-ua"), WithBeta("2026-02-04"))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -254,7 +254,7 @@ func TestWSDefaultHeadersAndOverride(t *testing.T) {
 // TestBetaAndCustomHeaders：OpenAI-Beta 与自定义头注入升级请求。
 func TestBetaAndCustomHeaders(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"),
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url),
 		WithBeta("2026-02-04"), WithHeader("x-custom", "abc"))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -270,7 +270,7 @@ func TestBetaAndCustomHeaders(t *testing.T) {
 // TestPing：WS 层 ping 有 pong 应答（常驻读循环处理 pong），ping 后连接仍可用。
 func TestPing(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"),
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url),
 		WithPayloadFiltering(false), WithTraceAuto(false), WithTurnAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -299,7 +299,7 @@ func TestPing(t *testing.T) {
 // TestHeartbeatKeepalive：短间隔心跳下连接保持存活（常驻读循环处理 pong）。
 func TestHeartbeatKeepalive(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"), WithPingInterval(50*time.Millisecond))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url), WithPingInterval(50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestHeartbeatDeathPath(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { close(release) }) // LIFO：先释放 handler，再关 server
 
-	c, err := Dial(context.Background(), srv.URL, PAT("t"), WithPingInterval(50*time.Millisecond))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(srv.URL), WithPingInterval(50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestHeartbeatDeathPath(t *testing.T) {
 // TestReadLimit：单帧超 ReadLimit 返回 ErrMessageTooBig。
 func TestReadLimit(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"), WithReadLimit(8))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url), WithReadLimit(8))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -373,7 +373,7 @@ func TestReadLimit(t *testing.T) {
 // TestCloseCodePassthrough：关闭码与原因透传 + Close 幂等。
 func TestCloseCodePassthrough(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestCloseCodePassthrough(t *testing.T) {
 // TestCloseNow：CloseNow 立即断开且幂等，CloseNow 后 Close 为 no-op。
 func TestCloseNow(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -430,7 +430,7 @@ func TestBinaryFrameRecv(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := Dial(context.Background(), srv.URL, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(srv.URL))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestBinaryFrameRecv(t *testing.T) {
 // TestRecvBufferOwnership：Recv 返回的缓冲归调用方所有（跨次调用有效）。
 func TestRecvBufferOwnership(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"),
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url),
 		WithPayloadFiltering(false), WithTraceAuto(false), WithTurnAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -485,7 +485,7 @@ var traceparentRe = regexp.MustCompile(`^00-[0-9a-f]{32}-[0-9a-f]{16}-01$`)
 // TestWSTraceHeaders：WS 握手不发 trace 头（trace 只进帧内 client_metadata）。
 func TestWSTraceHeaders(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -509,7 +509,7 @@ func TestWSTraceHeaders(t *testing.T) {
 func TestSessionHeaders(t *testing.T) {
 	url, st := startEchoServer(t, "")
 	sess := Session{SessionID: "s-1", ThreadID: "t-1", WindowID: "t-1:0"}
-	c, err := Dial(context.Background(), url, PAT("t"), WithSession(sess))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url), WithSession(sess))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -545,7 +545,7 @@ func TestSessionHeaders(t *testing.T) {
 	// ClientRequestID 显式提供
 	url2, st2 := startEchoServer(t, "")
 	sess2 := Session{SessionID: "s-2", ThreadID: "t-2", ClientRequestID: "cr-2"}
-	c2, err := Dial(context.Background(), url2, PAT("t"), WithSession(sess2))
+	c2, err := Dial(context.Background(), PAT("t"), WithBaseURL(url2), WithSession(sess2))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -581,7 +581,7 @@ func TestWSTurnState(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := Dial(context.Background(), srv.URL, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(srv.URL))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

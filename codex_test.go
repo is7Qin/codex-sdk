@@ -64,7 +64,7 @@ func TestFilterCodexPayload(t *testing.T) {
 // TestSendDefaultFiltering：Send 默认应用白名单过滤，Options 可关。
 func TestSendDefaultFiltering(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestSendDefaultFiltering(t *testing.T) {
 
 	// 关闭过滤
 	url2, st2 := startEchoServer(t, "")
-	c2, err := Dial(context.Background(), url2, PAT("t"), WithPayloadFiltering(false))
+	c2, err := Dial(context.Background(), PAT("t"), WithBaseURL(url2), WithPayloadFiltering(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestSendDefaultFiltering(t *testing.T) {
 // TestCodexMetaInjection：Send 顶层 client_metadata 组装（浅合并，不覆盖已存在）。
 func TestCodexMetaInjection(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"),
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url),
 		WithCodexMeta(CodexMeta{
 			InstallationID: "inst-1",
 			WindowID:       "win-1",
@@ -174,7 +174,7 @@ func TestCodexMetaInjection(t *testing.T) {
 // 帧内已有同 key 时不覆盖。
 func TestClientMetadataPassthrough(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"),
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url),
 		WithClientMetadata(MetaResponsesLiteKey, "true"))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -231,7 +231,7 @@ func TestNewTraceContext(t *testing.T) {
 func TestTraceInjection(t *testing.T) {
 	// 自动：每帧新 traceparent，帧间不同；握手头无 trace
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestTraceInjection(t *testing.T) {
 	// 外部注入：静态值每帧一致
 	url2, st2 := startEchoServer(t, "")
 	external := TraceContext{Traceparent: "00-11111111111111111111111111111111-2222222222222222-01", Tracestate: "vendor=1"}
-	c2, err := Dial(context.Background(), url2, PAT("t"), WithTraceContext(external))
+	c2, err := Dial(context.Background(), PAT("t"), WithBaseURL(url2), WithTraceContext(external))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestTraceInjection(t *testing.T) {
 
 	// 关闭自动生成：帧内无 trace key
 	url3, st3 := startEchoServer(t, "")
-	c3, err := Dial(context.Background(), url3, PAT("t"), WithTraceAuto(false))
+	c3, err := Dial(context.Background(), PAT("t"), WithBaseURL(url3), WithTraceAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestNewUUIDv7(t *testing.T) {
 // TestTurnIDAuto：每帧自动生成新 turn_id（UUIDv7）；CodexMeta.TurnID 静态优先。
 func TestTurnIDAuto(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestTurnIDAuto(t *testing.T) {
 
 	// 静态 TurnID 优先
 	url2, st2 := startEchoServer(t, "")
-	c2, err := Dial(context.Background(), url2, PAT("t"), WithCodexMeta(CodexMeta{TurnID: "static-turn"}))
+	c2, err := Dial(context.Background(), PAT("t"), WithBaseURL(url2), WithCodexMeta(CodexMeta{TurnID: "static-turn"}))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestTurnIDAuto(t *testing.T) {
 // TestTurnCounting：连接内 turn 序号自增，turn_metadata 由回调提供并组装。
 func TestTurnCounting(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"),
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url),
 		WithTurnMetadata(func(turn uint64) string {
 			return fmt.Sprintf(`{"turn":%d}`, turn)
 		}))
@@ -410,7 +410,7 @@ func TestTurnCounting(t *testing.T) {
 // TestTurnMetadataProviderConcurrent：多 Send 并发下 turn 计数不重复。
 func TestTurnMetadataProviderConcurrent(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"),
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url),
 		WithTurnMetadata(func(turn uint64) string {
 			return fmt.Sprintf(`{"turn":%d}`, turn)
 		}))
@@ -454,7 +454,7 @@ func TestTurnMetadataProviderConcurrent(t *testing.T) {
 // 无值帧自动生成 UUIDv7 兜底。
 func TestTurnIDPassthrough(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), url, PAT("t"))
+	c, err := Dial(context.Background(), PAT("t"), WithBaseURL(url))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
