@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 func strPtr(s string) *string { return &s }
@@ -470,5 +471,232 @@ func TestGenerateImage403Passthrough(t *testing.T) {
 	}
 	if !bytes.Equal(he.Raw, errorBody) {
 		t.Fatalf("Raw 应原样交付错误体: %s", he.Raw)
+	}
+}
+
+// ---- 流式合成单测（GenerateImageStream）----
+
+// imageStreamBody 是双图上游响应样本（usage 嵌套 details）。
+const imageStreamBody = `{"created":1,` +
+	`"data":[{"b64_json":"AAA="},{"b64_json":"BBB="}],` +
+	`"usage":{"input_tokens":10,"input_tokens_details":{"image_tokens":8,"text_tokens":2},` +
+	`"output_tokens":20,"output_tokens_details":{"image_tokens":15,"text_tokens":5},"total_tokens":30}}`
+
+// startImageMock 起 images 端点 mock：固定响应体返回。
+func startImageMock(t *testing.T, body string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/images/generations"
+}
+
+// TestGenerateImageStreamSuccess：非流式生成成功 → 每张图一个 completed 事件
+// （B64JSON 各自）+ usage 仅最后一个事件携带。
+func TestGenerateImageStreamSuccess(t *testing.T) {
+	hc := NewHTTPClient(PAT("p"), WithBaseURL(startImageMock(t, imageStreamBody)))
+	var events []ImageStreamEvent
+	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
+		func(ev ImageStreamEvent) error {
+			events = append(events, ev)
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("GenerateImageStream: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("事件数 = %d, 期望 2（每图一个）", len(events))
+	}
+	if events[0].Type != ImageStreamEventCompleted {
+		t.Fatalf("Type = %q, 期望 %q", events[0].Type, ImageStreamEventCompleted)
+	}
+	if events[0].B64JSON == nil || *events[0].B64JSON != "AAA=" {
+		t.Fatalf("事件0 B64JSON = %v, 期望 AAA=", events[0].B64JSON)
+	}
+	if events[0].Usage != nil {
+		t.Fatalf("usage 不应出现在非最后一个事件, got %+v", events[0].Usage)
+	}
+	if events[1].B64JSON == nil || *events[1].B64JSON != "BBB=" {
+		t.Fatalf("事件1 B64JSON = %v, 期望 BBB=", events[1].B64JSON)
+	}
+	if events[1].Usage == nil {
+		t.Fatal("usage 应仅最后一个事件携带")
+	}
+	if events[1].Usage.InputTokens != 10 || events[1].Usage.InputImageTokens != 8 ||
+		events[1].Usage.OutputTokens != 20 || events[1].Usage.OutputImageTokens != 15 {
+		t.Fatalf("Usage = %+v（期望 10/8/20/15——image_tokens 提取）", events[1].Usage)
+	}
+}
+
+// TestGenerateImageStreamSingleEvent：单图 + usage → 恰好一个 completed 事件
+// （usage 即携带于该事件）——spec 验收：流式合成单事件。
+func TestGenerateImageStreamSingleEvent(t *testing.T) {
+	hc := NewHTTPClient(PAT("p"), WithBaseURL(startImageMock(t, imageResponseBody)))
+	var calls int
+	var last ImageStreamEvent
+	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
+		func(ev ImageStreamEvent) error {
+			calls++
+			last = ev
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("GenerateImageStream: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("事件数 = %d, 期望 1", calls)
+	}
+	if last.Usage == nil || last.Usage.InputImageTokens != 80 {
+		t.Fatalf("单事件应携带 usage, got %+v", last.Usage)
+	}
+}
+
+// TestGenerateImageStreamErrorNoEvents：上游 403 → 回调不调用 + *HTTPError
+// 原样透传。
+func TestGenerateImageStreamErrorNoEvents(t *testing.T) {
+	errorBody := []byte(`{"detail":"Forbidden"}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(errorBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL+"/images/generations"))
+	var calls int
+	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
+		func(ev ImageStreamEvent) error {
+			calls++
+			return nil
+		})
+	var he *HTTPError
+	if !errors.As(err, &he) {
+		t.Fatalf("期望 *HTTPError 透传, got %T: %v", err, err)
+	}
+	if he.StatusCode != http.StatusForbidden {
+		t.Fatalf("StatusCode = %d, 期望 403", he.StatusCode)
+	}
+	if calls != 0 {
+		t.Fatalf("错误路径回调不应调用, calls = %d", calls)
+	}
+}
+
+// TestGenerateImageStreamEmptyData：Data 为空 → 不调回调直接返回（无事件）。
+func TestGenerateImageStreamEmptyData(t *testing.T) {
+	hc := NewHTTPClient(PAT("p"), WithBaseURL(startImageMock(t, `{"created":1}`)))
+	var calls int
+	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
+		func(ev ImageStreamEvent) error {
+			calls++
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("Data 空应无错误返回, got %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("Data 空不应有事件, calls = %d", calls)
+	}
+}
+
+// TestGenerateImageStreamCallbackError：completed 回调返回错误 → 立即终止并
+// 透传（对齐既有 Stream 回调语义——后续事件不再调用）。
+func TestGenerateImageStreamCallbackError(t *testing.T) {
+	hc := NewHTTPClient(PAT("p"), WithBaseURL(startImageMock(t, imageStreamBody)))
+	sentinel := errors.New("stop")
+	var calls int
+	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
+		func(ev ImageStreamEvent) error {
+			calls++
+			return sentinel
+		})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("回调错误应透传, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("回调错误应立即终止, calls = %d, 期望 1", calls)
+	}
+}
+
+// TestGenerateImageStreamKeepalive：等待期间（mock 上游延迟响应）收到
+// keepalive 事件（B64JSON/Usage 恒 nil）；响应返回后停 ticker → 每图一个
+// completed 事件 + usage 仅最后一个携带。
+func TestGenerateImageStreamKeepalive(t *testing.T) {
+	old := keepaliveInterval
+	keepaliveInterval = 50 * time.Millisecond
+	t.Cleanup(func() { keepaliveInterval = old })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond) // 延迟响应：等待期 > 2 个 keepalive 周期
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(imageStreamBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL+"/images/generations"))
+	var keepalives int
+	var keepaliveNilViolations int
+	var events []ImageStreamEvent
+	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
+		func(ev ImageStreamEvent) error {
+			if ev.Type == ImageStreamEventKeepalive {
+				keepalives++
+				if ev.B64JSON != nil || ev.Usage != nil {
+					keepaliveNilViolations++
+				}
+				return nil
+			}
+			events = append(events, ev)
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("GenerateImageStream: %v", err)
+	}
+	if keepalives < 1 {
+		t.Fatalf("等待期间应收到 keepalive 事件, got %d", keepalives)
+	}
+	if keepaliveNilViolations != 0 {
+		t.Fatalf("keepalive 事件 B64JSON/Usage 应恒 nil, 违规 %d 次", keepaliveNilViolations)
+	}
+	if len(events) != 2 {
+		t.Fatalf("completed 事件数 = %d, 期望 2（每图一个）", len(events))
+	}
+	if events[1].Usage == nil || events[0].Usage != nil {
+		t.Fatalf("usage 应仅最后一个 completed 事件携带, 0=%+v 1=%+v", events[0].Usage, events[1].Usage)
+	}
+}
+
+// TestGenerateImageStreamKeepaliveCallbackError：keepalive 回调错误 → 取消
+// 在途请求 + 回调错误优先返回（completed 回调不调用）。
+func TestGenerateImageStreamKeepaliveCallbackError(t *testing.T) {
+	old := keepaliveInterval
+	keepaliveInterval = 30 * time.Millisecond
+	t.Cleanup(func() { keepaliveInterval = old })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond) // 延迟足够长：keepalive 先触发
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(imageStreamBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL+"/images/generations"))
+	sentinel := errors.New("stop")
+	var completedCalls int
+	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
+		func(ev ImageStreamEvent) error {
+			if ev.Type == ImageStreamEventKeepalive {
+				return sentinel
+			}
+			completedCalls++
+			return nil
+		})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("keepalive 回调错误应优先透传, got %v", err)
+	}
+	if completedCalls != 0 {
+		t.Fatalf("错误路径 completed 回调不应调用, calls = %d", completedCalls)
 	}
 }

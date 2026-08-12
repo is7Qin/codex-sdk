@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // DefaultImagesURL 是内置默认上游 images generations 完整端点
@@ -70,10 +71,35 @@ type ImageUsage struct {
 	OutputImageTokens int64 `json:"output_image_tokens"` // output_tokens_details.image_tokens
 }
 
+// ImageStreamEvent 事件类型常量（GenerateImageStream 合成事件）。
+const (
+	// ImageStreamEventCompleted 对齐上游 image_generation_call 会话 item 的
+	// completed 终态（每张图一个）。
+	ImageStreamEventCompleted = "image_generation.completed"
+	// ImageStreamEventKeepalive 保活事件（等待期间每 60s 一个；B64JSON/Usage
+	// 恒 nil）——网关收到首个事件即发 SSE 响应头，keepalive 保证 120s 响应头
+	// 超时门槛内必有字节流（CF 524 免疫）。
+	ImageStreamEventKeepalive = "keepalive"
+)
+
+// ImageStreamEvent 是 GenerateImageStream 的合成流式事件（用户裁决：codex
+// 专属合成归 SDK，网关统一透传）。completed：每张图一个（带 b64_json；
+// usage 仅最后一个事件携带——对齐上游 completed 事件语义）；keepalive：
+// 等待期间保活（B64JSON/Usage 恒 nil）。partial_image 不合成——无 wire 来源。
+type ImageStreamEvent struct {
+	Type    string      // "image_generation.completed" | "keepalive"
+	B64JSON *string     // completed：原始 PNG base64（无 data URL 前缀）；keepalive 恒 nil
+	Usage   *ImageUsage // 仅最后一个 completed 事件携带；keepalive 恒 nil
+}
+
+// keepaliveInterval 是 GenerateImageStream 等待期间 keepalive 事件间隔
+// （默认 60s；测试可改小加速）。
+var keepaliveInterval = 60 * time.Second
+
 // GenerateImage 非流式生图（codex 凭据直连 images 端点）：POST
 // {imagesBase}/images/generations|edits（JSON 非流式——上游无流式路径，
-// 无 GenerateImageStream 接口；网关对 codex 类型流式请求转调本方法 +
-// SSE 包装）。edits 由 Images 非空判定；输入图 Raw 字节经 data URL 直嵌
+// 流式语义见 GenerateImageStream——合成 completed 事件包装本方法）。
+// edits 由 Images 非空判定；输入图 Raw 字节经 data URL 直嵌
 // （MIME 魔数检测 PNG/JPEG，默认 image/png——codex-rs 恒 PNG 先例）。
 //
 // 端点：默认 DefaultImagesURL（与 DefaultResponsesURL 同源派生）；
@@ -117,6 +143,68 @@ func (c *HTTPClient) GenerateImage(ctx context.Context, p *ImageGenParams) (*Ima
 		return nil, fmt.Errorf("codexsdk: 解析生图响应失败: %w", err)
 	}
 	return img, nil
+}
+
+// GenerateImageStream 流式语义（合成——上游 images 端点无流式路径）：内部调
+// 非流式 GenerateImage，等待期间（请求发出后、响应返回前）每 60s 回调一次
+// keepalive 事件（网关收到首个事件即发 SSE 响应头——keepalive 保证 120s
+// 响应头超时门槛内必有字节流，CF 524 免疫）；响应返回后停 ticker，为每张图
+// 合成一个 "image_generation.completed" 事件回调（B64JSON 各自；Usage 仅
+// 最后一个事件携带——对齐上游 completed 事件语义）→ 结束（发完即止，
+// 无会话维持）。
+//
+// 回调式对齐既有 Stream 风格：fn 返回错误立即终止并透传该错误（keepalive
+// 回调错误取消在途请求且优先返回）。错误路径同 GenerateImage：生成失败 →
+// completed 回调不调用、错误原样透传（HTTPError / 鉴权 fatal 五类 /
+// refresh 失败均不包装）。Data 为空 → 无 completed 事件直接返回。无
+// partial_image 合成（无 wire 来源）。
+func (c *HTTPClient) GenerateImageStream(ctx context.Context, p *ImageGenParams, fn func(ImageStreamEvent) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// 保活 goroutine：GenerateImage 等待期间每 keepaliveInterval 回调一次
+	// keepalive 事件；回调错误 → 取消在途请求并优先返回该错误。
+	keepaliveErr := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(keepaliveInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := fn(ImageStreamEvent{Type: ImageStreamEventKeepalive}); err != nil {
+					keepaliveErr <- err
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	resp, err := c.GenerateImage(ctx, p)
+	cancel()
+	<-done // 等保活 goroutine 退出（避免与 completed 事件并发回调）
+	select {
+	case ke := <-keepaliveErr:
+		return ke // keepalive 回调错误优先（调用方 sentinel）
+	default:
+	}
+	if err != nil {
+		return err
+	}
+	for i := range resp.Data {
+		ev := ImageStreamEvent{Type: ImageStreamEventCompleted, B64JSON: resp.Data[i].B64JSON}
+		if i == len(resp.Data)-1 {
+			ev.Usage = resp.Usage
+		}
+		if err := fn(ev); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // imagesEndpoint 返回 images 端点：generations = WithBaseURL 覆盖值（有覆盖时，
