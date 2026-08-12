@@ -171,6 +171,16 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	if err != nil {
 		return nil, err
 	}
+	return c.doURL(ctx, targetURL, payload)
+}
+
+// doURL 发送 POST 到指定完整端点并应用 401 自动轮转（do 的 URL 已构建形态；
+// GenerateImage 等非 responses 端点复用同一传输层：判死分类 + 单飞 refresh +
+// 自动重试一次，语义与 do 完全一致）。
+func (c *HTTPClient) doURL(ctx context.Context, targetURL string, payload []byte) (*http.Response, error) {
+	if c.auth == nil {
+		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
+	}
 	resp, err := c.sendRequest(ctx, targetURL, payload)
 	if err != nil {
 		return nil, err
