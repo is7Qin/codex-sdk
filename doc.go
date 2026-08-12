@@ -7,6 +7,12 @@
 //   - Responses WebSocket：Dial / 帧字节收发（文本与二进制帧原样透传）/ 心跳保活 /
 //     关闭码透传（Close(status, reason)，急断 CloseNow）
 //   - Responses HTTP：POST 请求构造 / 非流式响应 / 流式 SSE 事件帧提取
+//   - 生图（HTTPClient 方法）：GenerateImage 非流式直连 images 端点
+//     （generations/edits、JSON 非流式——上游无流式路径故无 GenerateImageStream；
+//     输入图 Raw 字节 → data URL 直嵌、usage image_tokens 提取；端点默认
+//     DefaultImagesURL 与 DefaultResponsesURL 同源派生，WithBaseURL 覆盖值 =
+//     完整 generations 端点直用；传输层复用 Do：401 轮转 / 判死分类 / 错误透传
+//     零新增）
 //   - 上游 URL 内置维护：默认 DefaultResponsesURL（完整 responses 端点直用，
 //     不再拼 /responses）；WS 由该端点派生（http→ws / https→wss 换 scheme，
 //     path/query 保留，对齐真实客户端 provider.rs:92-103）；WithBaseURL 覆盖
