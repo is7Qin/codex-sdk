@@ -91,7 +91,7 @@ func (e *DialError) Unwrap() error { return e.Err }
 
 // options 是 Dial / NewHTTPClient 的共享配置（无关字段按形态忽略）。
 type options struct {
-	baseURL    string     // 上游 responses 端点（默认 DefaultResponsesURL；WithBaseURL 覆盖）
+	baseURL    string     // 上游 responses 端点（默认 DefaultResponsesURL；WithBaseURL 覆盖；Search 方法由该值尾段派生）
 	baseURLSet bool       // WithBaseURL 是否被调用（GenerateImage 据此区分默认 images 端点）
 	query      url.Values // WithQuery 注入的 URL query 参数（HTTP/WS 双形态）
 
@@ -135,10 +135,10 @@ func defaultOptions() options {
 type Option func(*options)
 
 // WithBaseURL 覆盖内置上游 URL（默认 DefaultResponsesURL）——覆盖值按完整
-// responses 端点语义直用：SDK 不再自动拼接 /responses（与旧版 baseURL 参数
-// 语义不同，显式行为变更——自建上游传 https://selfhost/v1 将打 /v1 而非
+// 端点语义直用：SDK 不再自动拼接 /responses（与旧版 baseURL 参数语义不同，
+// 显式行为变更——自建上游传 https://selfhost/v1 将打 /v1 而非
 // /v1/responses，避免静默 404 请传完整端点）。HTTP 与 WS（Dial 由该值派生
-// scheme）双形态生效。
+// scheme）双形态生效；Search 方法由该值尾段派生 search 端点。
 func WithBaseURL(u string) Option {
 	return func(o *options) { o.baseURL = u; o.baseURLSet = true }
 }

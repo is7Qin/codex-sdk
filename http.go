@@ -21,14 +21,16 @@ const defaultMaxLineSize = 16 * 1024 * 1024
 // WithBaseURL 可覆盖。
 const DefaultResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 
-// HTTPClient 是 Responses HTTP 客户端（懒构建：NewHTTPClient 零开销，
-// 首次 Do/Stream 才创建 http.Client，连接池复用）。
+// HTTPClient 是统一端点方法 HTTP 客户端（懒构建：NewHTTPClient 零开销，
+// 首次 Do/Stream 才创建 http.Client，连接池复用）。端点方法族：
+// Do/Stream（构造期 URL 固定）、GenerateImage / Search（方法内由 baseURL
+// 派生端点）、Responses（合成非流式）。
 //
 // x-codex-turn-state 仅响应侧（真实 codex 客户端行为）：响应头/SSE 中的
 // turn-state 自动捕获，经 TurnState() / HTTPResponse.TurnState 暴露给网关；
 // HTTP 请求不携带 x-codex-turn-state 头（头回传仅 WS 路径，见 Client）。
 type HTTPClient struct {
-	baseURL string // 上游 responses 端点（默认 DefaultResponsesURL）
+	baseURL string // 上游 responses 端点（默认 DefaultResponsesURL；Search 方法由该值尾段派生）
 	auth    Auth
 	opts    options
 
@@ -37,12 +39,13 @@ type HTTPClient struct {
 	turnState atomic.Value // string；x-codex-turn-state 响应侧捕获值
 }
 
-// NewHTTPClient 创建 Responses HTTP 客户端。上游 URL 由 SDK 内置维护：
-// 默认 DefaultResponsesURL（完整 responses 端点，不再自动拼接 /responses），
-// WithBaseURL 可覆盖（覆盖值同样按完整端点语义直用——传 https://selfhost/v1
-// 将打 /v1 而非 /v1/responses，与旧版 baseURL 语义不同，显式行为变更；
-// 自建上游请传完整 responses 端点 URL）。WithQuery 注入的 query 参数
-// 拼接到最终 URL。
+// NewHTTPClient 创建 Responses HTTP 客户端（端点方法族客户端——search
+// 端点无独立构造器，经 Search 方法由 baseURL 尾段派生）。上游 URL 由 SDK
+// 内置维护：默认 DefaultResponsesURL（完整 responses 端点，不再自动拼接
+// /responses），WithBaseURL 可覆盖（覆盖值同样按完整端点语义直用——传
+// https://selfhost/v1 将打 /v1 而非 /v1/responses，与旧版 baseURL 语义
+// 不同，显式行为变更；自建上游请传完整 responses 端点 URL）。WithQuery
+// 注入的 query 参数拼接到最终 URL。
 func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 	cfg := defaultOptions()
 	for _, o := range opts {
@@ -64,8 +67,8 @@ func (c *HTTPClient) CloseIdleConnections() {
 	}
 }
 
-// HTTPResponse 是 Responses HTTP 非流式响应（原样交付，不做字段解析——
-// id/type/usage 由网关在完整字节上自行解析）。
+// HTTPResponse 是 HTTP 非流式响应（原样交付，不做字段解析——字段由网关
+// 在完整字节上自行解析；Do / Search 方法共用）。
 type HTTPResponse struct {
 	StatusCode int
 	Raw        []byte // 完整响应体
@@ -82,8 +85,9 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("codexsdk: upstream HTTP %d", e.StatusCode)
 }
 
-// Do 发送 POST <responses 端点> 请求（payload 为完整 JSON 请求体，调用方
-// 决定 stream 等字段），原样返回非流式响应。非 2xx 返回 *HTTPError。
+// Do 发送 POST <responses 端点> 请求（端点方法族成员——search 端点经
+// Search 方法派生；payload 为完整 JSON 请求体，调用方决定 stream 等字段），
+// 原样返回非流式响应。非 2xx 返回 *HTTPError。
 //
 // 401 自动轮转（OAuthWithRotation 专属）：每次 401 先做判死分类（响应体
 // error_code/error_type/detail，大小写不敏感）——判死码 → Fatal 态 +
