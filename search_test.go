@@ -186,10 +186,10 @@ func TestSearch401Rotate(t *testing.T) {
 	}
 }
 
-// TestSearchEndpointFrom：由 responses 完整端点派生 search 端点——末尾
-// /responses 路径段 → /alpha/search；非 /responses 结尾 → 错误（尾斜杠
+// TestSearchEndpointDerivation：由 responses 完整端点派生 search 端点——
+// 末尾 /responses 路径段 → /alpha/search；非 /responses 结尾 → 错误（尾斜杠
 // 同样报错——不静默产生错误 URL；实态输入已归一，纯防御性）。
-func TestSearchEndpointFrom(t *testing.T) {
+func TestSearchEndpointDerivation(t *testing.T) {
 	cases := []struct {
 		name string
 		in   string

@@ -112,7 +112,8 @@ var keepaliveInterval = 60 * time.Second
 // 请求头与 HTTPClient 既有默认一致（Authorization + Content-Type:
 // application/json + codex UA/Originator）；不发 OpenAI-Beta 与
 // x-codex-image-turn-id（实证不需要，不影响功能；需要时 WithHeader 注入）。
-// turn-state 复用 Do 自动捕获但不对外暴露。
+// turn-state 不捕获（doURL 路径无捕获调用——对齐 Search 方法语义，
+// 响应头 turn-state 不读取；网关不消费）。
 func (c *HTTPClient) GenerateImage(ctx context.Context, p *ImageGenParams) (*ImageResponse, error) {
 	payload, err := buildImageRequest(p)
 	if err != nil {
