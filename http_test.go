@@ -356,6 +356,45 @@ func TestHTTPTurnStateNoEcho(t *testing.T) {
 	}
 }
 
+// TestHTTPStreamDoneDrainsBodyForReuse：[DONE] 命中后排空残余 body——mock
+// 上游发送 [DONE] + 尾部字节（不关闭连接），客户端返回后第二轮请求必须复用
+// 同一连接（countingListener 断言 accepts==1）。排空完成是连接回池的前提：
+// 残余未读使 http.Transport 判定连接不可复用，第二轮必重拨（accepts==2）。
+func TestHTTPStreamDoneDrainsBodyForReuse(t *testing.T) {
+	var accepts atomic.Int32
+	var reqs atomic.Int32
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+		f.Flush()
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		_, _ = io.WriteString(w, "trailing-bytes-after-done") // [DONE] 后残余字节
+		f.Flush()
+	}))
+	srv.Listener = &countingListener{Listener: base, accepts: &accepts}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	for i := 0; i < 2; i++ {
+		if err := hc.Stream(context.Background(), []byte(`{}`), func(raw []byte) error { return nil }); err != nil {
+			t.Fatalf("Stream #%d: %v", i+1, err)
+		}
+	}
+	if n := reqs.Load(); n != 2 {
+		t.Fatalf("服务端请求数 = %d, 期望 2（服务端收到第二轮请求 = 排空完成信号）", n)
+	}
+	if n := accepts.Load(); n != 1 {
+		t.Fatalf("TCP 连接数 = %d, 期望 1（[DONE] 后排空 → 连接回池复用）", n)
+	}
+}
+
 // TestHTTPStreamCapturesTurnState：Stream 响应头同样捕获 turn-state。
 func TestHTTPStreamCapturesTurnState(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
