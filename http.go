@@ -151,7 +151,14 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 			continue
 		}
 		if bytes.Equal(trimmed, sseDone) {
-			return nil // [DONE]：流正常终止
+			// [DONE]：流正常终止。排空残余 body——http.Transport 对未读完的
+			// body 连接不回池（残余未读使连接不可复用），读尽后连接回池，
+			// 下一轮请求复用同连接（消除重拨风暴）。排空失败（网络中断）
+			// 不影响语义：连接本就不复用，行为与现状等价（defer Close 兜底）。
+			// 病态上游边界：[DONE] 后不关闭 body 的病态上游——本读阻塞至
+			// ctx 取消兜底（连接随 ctx 取消释放，与现状等价）。
+			_, _ = io.Copy(io.Discard, resp.Body)
+			return nil
 		}
 		if err := fn(trimmed); err != nil {
 			return err

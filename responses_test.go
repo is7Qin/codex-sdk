@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -501,6 +503,50 @@ func TestResponses401Rotate(t *testing.T) {
 	defer mu.Unlock()
 	if len(auths) != 2 || auths[0] != "Bearer at-old" || auths[1] != "Bearer at-new" {
 		t.Fatalf("请求序列 = %v, 期望 [Bearer at-old, Bearer at-new]", auths)
+	}
+}
+
+// TestResponsesConnectionReuse：Responses（合成非流式——内部走 Stream）[DONE]
+// 后排空 body → 第二轮请求复用同一连接（countingListener 断言 accepts==1）。
+// Stream 排空修复自动覆盖非流式路径的连接复用（残余未读使连接不可回池）。
+func TestResponsesConnectionReuse(t *testing.T) {
+	var accepts atomic.Int32
+	var reqs atomic.Int32
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		for _, ev := range []string{respCreatedEvent, respItemMsgDoneEv, respCompletedEv} {
+			_, _ = io.WriteString(w, "data: "+ev+"\n\n")
+			f.Flush()
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		_, _ = io.WriteString(w, "trailing-bytes-after-done") // [DONE] 后残余字节
+		f.Flush()
+	}))
+	srv.Listener = &countingListener{Listener: base, accepts: &accepts}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL))
+	for i := 0; i < 2; i++ {
+		resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatalf("Responses #%d: %v", i+1, err)
+		}
+		if gjson.GetBytes(resp.Raw, "id").String() != "resp_001" {
+			t.Fatalf("合成体 id = %s", gjson.GetBytes(resp.Raw, "id").String())
+		}
+	}
+	if n := reqs.Load(); n != 2 {
+		t.Fatalf("服务端请求数 = %d, 期望 2（服务端收到第二轮请求 = 排空完成信号）", n)
+	}
+	if n := accepts.Load(); n != 1 {
+		t.Fatalf("TCP 连接数 = %d, 期望 1（Responses 内部 Stream 排空 → 连接回池复用）", n)
 	}
 }
 
