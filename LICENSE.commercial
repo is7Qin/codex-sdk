@@ -1,0 +1,48 @@
+# codex-sdk Commercial License Agreement
+
+Licensor: is7Qin
+
+This commercial license is a paid option for codex-sdk in addition to the
+[LGPL-3.0](./LICENSE). It is offered to licensees who need to distribute
+**modified versions of the library in closed source**, which LGPL-3.0 does not
+permit without complying with its source-disclosure requirements. Using the
+library as-is (linking it into your application, including commercial and
+hosted use) is permitted under LGPL-3.0 without a commercial license; see
+LICENSE and README for the licensing terms.
+
+## 1. Grant
+
+- The licensee obtains a non-exclusive, non-transferable right to deploy, run,
+  and integrate codex-sdk, and to **distribute modified versions of the
+  library in closed source** (without publishing the source code of the
+  modifications), for the duration of this agreement.
+- Covered forms: internal use, self-hosted services, SaaS / hosted offerings,
+  and closed-source deployments delivered to third-party customers.
+
+## 2. Waiver (LGPL obligations waived)
+
+Subject to the licensee's compliance with this agreement, the licensor waives
+the following obligations under LGPL-3.0 for covered deployments:
+
+- The obligation to provide the corresponding source code of modified versions
+  under LGPL-3.0 (LGPL-3.0 Section 4);
+- The obligation to license modified versions under LGPL-3.0.
+
+The waiver does **not** cover: the licensee's obligations under third-party
+software; code independently developed by the licensee that has no derivative
+relationship with codex-sdk.
+
+## 3. Fees and Term
+
+- Fees are negotiated with the licensor based on deployment scale (number of
+  instances / end users served) or as a one-time buyout.
+- This agreement remains in effect while fees are paid; it terminates upon
+  material breach with no refund of fees already paid.
+
+## 4. Miscellaneous
+
+- The library is provided "as is" without warranty of any kind, express or
+  implied, to the extent permitted by law.
+- This agreement is governed by the laws of the licensor's jurisdiction.
+- To obtain a commercial license, contact the licensor via GitHub
+  (https://github.com/is7Qin).
