@@ -558,7 +558,10 @@ func TestSessionHeaders(t *testing.T) {
 }
 
 // TestWSTurnState：握手响应头 x-codex-turn-state → SDK 缓存 → 帧内回传；
-// SetTurnState("") 清除（跨轮不得回传）。
+// 显式 SetTurnState 同效；SetTurnState("") 清除（跨轮不得回传）。
+// 对齐真实 codex：WS 发送路径在 build_ws_client_metadata 后显式追加 turn-state
+// 进 client_metadata（client.rs:1626-1631，帧体携带 :1702-1711）——TurnState
+// 非空时帧 metadata 恒带该键，勿反转回"无键"断言。
 func TestWSTurnState(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderTurnState, "st-1")
@@ -599,6 +602,20 @@ func TestWSTurnState(t *testing.T) {
 	}
 	if v := gjson.GetBytes(ev, "client_metadata.x-codex-turn-state").String(); v != "st-1" {
 		t.Fatalf("帧内应回传 x-codex-turn-state=st-1, got %q", v)
+	}
+
+	// 显式设置（网关在别处观测到该值时手动回传）：TurnState 非空 → 帧
+	// metadata 恒带该键（对齐真实 :1626-1631 追加注入）
+	c.SetTurnState("st-manual")
+	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	ev3, err := c.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if v := gjson.GetBytes(ev3, "client_metadata.x-codex-turn-state").String(); v != "st-manual" {
+		t.Fatalf("显式设置后帧内应回传 x-codex-turn-state=st-manual, got %q", v)
 	}
 
 	// 轮结束清除：不再回传

@@ -545,6 +545,10 @@ func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 		appendEntry(codexMetaThreadKey, s.ThreadID)
 		appendEntry(codexMetaWindowKey, s.WindowID)
 	}
+	// turn-state 回传（TurnState 非空时帧 metadata 恒带）：真实 codex WS
+	// 发送路径显式追加注入（client.rs:1626-1631，帧体携带 :1702-1711），与
+	// HTTP 头面（client.rs:1202）构成双面机制——此注入与真实逐点一致，勿删
+	// （完整实证见 doc.go"上游协议与参考"）。
 	if ts := c.TurnState(); ts != "" {
 		appendEntry(codexMetaTurnStateKey, ts)
 	}

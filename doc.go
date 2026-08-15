@@ -78,10 +78,20 @@
 // 2026-02-06，仅 WS 握手注入；HTTP 默认不发 OpenAI-Beta，需要时 WithHeader
 // 显式注入）。真实客户端行为对齐：WS 握手与 HTTP 请求均不发 trace 头（trace
 // 只进每帧 client_metadata，每帧新值）；session-id/thread-id/x-client-request-id/
-// x-codex-window-id 会话级握手头；x-codex-turn-state 仅响应侧捕获：WS 路径
-// 升级响应头签发 → 帧内 client_metadata 回传（Client.TurnState 缓存 + 网关
-// SetTurnState("") 清除，跨轮不得回传）；HTTP 路径请求不携带该头，捕获后经
-// TurnState() 暴露。responses-lite 非独立端点：与 /responses 同端点同事件集，
+// x-codex-window-id 会话级握手头；x-codex-turn-state 是双面机制（真实源码
+// 行号实证，防未来误删 WS 帧注入）：
+//   - HTTP 面：真实客户端请求头携带 x-codex-turn-state（client.rs:1202
+//     build_responses_headers(..., Some(&self.turn_state))）；本 SDK HTTP 路径
+//     不发送该头——仅响应侧捕获 + HTTPResponse.TurnState / TurnState() 暴露，
+//     同轮回传由网关转发层（c3api）实现
+//   - WS 面：帧 metadata 恒带（TurnState 非空时）——真实发送路径
+//     client.rs:1626-1631（stream_responses_websocket）在 build_ws_client_metadata
+//     （:779-792，辅助函数本身无 turn-state）之后显式追加
+//     client_metadata.insert(X_CODEX_TURN_STATE_HEADER, ...)，流入
+//     ResponseCreateWsRequest.client_metadata（:1702-1711 帧体携带）；SDK 帧注入
+//     （client.go:548 prepareFrame）逐点一致：升级响应头签发 → 帧内回传
+//     （Client.TurnState 缓存 + 网关 SetTurnState("") 清除，跨轮不得回传）。
+// responses-lite 非独立端点：与 /responses 同端点同事件集，
 // 仅 internal 标记区分——HTTP 头 x-openai-internal-codex-responses-lite（WithHeader
 // 透传）与 WS client_metadata 键 ws_request_header_x_openai_internal_codex_responses_lite
 // （WithClientMetadata 透传），SDK 只透传不解析。
