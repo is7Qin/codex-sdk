@@ -198,16 +198,18 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 //     帧面）、turn-state（体键不存在，其请求头属 HTTP 头面不在本方法）；
 //   - 不做 metaPassthrough / turn_metadata 回调（WS 帧面扩展——真实 HTTP
 //     client_metadata() 是静态键集）。
-// 预筛短路：payload 已含 client_metadata → 零注入原样返回（真实客户端自带
-// 完整 metadata 才自己组装——透传优先语义，缺键不补齐；bytes.Contains
-// memchr 级，免 ValidBytes 全量 JSON 扫描，常见场景注入成本归零）。
+// 预筛短路：payload 已含 client_metadata 键 → 零注入原样返回（真实客户端
+// 自带完整 metadata 才自己组装——透传优先语义，缺键不补齐；bytes.Contains
+// memchr 级，免 ValidBytes 全量 JSON 扫描，常见场景注入成本归零；判据为
+// 带引号 token "client_metadata"——键名恒带引号，字符串值里的裸词不误判）。
 // 非法 JSON payload 放弃注入保持原样（对齐 responses.go:37 先例——sjson
 // SetBytes 对非法 JSON 静默产出损坏字节，须前置 gjson.ValidBytes）。
 func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
-	// 预筛短路：payload 已含 client_metadata（真实 codex 客户端自带完整
-	// metadata 的请求体）→ 透传优先语义，零注入直接返回（省掉 ValidBytes
-	// 全量 JSON 扫描——常见场景注入成本归零）。
-	if bytes.Contains(payload, []byte("client_metadata")) {
+	// 预筛短路：payload 已含 JSON 键 "client_metadata"（真实 codex 客户端
+	// 自带完整 metadata 的请求体）→ 透传优先语义，零注入直接返回（省掉
+	// ValidBytes 全量 JSON 扫描——常见场景注入成本归零）。判据为带引号
+	// token（JSON 键名恒带引号）：字符串值里的裸词不误判（评审 P2-2）。
+	if bytes.Contains(payload, []byte(`"client_metadata"`)) {
 		return payload
 	}
 	if !gjson.ValidBytes(payload) {

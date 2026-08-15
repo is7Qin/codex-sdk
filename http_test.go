@@ -402,7 +402,8 @@ func TestHTTPStreamDoneDrainsBodyForReuse(t *testing.T) {
 
 // TestHTTPStreamClientMetadataMinimal：未配置 meta/session → 请求体仅注入
 // client_metadata.turn_id（UUIDv7 格式，真实恒发），无其他键。
-// （兼证预筛不误伤：payload 不含 client_metadata → 仍注入 turn_id。）
+// （兼证预筛判据：payload 无 "client_metadata" 键 → 仍注入 turn_id——
+// 字符串值里的裸词 "client_metadata" 不误判为已含 metadata，评审 P2-2。）
 func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -427,6 +428,22 @@ func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 	}
 	if gjson.GetBytes(gotBody, "model").String() != "m" {
 		t.Fatalf("注入不应动其余字段: %s", gotBody)
+	}
+
+	// 预筛判据收紧回归（P2-2）：prompt 字符串值含裸词 "client_metadata"
+	// （无引号包裹）→ 不触发短路，仍注入 turn_id
+	if err := hc.Stream(context.Background(), []byte(`{"model":"m","prompt":"see client_metadata docs"}`), func(raw []byte) error { return nil }); err != nil {
+		t.Fatalf("Stream #2: %v", err)
+	}
+	cm2 := gjson.GetBytes(gotBody, "client_metadata")
+	if !cm2.Exists() || len(cm2.Map()) != 1 {
+		t.Fatalf("裸词不应触发短路（期望仍注入仅 turn_id）, client_metadata = %s", cm2.Raw)
+	}
+	if turn := cm2.Get("turn_id").String(); !uuidv7Re.MatchString(turn) {
+		t.Fatalf("turn_id = %q, 期望 UUIDv7 格式", turn)
+	}
+	if got := gjson.GetBytes(gotBody, "prompt").String(); got != "see client_metadata docs" {
+		t.Fatalf("prompt 应原样保留: %s", gotBody)
 	}
 }
 
