@@ -68,6 +68,8 @@ const (
 	codexMetaTurnKey         = "turn_id"
 	codexMetaWindowKey       = "x-codex-window-id"
 	codexMetaSubagentKey     = "x-openai-subagent"
+	codexMetaParentThreadKey = "x-codex-parent-thread-id" // 条件键（真实 client_metadata()：responses_metadata.rs:274-279）
+	codexMetaParentTurnKey   = "parent_turn_id"           // 条件键（真实 client_metadata()：responses_metadata.rs:280-282）
 	codexMetaTurnMetadataKey = "x-codex-turn-metadata"
 	codexMetaTurnStateKey    = "x-codex-turn-state"
 	codexMetaTraceparentKey  = "ws_request_header_traceparent"
@@ -158,6 +160,8 @@ type CodexMeta struct {
 	TurnID         string // metadata "turn_id"（UUIDv7；为空时 SDK 每轮自动生成）
 	WindowID       string // metadata "x-codex-window-id"（{thread_id}:{n}）
 	Subagent       string // metadata "x-openai-subagent"（条件）
+	ParentThreadID string // metadata "x-codex-parent-thread-id"（条件；续接/子代理）
+	ParentTurnID   string // metadata "parent_turn_id"（条件；续接/子代理）
 	TurnMetadata   string // metadata "x-codex-turn-metadata"
 	Traceparent    string // metadata "ws_request_header_traceparent"（为空时自动生成）
 	Tracestate     string // metadata "ws_request_header_tracestate"
@@ -165,8 +169,8 @@ type CodexMeta struct {
 
 func (m *CodexMeta) empty() bool {
 	return m == nil || (m.InstallationID == "" && m.SessionID == "" && m.ThreadID == "" &&
-		m.TurnID == "" && m.WindowID == "" && m.Subagent == "" && m.TurnMetadata == "" &&
-		m.Traceparent == "" && m.Tracestate == "")
+		m.TurnID == "" && m.WindowID == "" && m.Subagent == "" && m.ParentThreadID == "" &&
+		m.ParentTurnID == "" && m.TurnMetadata == "" && m.Traceparent == "" && m.Tracestate == "")
 }
 
 // TraceContext 是 W3C trace context（仅注入 WS 帧内 client_metadata——

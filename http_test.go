@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 // TestHTTPDoRaw：POST /v1/responses，鉴权/content-type 头注入 +
@@ -392,6 +394,211 @@ func TestHTTPStreamDoneDrainsBodyForReuse(t *testing.T) {
 	}
 	if n := accepts.Load(); n != 1 {
 		t.Fatalf("TCP 连接数 = %d, 期望 1（[DONE] 后排空 → 连接回池复用）", n)
+	}
+}
+
+// ---- HTTP /responses client_metadata 注入（对齐真实 client_metadata()——
+// responses_metadata.rs:255-288；Stream 发送前统一注入点）----
+
+// TestHTTPStreamClientMetadataMinimal：未配置 meta/session → 请求体仅注入
+// client_metadata.turn_id（UUIDv7 格式，真实恒发），无其他键。
+func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), func(raw []byte) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	cm := gjson.GetBytes(gotBody, "client_metadata")
+	if !cm.Exists() || len(cm.Map()) != 1 {
+		t.Fatalf("client_metadata = %s（期望仅 turn_id）", cm.Raw)
+	}
+	if turn := cm.Get("turn_id").String(); !uuidv7Re.MatchString(turn) {
+		t.Fatalf("turn_id = %q, 期望 UUIDv7 格式", turn)
+	}
+	if gjson.GetBytes(gotBody, "model").String() != "m" {
+		t.Fatalf("注入不应动其余字段: %s", gotBody)
+	}
+}
+
+// TestHTTPStreamClientMetadataFullKeys：配置 CodexMeta（全键）+ WithSession
+// （不同值）→ 恒 4 key + turn_id（meta 静态值优先于自动生成）+ 条件键全带
+// （subagent/parent-thread-id/parent_turn_id/turn-metadata）；meta 与 session
+// 同 key 时 meta 优先（对齐 WS 组装优先级 client.go:522-578）。不注入 trace
+// 与 turn-state 键（HTTP 体面真实不带）。
+func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL),
+		WithCodexMeta(CodexMeta{
+			InstallationID: "inst-meta",
+			SessionID:      "sess-meta",
+			ThreadID:       "thread-meta",
+			TurnID:         "turn-meta",
+			WindowID:       "win-meta:0",
+			Subagent:       "sub-agent-1",
+			ParentThreadID: "parent-thread-1",
+			ParentTurnID:   "parent-turn-1",
+			TurnMetadata:   `{"request_kind":"turn"}`,
+		}),
+		WithSession(Session{SessionID: "sess-s", ThreadID: "thread-s", WindowID: "win-s:1"}))
+	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), func(raw []byte) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	cm := gjson.GetBytes(gotBody, "client_metadata")
+	if !cm.Exists() || len(cm.Map()) != 9 {
+		t.Fatalf("client_metadata = %s（期望 4 恒键 + turn_id + 4 条件键 = 9）", cm.Raw)
+	}
+	// 恒 4 key：meta 值生效（session 同 key 值被 meta 覆盖）
+	for key, want := range map[string]string{
+		"x-codex-installation-id": "inst-meta",
+		"session_id":              "sess-meta",
+		"thread_id":               "thread-meta",
+		"x-codex-window-id":       "win-meta:0",
+	} {
+		if got := cm.Get(key).String(); got != want {
+			t.Fatalf("%s = %q, 期望 %q（CodexMeta 优先于 WithSession）", key, got, want)
+		}
+	}
+	// turn_id：meta 静态值优先（不自动生成）
+	if got := cm.Get("turn_id").String(); got != "turn-meta" {
+		t.Fatalf("turn_id = %q, 期望 meta 静态值 turn-meta", got)
+	}
+	// 条件键：配置了才带
+	for key, want := range map[string]string{
+		"x-openai-subagent":       "sub-agent-1",
+		"x-codex-parent-thread-id": "parent-thread-1",
+		"parent_turn_id":           "parent-turn-1",
+		"x-codex-turn-metadata":    `{"request_kind":"turn"}`,
+	} {
+		if got := cm.Get(key).String(); got != want {
+			t.Fatalf("%s = %q, 期望 %q", key, got, want)
+		}
+	}
+	// 不注入：trace 键（仅 WS 帧面）与 turn-state（体键不存在）
+	if cm.Get("ws_request_header_traceparent").Exists() || cm.Get("ws_request_header_tracestate").Exists() {
+		t.Fatalf("HTTP 体面不应注入 trace 键: %s", cm.Raw)
+	}
+	if cm.Get("x-codex-turn-state").Exists() {
+		t.Fatalf("HTTP 体面不应注入 turn-state 键: %s", cm.Raw)
+	}
+}
+
+// TestHTTPStreamClientMetadataPassthrough：payload 已有 client_metadata.turn_id
+// → 原值透传（不覆盖——即使 CodexMeta.TurnID 已配置）；payload 已有条件键
+// 同样不覆盖；缺键由 meta 补齐。
+func TestHTTPStreamClientMetadataPassthrough(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL),
+		WithCodexMeta(CodexMeta{InstallationID: "inst-1", TurnID: "meta-turn", Subagent: "meta-sub"}))
+	payload := []byte(`{"model":"m","client_metadata":{"turn_id":"payload-turn","x-openai-subagent":"keep"}}`)
+	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	cm := gjson.GetBytes(gotBody, "client_metadata")
+	if got := cm.Get("turn_id").String(); got != "payload-turn" {
+		t.Fatalf("turn_id = %q, 期望 payload 原值透传（不覆盖 meta 静态值）", got)
+	}
+	if got := cm.Get("x-openai-subagent").String(); got != "keep" {
+		t.Fatalf("x-openai-subagent = %q, 期望 payload 原值透传", got)
+	}
+	if got := cm.Get("x-codex-installation-id").String(); got != "inst-1" {
+		t.Fatalf("x-codex-installation-id = %q, 期望缺键由 meta 补齐", got)
+	}
+}
+
+// TestHTTPStreamClientMetadataSessionFallback：未配置 meta 仅 WithSession →
+// session_id/thread_id/x-codex-window-id（session 值）+ 自动 turn_id（无静态
+// 值）；installation_id 缺（仅 CodexMeta 可携带）。
+func TestHTTPStreamClientMetadataSessionFallback(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL),
+		WithSession(Session{SessionID: "sess-s", ThreadID: "thread-s", WindowID: "win-s:1"}))
+	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), func(raw []byte) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	cm := gjson.GetBytes(gotBody, "client_metadata")
+	if !cm.Exists() || len(cm.Map()) != 4 {
+		t.Fatalf("client_metadata = %s（期望 session 3 键 + turn_id）", cm.Raw)
+	}
+	for key, want := range map[string]string{
+		"session_id":         "sess-s",
+		"thread_id":          "thread-s",
+		"x-codex-window-id":  "win-s:1",
+	} {
+		if got := cm.Get(key).String(); got != want {
+			t.Fatalf("%s = %q, 期望 %q", key, got, want)
+		}
+	}
+	if turn := cm.Get("turn_id").String(); !uuidv7Re.MatchString(turn) {
+		t.Fatalf("turn_id = %q, 期望 UUIDv7 格式（无静态值时自动生成）", turn)
+	}
+	if cm.Get("x-codex-installation-id").Exists() {
+		t.Fatalf("未配置 meta 不应注入 installation_id: %s", cm.Raw)
+	}
+}
+
+// TestHTTPStreamClientMetadataInvalidJSON：非法 JSON payload → 放弃注入保持
+// 原样（对齐 responses.go:37 先例）→ 上游 400 原样透传。
+func TestHTTPStreamClientMetadataInvalidJSON(t *testing.T) {
+	errorBody := []byte(`{"error":{"code":"invalid_request","message":"bad json"}}`)
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(errorBody)
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL),
+		WithCodexMeta(CodexMeta{InstallationID: "inst-1"}))
+	err := hc.Stream(context.Background(), []byte(`{"broken`), func(raw []byte) error { return nil })
+	var he *HTTPError
+	if !errors.As(err, &he) {
+		t.Fatalf("期望 *HTTPError, got %T: %v", err, err)
+	}
+	if he.StatusCode != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, 期望 400", he.StatusCode)
+	}
+	if !bytes.Equal(he.Raw, errorBody) {
+		t.Fatalf("Raw 应原样交付上游错误体: %s", he.Raw)
+	}
+	if string(gotBody) != `{"broken` {
+		t.Fatalf("非法 payload 应原样上送（放弃注入）, got %s", gotBody)
 	}
 }
 

@@ -24,7 +24,10 @@ const (
 // 要求——payload 任意 stream 值（含显式 false）均覆盖为 true，非流式语义由
 // 聚合保证），SSE 事件流聚合重组为完整响应体返回。
 // 注入机制：sjson.SetBytes 同款（对齐 injectClientMetadataKeys 先例——非法
-// JSON payload 放弃注入保持原样，上游 400 透传）。
+// JSON payload 放弃注入保持原样，上游 400 透传）；client_metadata 注入
+// （恒 4 key + turn_id + 条件键，对齐真实 client_metadata()——
+// responses_metadata.rs:255-288）在 Stream 发送前统一执行
+// （injectResponsesClientMetadata——非流式聚合与流式路径同一注入点）。
 // 与 Do 的区别：Do 是通用非流式 POST（对 codex responses 端点 400 不可用）；
 // 本方法走 Stream 合成——网关以非流式语义消费（一次性响应）。
 // 返回 HTTPResponse{StatusCode, Raw, TurnState}（与 Do 同形态；TurnState 读

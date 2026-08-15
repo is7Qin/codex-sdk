@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+
+	"github.com/tidwall/gjson"
 )
 
 // defaultMaxLineSize HTTP SSE 单行上限（与 WS ReadLimit 同量级）。
@@ -121,9 +123,15 @@ func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, err
 // 行切片——回调内的字节引用 scanner 复用缓冲，仅在回调执行期间有效；
 // 跨回调保留需自行拷贝），[DONE] 标记流正常终止。
 //
+// 发送前统一注入 client_metadata（对齐真实 codex client_metadata()——
+// responses_metadata.rs:255-288；见 injectResponsesClientMetadata）。
+// Responses 内部调 Stream 走同一注入点，避免两路径重复；Do 是通用非流式
+// POST 不注入（GenerateImage/Search 各自端点不受影响）。
+//
 // fn 返回错误立即终止读取并透传该错误。非 2xx 返回 *HTTPError；
 // 401 自动轮转语义同 Do。
 func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []byte) error) error {
+	payload = c.injectResponsesClientMetadata(payload)
 	resp, err := c.do(ctx, payload)
 	if err != nil {
 		return err
@@ -172,6 +180,66 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 		return fmt.Errorf("codexsdk: 读取 SSE 流失败: %w", err)
 	}
 	return nil // EOF 结束（是否截断由网关按终态事件判定）
+}
+
+// injectResponsesClientMetadata 在发送前注入 HTTP /responses 面的
+// client_metadata（键集严格对齐真实 codex client_metadata()——
+// responses_metadata.rs:255-288；生产模板 turn_metadata.rs:260-278
+// turn_id 恒带）：
+//   - 恒 4 key：x-codex-installation-id / session_id / thread_id /
+//     x-codex-window-id（CodexMeta 与 WithSession 同 key 时 CodexMeta 优先
+//     ——对齐 WS 组装优先级 client.go:522-578；空值跳过）；
+//   - 恒带 turn_id：payload 已含 → 原值透传（不覆盖）；CodexMeta.TurnID
+//     静态值其次；否则每请求自动 UUIDv7（网关每请求即一轮，对齐真实
+//     "每轮新 sub_id"语义）；
+//   - 条件键（仅配置了才带）：x-openai-subagent / x-codex-parent-thread-id /
+//     parent_turn_id / x-codex-turn-metadata；
+//   - 不注入：traceparent/tracestate（HTTP 体面真实不带——trace 仅 WS
+//     帧面）、turn-state（体键不存在，其请求头属 HTTP 头面不在本方法）；
+//   - 不做 metaPassthrough / turn_metadata 回调（WS 帧面扩展——真实 HTTP
+//     client_metadata() 是静态键集）。
+// 非法 JSON payload 放弃注入保持原样（对齐 responses.go:37 先例——sjson
+// SetBytes 对非法 JSON 静默产出损坏字节，须前置 gjson.ValidBytes）。
+func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
+	if !gjson.ValidBytes(payload) {
+		return payload
+	}
+	// 惰性组装 entries（同 WS prepareFrame 键序与优先级）；零配置时仍带
+	// turn_id（真实恒发）。
+	var entries []metadataEntry
+	appendEntry := func(key, value string) {
+		if value == "" {
+			return
+		}
+		if entries == nil {
+			entries = make([]metadataEntry, 0, 8)
+		}
+		entries = append(entries, metadataEntry{key, value})
+	}
+	if m := c.opts.meta; m != nil {
+		appendEntry(codexMetaInstallationKey, m.InstallationID)
+		appendEntry(codexMetaSessionKey, m.SessionID)
+		appendEntry(codexMetaThreadKey, m.ThreadID)
+		appendEntry(codexMetaTurnKey, m.TurnID)
+		appendEntry(codexMetaWindowKey, m.WindowID)
+		appendEntry(codexMetaSubagentKey, m.Subagent)
+		appendEntry(codexMetaParentThreadKey, m.ParentThreadID)
+		appendEntry(codexMetaParentTurnKey, m.ParentTurnID)
+		appendEntry(codexMetaTurnMetadataKey, m.TurnMetadata)
+		// 注意：HTTP 体面不含 trace 键（真实 client_metadata() 无
+		// ws_request_header_trace* 注入——trace 仅 WS 帧面扩展）。
+	}
+	if s := c.opts.session; s != nil {
+		appendEntry(codexMetaSessionKey, s.SessionID)
+		appendEntry(codexMetaThreadKey, s.ThreadID)
+		appendEntry(codexMetaWindowKey, s.WindowID)
+	}
+	// turn_id 恒带：payload 已含 → injectClientMetadataKeys 不覆盖（透传）；
+	// 无静态值才自动 UUIDv7（对齐 WS 组装条件 client.go:560）。
+	if (c.opts.meta == nil || c.opts.meta.TurnID == "") && !hasClientMetadataKey(payload, codexMetaTurnKey) {
+		appendEntry(codexMetaTurnKey, NewUUIDv7())
+	}
+	return injectClientMetadataKeys(payload, entries)
 }
 
 func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, error) {

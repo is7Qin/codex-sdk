@@ -550,6 +550,57 @@ func TestResponsesConnectionReuse(t *testing.T) {
 	}
 }
 
+// TestResponsesClientMetadataWire：Responses（非流式聚合路径，内部走 Stream
+// 统一注入点）——配置 meta + session → wire 请求体带恒 4 key（meta 优先于
+// session）+ 自动 turn_id（UUIDv7）+ stream:true 注入共存。
+func TestResponsesClientMetadataWire(t *testing.T) {
+	var cap responsesWireCapture
+	srv := startResponsesMock(t, nil,
+		[]string{respCreatedEvent, respItemMsgDoneEv, respCompletedEv}, true, &cap)
+
+	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv),
+		WithCodexMeta(CodexMeta{
+			InstallationID: "inst-1",
+			SessionID:      "sess-1",
+			ThreadID:       "thread-1",
+			WindowID:       "win-1:0",
+		}),
+		WithSession(Session{SessionID: "sess-other", ThreadID: "thread-other", WindowID: "win-other:1"}))
+	resp, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6"}`))
+	if err != nil {
+		t.Fatalf("Responses: %v", err)
+	}
+	if gjson.GetBytes(resp.Raw, "id").String() != "resp_001" {
+		t.Fatalf("合成体 id = %s", resp.Raw)
+	}
+
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	if !gjson.GetBytes(cap.body, "stream").Bool() {
+		t.Fatalf("stream:true 注入应保留, body = %s", cap.body)
+	}
+	cm := gjson.GetBytes(cap.body, "client_metadata")
+	if !cm.Exists() || len(cm.Map()) != 5 {
+		t.Fatalf("client_metadata = %s（期望恒 4 key + turn_id）", cm.Raw)
+	}
+	for key, want := range map[string]string{
+		"x-codex-installation-id": "inst-1",
+		"session_id":              "sess-1",
+		"thread_id":               "thread-1",
+		"x-codex-window-id":       "win-1:0",
+	} {
+		if got := cm.Get(key).String(); got != want {
+			t.Fatalf("%s = %q, 期望 %q（CodexMeta 优先于 WithSession）", key, got, want)
+		}
+	}
+	if turn := cm.Get("turn_id").String(); !uuidv7Re.MatchString(turn) {
+		t.Fatalf("turn_id = %q, 期望 UUIDv7 格式（无静态值自动生成）", turn)
+	}
+	if gjson.GetBytes(cap.body, "model").String() != "gpt-5.6" {
+		t.Fatalf("注入不应动其余字段: %s", cap.body)
+	}
+}
+
 // TestResponsesNilAuth：auth 为 nil 直接报错（不发出请求）。
 func TestResponsesNilAuth(t *testing.T) {
 	hc := NewHTTPClient(nil, WithBaseURL("http://127.0.0.1:1"))

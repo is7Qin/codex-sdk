@@ -28,9 +28,11 @@
 //     事件帧时调用）
 //   - 伪装层（真实 codex 客户端形态对齐，对照见 IMPERSONATION.md）：默认
 //     codex-tui UA/originator（0.147.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
-//     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata 组装（8 key 恒发：
-//     installation_id/session_id/thread_id/turn_id/window_id/turn-metadata/
-//     traceparent/tracestate）、透传（HTTP 头 WithHeader / WS client_metadata
+//     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata 组装（WS 帧面
+//     8 key 恒发：installation_id/session_id/thread_id/turn_id/window_id/
+//     turn-metadata/traceparent/tracestate；HTTP 体面恒 4 key + turn_id +
+//     条件键，不含 trace/turn-state，见 injectResponsesClientMetadata）、
+//     透传（HTTP 头 WithHeader / WS client_metadata
 //     任意键 WithClientMetadata，只透传不解析——如 responses-lite 标记
 //     HeaderResponsesLite / MetaResponsesLiteKey）、会话标识握手头（WithSession）、
 //     x-codex-turn-state（WS：升级响应头签发 → 帧内 client_metadata 回传；
@@ -87,7 +89,11 @@
 // CompressionContextTakeover 压缩、WS 层 ping 心跳（30s 间隔 + 2s 超时）、
 // data: SSE 行提取与 [DONE] 终止、response.create 18 字段白名单、
 // client_metadata 恒发 8 key 集合（session_id/thread_id/turn_id 为 snake_case，
-// trace 的 metadata key 名与头名不同）。
+// trace 的 metadata key 名与头名不同）。HTTP /responses 面注入（Stream
+// 发送前统一执行）恒 4 key（x-codex-installation-id/session_id/thread_id/
+// x-codex-window-id）+ 恒带 turn_id + 条件键（x-openai-subagent/
+// x-codex-parent-thread-id/parent_turn_id/x-codex-turn-metadata）——不含
+// trace/turn-state（trace 仅 WS 帧面；turn-state 的请求头属 HTTP 头面）。
 //
 // 依赖：github.com/coder/websocket（纯标准库实现，无 CGO）+
 // github.com/tidwall/gjson / github.com/tidwall/sjson（raw JSON 修补）。
