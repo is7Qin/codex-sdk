@@ -543,6 +543,36 @@ func TestHTTPStreamClientMetadataPassthrough(t *testing.T) {
 	if !bytes.Equal(gotBody, payload) {
 		t.Fatalf("含 client_metadata 的 payload 应零注入原样上送（透传零改动）\n got: %s\nwant: %s", gotBody, payload)
 	}
+	// 缺 key 不补（评审 P3-D'）：payload 含 metadata 但缺 x-codex-installation-id
+	// → 不补齐（透传优先语义——即使 CodexMeta 已配置）
+	if gjson.GetBytes(gotBody, "client_metadata.x-codex-installation-id").Exists() {
+		t.Fatalf("缺键不应补齐 x-codex-installation-id: %s", gotBody)
+	}
+}
+
+// TestHTTPStreamClientMetadataQuotedValueEdge：判据边界（评审 P3-D'）——
+// 字符串值恰为 "client_metadata"（JSON 值恒带引号，与键 token 不可区分）→
+// 命中短路：零注入原样上送、不报错（仅跳过注入、请求合法——退化为缺
+// metadata 而非错误）。
+func TestHTTPStreamClientMetadataQuotedValueEdge(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	payload := []byte(`{"model":"m","prompt":"client_metadata"}`)
+	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if !bytes.Equal(gotBody, payload) {
+		t.Fatalf("值恰为键名的字符串应短路零注入原样上送（不报错）\n got: %s\nwant: %s", gotBody, payload)
+	}
 }
 
 // TestHTTPStreamClientMetadataSessionFallback：未配置 meta 仅 WithSession →

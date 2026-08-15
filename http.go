@@ -209,6 +209,10 @@ func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
 	// 自带完整 metadata 的请求体）→ 透传优先语义，零注入直接返回（省掉
 	// ValidBytes 全量 JSON 扫描——常见场景注入成本归零）。判据为带引号
 	// token（JSON 键名恒带引号）：字符串值里的裸词不误判（评审 P2-2）。
+	// 判据局限（评审 P3-B'）：值恰为 "client_metadata" 的字符串值（如
+	// prompt 值）仍命中短路——概率低且无害：仅跳过注入、请求合法，
+	// 退化为缺 metadata 而非错误；假阴性（非标准写法）无害——走注入链
+	// 补全更完整。
 	if bytes.Contains(payload, []byte(`"client_metadata"`)) {
 		return payload
 	}
