@@ -402,6 +402,7 @@ func TestHTTPStreamDoneDrainsBodyForReuse(t *testing.T) {
 
 // TestHTTPStreamClientMetadataMinimal：未配置 meta/session → 请求体仅注入
 // client_metadata.turn_id（UUIDv7 格式，真实恒发），无其他键。
+// （兼证预筛不误伤：payload 不含 client_metadata → 仍注入 turn_id。）
 func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -500,9 +501,10 @@ func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
 	}
 }
 
-// TestHTTPStreamClientMetadataPassthrough：payload 已有 client_metadata.turn_id
-// → 原值透传（不覆盖——即使 CodexMeta.TurnID 已配置）；payload 已有条件键
-// 同样不覆盖；缺键由 meta 补齐。
+// TestHTTPStreamClientMetadataPassthrough：payload 已含 client_metadata →
+// 预筛短路零注入（透传优先语义——真实客户端自带完整 metadata，注入仅面向
+// 无 client_metadata 的组装请求体）：整包逐字节原样上送，不补键不覆盖
+// （CodexMeta 配置不生效）。
 func TestHTTPStreamClientMetadataPassthrough(t *testing.T) {
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -520,15 +522,9 @@ func TestHTTPStreamClientMetadataPassthrough(t *testing.T) {
 	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	cm := gjson.GetBytes(gotBody, "client_metadata")
-	if got := cm.Get("turn_id").String(); got != "payload-turn" {
-		t.Fatalf("turn_id = %q, 期望 payload 原值透传（不覆盖 meta 静态值）", got)
-	}
-	if got := cm.Get("x-openai-subagent").String(); got != "keep" {
-		t.Fatalf("x-openai-subagent = %q, 期望 payload 原值透传", got)
-	}
-	if got := cm.Get("x-codex-installation-id").String(); got != "inst-1" {
-		t.Fatalf("x-codex-installation-id = %q, 期望缺键由 meta 补齐", got)
+	// 预筛短路：整包零注入原样透传（含 client_metadata 即免注入，逐字节一致）
+	if !bytes.Equal(gotBody, payload) {
+		t.Fatalf("含 client_metadata 的 payload 应零注入原样上送（透传零改动）\n got: %s\nwant: %s", gotBody, payload)
 	}
 }
 
