@@ -21,8 +21,8 @@ func TestUsageDefaultURLConst(t *testing.T) {
 }
 
 // TestUsageEndpointDerivation：由 responses 完整端点派生 usage 端点——
-// 尾段 /responses 且前一段为 codex（ChatGPT 面）→ 切尾两段 + /wham/usage；
-// 否则（API-key 面）→ 切尾一段 + /api/codex/usage；非 /responses 结尾 →
+// 尾段 /responses 且前一段为 codex（ChatGPT 面形态）→ 切尾两段 +
+// /wham/usage；尾段非 /responses 或前一段非 codex（API-key 面形态等）→
 // 错误（尾斜杠同样报错——不静默产生错误 URL；实态输入已归一，纯防御性）。
 func TestUsageEndpointDerivation(t *testing.T) {
 	cases := []struct {
@@ -31,8 +31,7 @@ func TestUsageEndpointDerivation(t *testing.T) {
 		want string
 	}{
 		{"默认 responses 端点（ChatGPT 面）", DefaultResponsesURL, DefaultUsageURL},
-		{"API key 模式形态", "https://api.openai.com/v1/responses", "https://api.openai.com/v1/api/codex/usage"},
-		{"query 形态（自带 query 保留）", "https://api.openai.com/v1/responses?foo=bar", "https://api.openai.com/v1/api/codex/usage?foo=bar"},
+		{"query 形态（自带 query 保留）", "https://chatgpt.com/backend-api/codex/responses?foo=bar", "https://chatgpt.com/backend-api/wham/usage?foo=bar"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,10 +45,12 @@ func TestUsageEndpointDerivation(t *testing.T) {
 		})
 	}
 
-	// 非 /responses 结尾（含尾斜杠）→ 错误
+	// 非 /responses 结尾（含尾斜杠）→ 错误；API-key 面形态（前一段非 codex）
+	// → 错误（其端点 /api/codex/usage 无实际调用者，仅 ChatGPT 面支持）
 	for _, bad := range []string{
 		"https://api.openai.com/v1/chat/completions",
 		"https://api.openai.com/v1/responses/",
+		"https://api.openai.com/v1/responses",
 	} {
 		if _, err := usageEndpointFrom(bad); err == nil {
 			t.Fatalf("usageEndpointFrom(%q) 应报错", bad)
@@ -58,7 +59,7 @@ func TestUsageEndpointDerivation(t *testing.T) {
 }
 
 // TestUsageGetMethodAndAuth：GetUsage 请求形态断言——method=GET + 无请求体 +
-// 鉴权头注入（API-key 面派生路径 /v1/api/codex/usage 一并断言）。
+// 鉴权头注入（ChatGPT 面派生路径 /backend-api/wham/usage 一并断言）。
 func TestUsageGetMethodAndAuth(t *testing.T) {
 	var gotMethod, gotPath, gotAuth string
 	var gotBody []byte
@@ -72,15 +73,15 @@ func TestUsageGetMethodAndAuth(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("pat-usage"), WithBaseURL(srv.URL+"/v1/responses"))
+	hc := NewHTTPClient(PAT("pat-usage"), WithBaseURL(srv.URL+"/backend-api/codex/responses"))
 	if _, err := hc.GetUsage(context.Background()); err != nil {
 		t.Fatalf("GetUsage: %v", err)
 	}
 	if gotMethod != http.MethodGet {
 		t.Fatalf("method = %q, 期望 GET", gotMethod)
 	}
-	if gotPath != "/v1/api/codex/usage" {
-		t.Fatalf("路径 = %q, 期望派生 /v1/api/codex/usage", gotPath)
+	if gotPath != "/backend-api/wham/usage" {
+		t.Fatalf("路径 = %q, 期望派生 /backend-api/wham/usage", gotPath)
 	}
 	if len(gotBody) != 0 {
 		t.Fatalf("GET 应无请求体, got %s", gotBody)
@@ -161,7 +162,7 @@ func TestUsageDecode(t *testing.T) {
 		}))
 		t.Cleanup(srv2.Close)
 
-		hc2 := NewHTTPClient(PAT("pat-usage"), WithBaseURL(srv2.URL+"/v1/responses"))
+		hc2 := NewHTTPClient(PAT("pat-usage"), WithBaseURL(srv2.URL+"/backend-api/codex/responses"))
 		usage, err := hc2.GetUsage(context.Background())
 		if err != nil {
 			t.Fatalf("GetUsage(null 形态): %v", err)
@@ -185,7 +186,7 @@ func TestUsageErrorStatus(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("wrong"), WithBaseURL(srv.URL+"/v1/responses"))
+	hc := NewHTTPClient(PAT("wrong"), WithBaseURL(srv.URL+"/backend-api/codex/responses"))
 	_, err := hc.GetUsage(context.Background())
 	var he *HTTPError
 	if !errors.As(err, &he) {
@@ -220,7 +221,7 @@ func TestUsage401Rotate(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-	hc := NewHTTPClient(auth, WithBaseURL(srv.URL+"/v1/responses"))
+	hc := NewHTTPClient(auth, WithBaseURL(srv.URL+"/backend-api/codex/responses"))
 	usage, err := hc.GetUsage(context.Background())
 	if err != nil {
 		t.Fatalf("GetUsage: %v", err)

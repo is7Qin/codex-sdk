@@ -15,8 +15,10 @@ import (
 // base=https://chatgpt.com/backend-api/codex → .../backend-api/wham/usage）。
 // 实证出处：codex-rs backend-client/src/client/rate_limit_resets.rs:80-85
 // GET {base}/wham/usage（ChatGPT 面）+ client.rs:118-125 PathStyle 判定
-// （base_url 含 /backend-api → /wham/*，否则 /api/codex/*）；API key 模式
-// 派生形态 = https://api.openai.com/v1/api/codex/usage 一并成立。
+// （base_url 含 /backend-api → /wham/*）。仅支持 ChatGPT 面（用户裁决
+// 2026-08-17）：API-key 面端点 /api/codex/usage 无实际调用者——codex-rs
+// tui/chatwidget/rate_limits.rs:330 should_prefetch_rate_limits 仅在 ChatGPT
+// 账号登录态触发（has_chatgpt_account），API-key/PAT 模式从不调用。
 // 本常量在派生路径下仅文档/测试引用：默认 c.baseURL=DefaultResponsesURL →
 // GetUsage 方法内 usageEndpointFrom 派生结果即本值。
 const DefaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
@@ -28,7 +30,9 @@ const DefaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 // 端点：由 c.baseURL（responses 完整端点）尾段派生——默认
 // DefaultResponsesURL → DefaultUsageURL；WithBaseURL 覆盖值同样按
 // responses 端点语义派生（网关 cred.BaseURL 直传即用；URL 派生逻辑留
-// SDK——网关零拼装）。
+// SDK——网关零拼装）。仅支持 ChatGPT 面形态（.../backend-api/codex/
+// responses）：API-key 面形态（.../v1/responses）派生报错——其端点无
+// 实际调用者（见 DefaultUsageURL 实证出处）。
 //
 // 传输层复用 doURL：鉴权头注入 / 懒构建 / 401 判死分类 + 单飞 refresh +
 // 自动重试一次 / fatal 类错误透传（不被 HTTPError 吞掉，errors.As 可区分）/
@@ -65,12 +69,12 @@ func (c *HTTPClient) GetUsage(ctx context.Context) (*UsageStatus, error) {
 
 // usageEndpointFrom 由 responses 完整端点派生 usage 端点（对齐
 // searchEndpointFrom 防呆——非 /responses 结尾 → 错误，不静默产生错误 URL）：
-// 尾段 /responses 且前一段为 codex（ChatGPT 面形态 .../backend-api/codex/
-// responses）→ 切尾两段得 base → + /wham/usage；否则（API-key 面形态
-// .../v1/responses）→ 切尾一段得 base → + /api/codex/usage（对齐 codex-rs
-// rate_limit_resets.rs:82-83 / client.rs:118-125 PathStyle 判定——"前一段为
-// codex"判据与 /backend-api 判据在现实两形态输入下等价，假想输入下分叉
-// 无实际影响）。包内函数不导出——URL 派生全在 SDK。
+// 仅支持 ChatGPT 面形态（尾段 /responses 且前一段为 codex，
+// .../backend-api/codex/responses）→ 切尾两段得 base → + /wham/usage；
+// 尾段非 /responses 或前一段非 codex → 错误（API-key 面形态 .../v1/responses
+// 直接拒绝——其端点 /api/codex/usage 无实际调用者，见 DefaultUsageURL 实证
+// 出处；用户裁决 2026-08-17 仅 ChatGPT 面）。包内函数不导出——URL 派生全
+// 在 SDK。
 func usageEndpointFrom(responsesURL string) (string, error) {
 	u, err := url.Parse(responsesURL)
 	if err != nil {
@@ -79,14 +83,14 @@ func usageEndpointFrom(responsesURL string) (string, error) {
 	path := u.Path
 	i := strings.LastIndex(path, "/")
 	if i < 0 || path[i+1:] != "responses" {
-		return "", fmt.Errorf("codexsdk: usage 端点派生失败：%q 尾段非 /responses", responsesURL)
+		return "", fmt.Errorf("codexsdk: usage 端点派生失败：%q 尾段非 /codex/responses", responsesURL)
 	}
 	prefix := path[:i]
-	if j := strings.LastIndex(prefix, "/"); j >= 0 && prefix[j+1:] == "codex" {
-		u.Path = prefix[:j] + "/wham/usage"
-	} else {
-		u.Path = prefix + "/api/codex/usage"
+	j := strings.LastIndex(prefix, "/")
+	if j < 0 || prefix[j+1:] != "codex" {
+		return "", fmt.Errorf("codexsdk: usage 端点派生失败：%q 尾段非 /codex/responses", responsesURL)
 	}
+	u.Path = prefix[:j] + "/wham/usage"
 	return u.String(), nil
 }
 
