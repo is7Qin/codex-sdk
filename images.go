@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -127,7 +128,7 @@ func (c *HTTPClient) GenerateImage(ctx context.Context, p *ImageGenParams) (*Ima
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.doURL(ctx, targetURL, payload)
+	resp, err := c.doURL(ctx, targetURL, http.MethodPost, payload)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 )
@@ -46,7 +47,7 @@ func (c *HTTPClient) Search(ctx context.Context, payload []byte) (*HTTPResponse,
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.doURL(ctx, targetURL, payload)
+	resp, err := c.doURL(ctx, targetURL, http.MethodPost, payload)
 	if err != nil {
 		return nil, err
 	}

@@ -265,17 +265,17 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	if err != nil {
 		return nil, err
 	}
-	return c.doURL(ctx, targetURL, payload)
+	return c.doURL(ctx, targetURL, http.MethodPost, payload)
 }
 
-// doURL 发送 POST 到指定完整端点并应用 401 自动轮转（do 的 URL 已构建形态；
-// GenerateImage 等非 responses 端点复用同一传输层：判死分类 + 单飞 refresh +
-// 自动重试一次，语义与 do 完全一致）。
-func (c *HTTPClient) doURL(ctx context.Context, targetURL string, payload []byte) (*http.Response, error) {
+// doURL 发送指定 method 请求到指定完整端点并应用 401 自动轮转（do 的 URL
+// 已构建形态；GenerateImage / Search / GetUsage 等非 responses 端点复用
+// 同一传输层：判死分类 + 单飞 refresh + 自动重试一次，语义与 do 完全一致）。
+func (c *HTTPClient) doURL(ctx context.Context, targetURL string, method string, payload []byte) (*http.Response, error) {
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	resp, err := c.sendRequest(ctx, targetURL, payload)
+	resp, err := c.sendRequest(ctx, targetURL, method, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +303,7 @@ func (c *HTTPClient) doURL(ctx context.Context, targetURL string, payload []byte
 		return nil, err // refresh 失败（fatal / RefreshError）透传
 	}
 	// 自动重试一次（新 at）。
-	resp2, err := c.sendRequest(ctx, targetURL, payload)
+	resp2, err := c.sendRequest(ctx, targetURL, method, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -323,9 +323,9 @@ func (c *HTTPClient) doURL(ctx context.Context, targetURL string, payload []byte
 	return resp2, nil
 }
 
-// sendRequest 构造 POST 请求并执行（伪装层默认头 + 调用方 WithHeader 覆盖）。
-func (c *HTTPClient) sendRequest(ctx context.Context, targetURL string, payload []byte) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(payload))
+// sendRequest 构造指定 method 请求并执行（伪装层默认头 + 调用方 WithHeader 覆盖）。
+func (c *HTTPClient) sendRequest(ctx context.Context, targetURL string, method string, payload []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 构造请求失败: %w", err)
 	}
