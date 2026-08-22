@@ -597,26 +597,31 @@ func TestHTTP401AutoRotate(t *testing.T) {
 		}
 	})
 
-	t.Run("PAT 401 含判死码体原样返回不判死", func(t *testing.T) {
-		// 判死分类属 OAuth AT 概念：PAT 无轮转无状态，401 一律原样 HTTPError
-		//（即便响应体含 token_revoked），分类不执行（现状保持）。
+	t.Run("PAT 401 含判死码体触发判死", func(t *testing.T) {
+		// PAT 已升级为可判死 Auth：401 先判死分类，命中致命码 → AuthPermanentlyRevokedError。
 		respSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"error":{"code":"token_revoked"}}`))
 		}))
 		t.Cleanup(respSrv.Close)
 
-		hc := NewHTTPClient(PAT("p"), WithBaseURL(respSrv.URL))
+		var fatalCalls atomic.Int32
+		auth := PAT("p", WithPATOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
+		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
-		var he *HTTPError
-		if !errors.As(err, &he) {
-			t.Fatalf("PAT 场景应原样返回 *HTTPError, got %T: %v", err, err)
+		var ape *AuthPermanentlyRevokedError
+		if !errors.As(err, &ape) {
+			t.Fatalf("PAT 判死应返回 *AuthPermanentlyRevokedError, got %T: %v", err, err)
 		}
-		if he.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("StatusCode = %d, 期望 401", he.StatusCode)
+		if ape.Code != "token_revoked" {
+			t.Fatalf("Code = %q, 期望 token_revoked", ape.Code)
 		}
-		if _, ok := err.(*AuthPermanentlyRevokedError); ok {
-			t.Fatal("PAT 场景不应做 AT 判死分类")
+		if fatalCalls.Load() != 1 {
+			t.Fatalf("PAT 判死应触发 OnAuthFatal 恰一次, got %d", fatalCalls.Load())
+		}
+		// 毒化后后续 Authorization 恒错
+		if _, err := auth.Authorization(context.Background()); !errors.As(err, &ape) {
+			t.Fatalf("毒化后应恒返回致命错误, got %v", err)
 		}
 	})
 }
@@ -792,13 +797,25 @@ func TestRotationInvalidateFatal(t *testing.T) {
 	}
 }
 
-// TestPATAndOAuthNoop：PAT/oauthAuth 的 Invalidate/Fatal 为 no-op（不破坏鉴权）。
+// TestPATAndOAuthNoop：PAT 已升级为可判死（Fatal 毒化、Invalidate 仍 no-op），
+// oauthAuth 保持 no-op。
 func TestPATAndOAuthNoop(t *testing.T) {
 	pat := PAT("p")
 	pat.Invalidate()
-	pat.Fatal(errors.New("x"))
 	if h, err := pat.Authorization(context.Background()); err != nil || h != "Bearer p" {
-		t.Fatalf("PAT no-op 不破坏鉴权: %q %v", h, err)
+		t.Fatalf("PAT Invalidate 应 no-op: %q %v", h, err)
+	}
+	// PAT Fatal 毒化（不再 no-op）
+	pat2 := PAT("p")
+	pat2.Fatal(errors.New("x"))
+	if _, err := pat2.Authorization(context.Background()); err == nil {
+		t.Fatal("PAT Fatal 后应毒化")
+	}
+	// Fatal(nil) 忽略
+	pat3 := PAT("p")
+	pat3.Fatal(nil)
+	if h, err := pat3.Authorization(context.Background()); err != nil || h != "Bearer p" {
+		t.Fatalf("PAT Fatal(nil) 应忽略: %q %v", h, err)
 	}
 	oa := OAuth(func(ctx context.Context) (string, error) { return "t", nil })
 	oa.Invalidate()
