@@ -19,8 +19,8 @@ func TestSearchDefaultURLConst(t *testing.T) {
 	}
 }
 
-// TestSearchDerivedPathAndMethod：Search 方法固定官方端点验证（请求 method + path 全量断言）。
-func TestSearchDerivedPathAndMethod(t *testing.T) {
+// TestSearchFixedPathAndMethod：Search 方法固定官方端点验证（请求 method + path 全量断言）。
+func TestSearchFixedPathAndMethod(t *testing.T) {
 	var gotMethod, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
