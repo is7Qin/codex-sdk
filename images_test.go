@@ -221,42 +221,10 @@ func TestParseImageResponseMissingUsage(t *testing.T) {
 	}
 }
 
-// ---- 端点派生单测 ----
-
-// TestImagesEndpoint：无覆盖 = DefaultImagesURL 同源派生；WithBaseURL 覆盖值
-// = 完整 generations 端点直用；edits = 尾段 /images/generations → /images/edits。
-func TestImagesEndpoint(t *testing.T) {
-	hc := NewHTTPClient(PAT("t"))
-	gen, err := hc.imagesEndpoint(false)
-	if err != nil || gen != DefaultImagesURL {
-		t.Fatalf("默认 generations = %q, %v", gen, err)
-	}
-	ed, err := hc.imagesEndpoint(true)
-	if err != nil || ed != "https://chatgpt.com/backend-api/codex/images/edits" {
-		t.Fatalf("默认 edits 派生 = %q, %v", ed, err)
-	}
-
-	hc2 := NewHTTPClient(PAT("t"), WithBaseURL("https://selfhost/v1/images/generations"))
-	gen, err = hc2.imagesEndpoint(false)
-	if err != nil || gen != "https://selfhost/v1/images/generations" {
-		t.Fatalf("覆盖 generations 直用 = %q, %v", gen, err)
-	}
-	ed, err = hc2.imagesEndpoint(true)
-	if err != nil || ed != "https://selfhost/v1/images/edits" {
-		t.Fatalf("覆盖 edits 派生 = %q, %v", ed, err)
-	}
-
-	// 覆盖值尾段非 /generations：edits 派生报错（不静默打错误 URL）
-	hc3 := NewHTTPClient(PAT("t"), WithBaseURL("https://selfhost/v1/responses"))
-	if _, err := hc3.imagesEndpoint(true); err == nil {
-		t.Fatal("尾段非 /generations 的 edits 派生应报错")
-	}
-}
-
 // ---- 集成（httptest mock 上游）----
 
-// TestGenerateImageGenerations：全链路——WithBaseURL 完整端点直用（路径
-// /images/generations）、鉴权头注入、默认头（Content-Type/UA/Originator、
+// TestGenerateImageGenerations：全链路——固定官方端点（路径
+// /backend-api/codex/images/generations）、鉴权头注入、默认头（Content-Type/UA/Originator、
 // 不发 OpenAI-Beta 与 x-codex-image-turn-id）、请求体、响应解析。
 func TestGenerateImageGenerations(t *testing.T) {
 	var gotAuth, gotBeta, gotTurnID, gotContentType, gotUA, gotOriginator string
@@ -277,7 +245,7 @@ func TestGenerateImageGenerations(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("pat-img"), WithBaseURL(srv.URL+"/images/generations"))
+	hc := NewHTTPClient(PAT("pat-img"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	n := 1
 	resp, err := hc.GenerateImage(context.Background(), &ImageGenParams{
 		Model:  "gpt-image-2",
@@ -288,7 +256,7 @@ func TestGenerateImageGenerations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateImage: %v", err)
 	}
-	if gotPath != "/images/generations" {
+	if gotPath != "/backend-api/codex/images/generations" {
 		t.Fatalf("路径 = %q（覆盖值按完整 generations 端点直用）", gotPath)
 	}
 	if gotAuth != "Bearer pat-img" {
@@ -329,7 +297,7 @@ func TestGenerateImageEdits(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("pat-img"), WithBaseURL(srv.URL+"/images/generations"))
+	hc := NewHTTPClient(PAT("pat-img"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/edits", srv.URL)))
 	resp, err := hc.GenerateImage(context.Background(), &ImageGenParams{
 		Model:  "gpt-image-1.5",
 		Prompt: "add a red hat",
@@ -338,7 +306,7 @@ func TestGenerateImageEdits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateImage: %v", err)
 	}
-	if gotPath != "/images/edits" {
+	if gotPath != "/backend-api/codex/images/edits" {
 		t.Fatalf("edits 路径 = %q（尾段 /images/generations → /images/edits）", gotPath)
 	}
 	wantBody := `{"prompt":"add a red hat","model":"gpt-image-1.5","images":[{"image_url":"data:image/png;base64,` +
@@ -373,7 +341,7 @@ func TestGenerateImage401Rotate(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-	hc := NewHTTPClient(auth, WithBaseURL(srv.URL+"/images/generations"))
+	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	resp, err := hc.GenerateImage(context.Background(), &ImageGenParams{Model: "gpt-image-2", Prompt: "hi"})
 	if err != nil {
 		t.Fatalf("GenerateImage: %v", err)
@@ -403,7 +371,7 @@ func TestGenerateImage401Fatal(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-	hc := NewHTTPClient(auth, WithBaseURL(srv.URL+"/images/generations"))
+	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	_, err := hc.GenerateImage(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"})
 	var are *AuthPermanentlyRevokedError
 	if !errors.As(err, &are) {
@@ -436,7 +404,7 @@ func TestGenerateImageRefreshFatalPassthrough(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-	hc := NewHTTPClient(auth, WithBaseURL(srv.URL+"/images/generations"))
+	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	_, err := hc.GenerateImage(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"})
 	var re *RefreshOAuthError
 	if !errors.As(err, &re) {
@@ -460,7 +428,7 @@ func TestGenerateImage403Passthrough(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL+"/images/generations"))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	_, err := hc.GenerateImage(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"})
 	var he *HTTPError
 	if !errors.As(err, &he) {
@@ -491,13 +459,13 @@ func startImageMock(t *testing.T, body string) string {
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
-	return srv.URL + "/images/generations"
+	return srv.URL
 }
 
 // TestGenerateImageStreamSuccess：非流式生成成功 → 每张图一个 completed 事件
 // （B64JSON 各自）+ usage 仅最后一个事件携带。
 func TestGenerateImageStreamSuccess(t *testing.T) {
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(startImageMock(t, imageStreamBody)))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", startImageMock(t, imageStreamBody))))
 	var events []ImageStreamEvent
 	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
 		func(ev ImageStreamEvent) error {
@@ -534,7 +502,7 @@ func TestGenerateImageStreamSuccess(t *testing.T) {
 // TestGenerateImageStreamSingleEvent：单图 + usage → 恰好一个 completed 事件
 // （usage 即携带于该事件）——spec 验收：流式合成单事件。
 func TestGenerateImageStreamSingleEvent(t *testing.T) {
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(startImageMock(t, imageResponseBody)))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", startImageMock(t, imageResponseBody))))
 	var calls int
 	var last ImageStreamEvent
 	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
@@ -564,7 +532,7 @@ func TestGenerateImageStreamErrorNoEvents(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL+"/images/generations"))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	var calls int
 	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
 		func(ev ImageStreamEvent) error {
@@ -585,7 +553,7 @@ func TestGenerateImageStreamErrorNoEvents(t *testing.T) {
 
 // TestGenerateImageStreamEmptyData：Data 为空 → 不调回调直接返回（无事件）。
 func TestGenerateImageStreamEmptyData(t *testing.T) {
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(startImageMock(t, `{"created":1}`)))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", startImageMock(t, `{"created":1}`))))
 	var calls int
 	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
 		func(ev ImageStreamEvent) error {
@@ -603,7 +571,7 @@ func TestGenerateImageStreamEmptyData(t *testing.T) {
 // TestGenerateImageStreamCallbackError：completed 回调返回错误 → 立即终止并
 // 透传（对齐既有 Stream 回调语义——后续事件不再调用）。
 func TestGenerateImageStreamCallbackError(t *testing.T) {
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(startImageMock(t, imageStreamBody)))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", startImageMock(t, imageStreamBody))))
 	sentinel := errors.New("stop")
 	var calls int
 	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},
@@ -635,7 +603,7 @@ func TestGenerateImageStreamKeepalive(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL+"/images/generations"))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	var keepalives int
 	var keepaliveNilViolations int
 	var events []ImageStreamEvent
@@ -682,7 +650,7 @@ func TestGenerateImageStreamKeepaliveCallbackError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL+"/images/generations"))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	sentinel := errors.New("stop")
 	var completedCalls int
 	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},

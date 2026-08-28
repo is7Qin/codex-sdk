@@ -12,18 +12,14 @@ import (
 	"testing"
 )
 
-// TestSearchDefaultURLConst：DefaultSearchURL 常量值断言（无网络）——
-// 默认 c.baseURL=DefaultResponsesURL → Search 方法内 searchEndpointFrom
-// 派生结果即本值（派生链路网络断言见 TestSearchDerivedPathAndMethod）。
+// TestSearchDefaultURLConst：DefaultSearchURL 常量值断言（无网络）。
 func TestSearchDefaultURLConst(t *testing.T) {
 	if DefaultSearchURL != "https://chatgpt.com/backend-api/codex/alpha/search" {
 		t.Fatalf("DefaultSearchURL 应为完整 search 端点, got %q", DefaultSearchURL)
 	}
 }
 
-// TestSearchDerivedPathAndMethod：Search 方法派生链路实证——WithBaseURL
-// 覆盖值按 responses 端点语义派生：打 /v1/responses 覆盖 → Search 派生
-// /v1/alpha/search（请求 method + path 全量断言）。
+// TestSearchDerivedPathAndMethod：Search 方法固定官方端点验证（请求 method + path 全量断言）。
 func TestSearchDerivedPathAndMethod(t *testing.T) {
 	var gotMethod, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -34,15 +30,15 @@ func TestSearchDerivedPathAndMethod(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("pat-search"), WithBaseURL(srv.URL+"/v1/responses"))
+	hc := NewHTTPClient(PAT("pat-search"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/alpha/search", srv.URL)))
 	if _, err := hc.Search(context.Background(), []byte(`{}`)); err != nil {
 		t.Fatalf("Search: %v", err)
 	}
 	if gotMethod != http.MethodPost {
 		t.Fatalf("method = %q, 期望 POST", gotMethod)
 	}
-	if gotPath != "/v1/alpha/search" {
-		t.Fatalf("路径 = %q, 期望派生 /v1/alpha/search", gotPath)
+	if gotPath != "/backend-api/codex/alpha/search" {
+		t.Fatalf("路径 = %q, 期望 /backend-api/codex/alpha/search", gotPath)
 	}
 }
 
@@ -58,7 +54,7 @@ func TestSearchPayloadAndRaw(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("pat-search"), WithBaseURL(srv.URL+"/v1/responses"))
+	hc := NewHTTPClient(PAT("pat-search"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/alpha/search", srv.URL)))
 	resp, err := hc.Search(context.Background(), []byte(`{"query":"codex","limit":10}`))
 	if err != nil {
 		t.Fatalf("Search: %v", err)
@@ -86,7 +82,7 @@ func TestSearchErrorStatus(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("wrong"), WithBaseURL(srv.URL+"/v1/responses"))
+	hc := NewHTTPClient(PAT("wrong"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/alpha/search", srv.URL)))
 	_, err := hc.Search(context.Background(), []byte(`{}`))
 	var he *HTTPError
 	if !errors.As(err, &he) {
@@ -112,7 +108,7 @@ func TestSearchAuthorizationForms(t *testing.T) {
 		}))
 		t.Cleanup(srv.Close)
 
-		hc := NewHTTPClient(PAT("pat-search"), WithBaseURL(srv.URL+"/v1/responses"))
+		hc := NewHTTPClient(PAT("pat-search"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/alpha/search", srv.URL)))
 		if _, err := hc.Search(context.Background(), []byte(`{}`)); err != nil {
 			t.Fatalf("Search: %v", err)
 		}
@@ -134,7 +130,7 @@ func TestSearchAuthorizationForms(t *testing.T) {
 		hc := NewHTTPClient(OAuth(func(ctx context.Context) (string, error) {
 			providerCalls.Add(1)
 			return "oauth-static", nil
-		}), WithBaseURL(srv.URL+"/v1/responses"))
+		}), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/alpha/search", srv.URL)))
 		if _, err := hc.Search(context.Background(), []byte(`{}`)); err != nil {
 			t.Fatalf("Search: %v", err)
 		}
@@ -168,7 +164,7 @@ func TestSearch401Rotate(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-	hc := NewHTTPClient(auth, WithBaseURL(srv.URL+"/v1/responses"))
+	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/alpha/search", srv.URL)))
 	resp, err := hc.Search(context.Background(), []byte(`{}`))
 	if err != nil {
 		t.Fatalf("Search: %v", err)
@@ -186,37 +182,3 @@ func TestSearch401Rotate(t *testing.T) {
 	}
 }
 
-// TestSearchEndpointDerivation：由 responses 完整端点派生 search 端点——
-// 末尾 /responses 路径段 → /alpha/search；非 /responses 结尾 → 错误（尾斜杠
-// 同样报错——不静默产生错误 URL；实态输入已归一，纯防御性）。
-func TestSearchEndpointDerivation(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"API key 模式形态", "https://api.openai.com/v1/responses", "https://api.openai.com/v1/alpha/search"},
-		{"chatgpt.com 登录模式形态", "https://chatgpt.com/backend-api/codex/responses", "https://chatgpt.com/backend-api/codex/alpha/search"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := searchEndpointFrom(tc.in)
-			if err != nil {
-				t.Fatalf("searchEndpointFrom(%q): %v", tc.in, err)
-			}
-			if got != tc.want {
-				t.Fatalf("派生结果 = %q, 期望 %q", got, tc.want)
-			}
-		})
-	}
-
-	// 非 /responses 结尾 → 错误
-	for _, bad := range []string{
-		"https://api.openai.com/v1/chat/completions",
-		"https://api.openai.com/v1/responses/",
-	} {
-		if _, err := searchEndpointFrom(bad); err == nil {
-			t.Fatalf("searchEndpointFrom(%q) 应报错", bad)
-		}
-	}
-}

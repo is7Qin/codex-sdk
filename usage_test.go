@@ -11,52 +11,13 @@ import (
 	"testing"
 )
 
-// TestUsageDefaultURLConst：DefaultUsageURL 常量值断言（无网络）——
-// 默认 c.baseURL=DefaultResponsesURL → GetUsage 方法内 usageEndpointFrom
-// 派生结果即本值（派生链路网络断言见 TestUsageGetMethodAndAuth）。
+// TestUsageDefaultURLConst：DefaultUsageURL 常量值断言（无网络）。
 func TestUsageDefaultURLConst(t *testing.T) {
 	if DefaultUsageURL != "https://chatgpt.com/backend-api/wham/usage" {
 		t.Fatalf("DefaultUsageURL 应为完整 usage 端点, got %q", DefaultUsageURL)
 	}
 }
 
-// TestUsageEndpointDerivation：由 responses 完整端点派生 usage 端点——
-// 尾段 /responses 且前一段为 codex（ChatGPT 面形态）→ 切尾两段 +
-// /wham/usage；尾段非 /responses 或前一段非 codex（API-key 面形态等）→
-// 错误（尾斜杠同样报错——不静默产生错误 URL；实态输入已归一，纯防御性）。
-func TestUsageEndpointDerivation(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"默认 responses 端点（ChatGPT 面）", DefaultResponsesURL, DefaultUsageURL},
-		{"query 形态（自带 query 保留）", "https://chatgpt.com/backend-api/codex/responses?foo=bar", "https://chatgpt.com/backend-api/wham/usage?foo=bar"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := usageEndpointFrom(tc.in)
-			if err != nil {
-				t.Fatalf("usageEndpointFrom(%q): %v", tc.in, err)
-			}
-			if got != tc.want {
-				t.Fatalf("派生结果 = %q, 期望 %q", got, tc.want)
-			}
-		})
-	}
-
-	// 非 /responses 结尾（含尾斜杠）→ 错误；API-key 面形态（前一段非 codex）
-	// → 错误（其端点 /api/codex/usage 无实际调用者，仅 ChatGPT 面支持）
-	for _, bad := range []string{
-		"https://api.openai.com/v1/chat/completions",
-		"https://api.openai.com/v1/responses/",
-		"https://api.openai.com/v1/responses",
-	} {
-		if _, err := usageEndpointFrom(bad); err == nil {
-			t.Fatalf("usageEndpointFrom(%q) 应报错", bad)
-		}
-	}
-}
 
 // TestUsageGetMethodAndAuth：GetUsage 请求形态断言——method=GET + 无请求体 +
 // 鉴权头注入（ChatGPT 面派生路径 /backend-api/wham/usage 一并断言）。
@@ -73,7 +34,7 @@ func TestUsageGetMethodAndAuth(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("pat-usage"), WithBaseURL(srv.URL+"/backend-api/codex/responses"))
+	hc := NewHTTPClient(PAT("pat-usage"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/wham/usage", srv.URL)))
 	if _, err := hc.GetUsage(context.Background()); err != nil {
 		t.Fatalf("GetUsage: %v", err)
 	}
@@ -81,7 +42,7 @@ func TestUsageGetMethodAndAuth(t *testing.T) {
 		t.Fatalf("method = %q, 期望 GET", gotMethod)
 	}
 	if gotPath != "/backend-api/wham/usage" {
-		t.Fatalf("路径 = %q, 期望派生 /backend-api/wham/usage", gotPath)
+		t.Fatalf("路径 = %q, 期望 /backend-api/wham/usage", gotPath)
 	}
 	if len(gotBody) != 0 {
 		t.Fatalf("GET 应无请求体, got %s", gotBody)
@@ -93,8 +54,7 @@ func TestUsageGetMethodAndAuth(t *testing.T) {
 
 // TestUsageDecode：2xx 响应解码断言——全字段形态（含 credits.balance /
 // spend_control.individual_limit 有值）+ 未知字段静默忽略（白名单解码，
-// user_id/account_id/email/rate_limit_upsell 等键不报错）。ChatGPT 面派生
-// 路径 /backend-api/wham/usage 一并断言。
+// user_id/account_id/email/rate_limit_upsell 等键不报错）。
 func TestUsageDecode(t *testing.T) {
 	usageJSON := `{
 		"plan_type": "team",
@@ -115,13 +75,13 @@ func TestUsageDecode(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("pat-usage"), WithBaseURL(srv.URL+"/backend-api/codex/responses"))
+	hc := NewHTTPClient(PAT("pat-usage"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/wham/usage", srv.URL)))
 	usage, err := hc.GetUsage(context.Background())
 	if err != nil {
 		t.Fatalf("GetUsage: %v", err)
 	}
 	if gotPath != "/backend-api/wham/usage" {
-		t.Fatalf("路径 = %q, 期望派生 /backend-api/wham/usage", gotPath)
+		t.Fatalf("路径 = %q, 期望 /backend-api/wham/usage", gotPath)
 	}
 	if usage.PlanType != "team" {
 		t.Fatalf("PlanType = %q, 期望 team", usage.PlanType)
@@ -162,7 +122,7 @@ func TestUsageDecode(t *testing.T) {
 		}))
 		t.Cleanup(srv2.Close)
 
-		hc2 := NewHTTPClient(PAT("pat-usage"), WithBaseURL(srv2.URL+"/backend-api/codex/responses"))
+		hc2 := NewHTTPClient(PAT("pat-usage"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/wham/usage", srv2.URL)))
 		usage, err := hc2.GetUsage(context.Background())
 		if err != nil {
 			t.Fatalf("GetUsage(null 形态): %v", err)
@@ -186,7 +146,7 @@ func TestUsageErrorStatus(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("wrong"), WithBaseURL(srv.URL+"/backend-api/codex/responses"))
+	hc := NewHTTPClient(PAT("wrong"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/wham/usage", srv.URL)))
 	_, err := hc.GetUsage(context.Background())
 	var he *HTTPError
 	if !errors.As(err, &he) {
@@ -221,7 +181,7 @@ func TestUsage401Rotate(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-	hc := NewHTTPClient(auth, WithBaseURL(srv.URL+"/backend-api/codex/responses"))
+	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/wham/usage", srv.URL)))
 	usage, err := hc.GetUsage(context.Background())
 	if err != nil {
 		t.Fatalf("GetUsage: %v", err)
