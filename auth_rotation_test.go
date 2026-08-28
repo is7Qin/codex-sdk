@@ -275,7 +275,7 @@ func TestRotationSharedAuthMultiClient401(t *testing.T) {
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
 	clients := make([]*HTTPClient, n)
 	for i := range clients {
-		clients[i] = NewHTTPClient(auth, WithBaseURL(respSrv.URL))
+		clients[i] = NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", respSrv.URL)))
 	}
 	var wg sync.WaitGroup
 	for _, c := range clients {
@@ -503,7 +503,7 @@ func TestHTTP401AutoRotate(t *testing.T) {
 		t.Cleanup(respSrv.Close)
 
 		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", respSrv.URL)))
 		resp, err := hc.Do(context.Background(), []byte(`{}`))
 		if err != nil {
 			t.Fatalf("Do: %v", err)
@@ -534,7 +534,7 @@ func TestHTTP401AutoRotate(t *testing.T) {
 
 		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"),
 			WithOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
-		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", respSrv.URL)))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
 		var are *AuthPermanentlyRevokedError
 		if !errors.As(err, &are) {
@@ -580,7 +580,7 @@ func TestHTTP401AutoRotate(t *testing.T) {
 
 		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"),
 			WithOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
-		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", respSrv.URL)))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
 		var are *AuthPermanentlyRevokedError
 		if !errors.As(err, &are) {
@@ -607,7 +607,7 @@ func TestHTTP401AutoRotate(t *testing.T) {
 
 		var fatalCalls atomic.Int32
 		auth := PAT("p", WithPATOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
-		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", respSrv.URL)))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
 		var ape *AuthPermanentlyRevokedError
 		if !errors.As(err, &ape) {
@@ -669,7 +669,7 @@ func TestWSDial401Rotation(t *testing.T) {
 		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
 		url, _ := startWSAuthGate(t, "Bearer at-new") // 第一次升级（旧 at）→ 401，第二次（新 at）→ 升级
 		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-		c, err := Dial(context.Background(), auth, WithBaseURL(url))
+		c, err := Dial(context.Background(), auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 		if err != nil {
 			t.Fatalf("Dial: %v", err)
 		}
@@ -687,7 +687,7 @@ func TestWSDial401Rotation(t *testing.T) {
 		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new"}`})
 		url, _ := startWSAuthGate(t) // 恒 401
 		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-		_, err := Dial(context.Background(), auth, WithBaseURL(url))
+		_, err := Dial(context.Background(), auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 		var de *DialError
 		if !errors.As(err, &de) {
 			t.Fatalf("期望 *DialError, got %T: %v", err, err)
@@ -702,7 +702,7 @@ func TestWSDial401Rotation(t *testing.T) {
 
 	t.Run("PAT 不轮转 Refreshed=false", func(t *testing.T) {
 		url, _ := startWSAuthGate(t)
-		_, err := Dial(context.Background(), PAT("wrong"), WithBaseURL(url))
+		_, err := Dial(context.Background(), PAT("wrong"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 		var de *DialError
 		if !errors.As(err, &de) {
 			t.Fatalf("期望 *DialError, got %T: %v", err, err)
@@ -716,7 +716,7 @@ func TestWSDial401Rotation(t *testing.T) {
 		url, _ := startWSAuthGate(t)
 		_, err := Dial(context.Background(), OAuth(func(ctx context.Context) (string, error) {
 			return "wrong", nil
-		}), WithBaseURL(url))
+		}), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 		var de *DialError
 		if !errors.As(err, &de) {
 			t.Fatalf("期望 *DialError, got %T: %v", err, err)
@@ -730,7 +730,7 @@ func TestWSDial401Rotation(t *testing.T) {
 		m := newMockRefresh(t, refreshStep{status: 400, body: `{"error":{"code":"invalid_grant"}}`})
 		url, _ := startWSAuthGate(t) // 恒 401 → 触发 refresh → 判死
 		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-		_, err := Dial(context.Background(), auth, WithBaseURL(url))
+		_, err := Dial(context.Background(), auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 		var re *RefreshOAuthError
 		if !errors.As(err, &re) {
 			t.Fatalf("refresh 判死应透传（不被 DialError 吞掉）, got %T: %v", err, err)

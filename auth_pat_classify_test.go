@@ -39,7 +39,7 @@ func TestPAT401FatalViaClassify(t *testing.T) {
 			t.Cleanup(srv.Close)
 
 			auth := PAT("pat-1", WithPATOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
-			hc := NewHTTPClient(auth, WithBaseURL(srv.URL))
+			hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 			_, err := hc.Do(context.Background(), []byte(`{}`))
 			var ape *AuthPermanentlyRevokedError
 			if !errors.As(err, &ape) {
@@ -83,7 +83,7 @@ func TestPAT401NonFatalPassthrough(t *testing.T) {
 		}))
 		// no t.Cleanup in loop: close explicitly
 		auth := PAT("pat-1", WithPATOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
-		hc := NewHTTPClient(auth, WithBaseURL(srv.URL))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
 		var he *HTTPError
 		if !errors.As(err, &he) {
@@ -192,7 +192,7 @@ func TestOAuthRotationRegressionReorderedGate(t *testing.T) {
 		t.Cleanup(respSrv.Close)
 
 		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", respSrv.URL)))
 		resp, err := hc.Do(context.Background(), []byte(`{}`))
 		if err != nil {
 			t.Fatalf("Do: %v", err)
@@ -219,7 +219,7 @@ func TestOAuthRotationRegressionReorderedGate(t *testing.T) {
 
 		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"),
 			WithOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
-		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", respSrv.URL)))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
 		var ape *AuthPermanentlyRevokedError
 		if !errors.As(err, &ape) {
@@ -249,7 +249,7 @@ func TestOAuthRotationRegressionReorderedGate(t *testing.T) {
 
 		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"),
 			WithOnAuthFatal(func(err error) { fatalCalls.Add(1) }))
-		hc := NewHTTPClient(auth, WithBaseURL(respSrv.URL))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", respSrv.URL)))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
 		var ape *AuthPermanentlyRevokedError
 		if !errors.As(err, &ape) {
@@ -291,7 +291,7 @@ func TestCodesetConsistencyAnchor(t *testing.T) {
 			_, _ = w.Write([]byte(body))
 		}))
 		auth := PAT("pat-x", WithPATOnAuthFatal(func(err error) {}))
-		hc := NewHTTPClient(auth, WithBaseURL(srv.URL))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 		_, err := hc.Do(context.Background(), []byte(`{}`))
 		var ape *AuthPermanentlyRevokedError
 		if !errors.As(err, &ape) {
@@ -308,7 +308,7 @@ func TestCodesetConsistencyAnchor(t *testing.T) {
 			_, _ = w.Write([]byte(body))
 		}))
 		auth2 := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-		hc2 := NewHTTPClient(auth2, WithBaseURL(srv2.URL))
+		hc2 := NewHTTPClient(auth2, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv2.URL)))
 		_, err2 := hc2.Do(context.Background(), []byte(`{}`))
 		var ape2 *AuthPermanentlyRevokedError
 		if !errors.As(err2, &ape2) {
@@ -329,7 +329,7 @@ func TestCodesetConsistencyAnchor(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	auth := PAT("pat-x")
-	hc := NewHTTPClient(auth, WithBaseURL(srv.URL))
+	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	_, err := hc.Do(context.Background(), []byte(`{}`))
 	var he *HTTPError
 	if !errors.As(err, &he) {
