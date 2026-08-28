@@ -13,10 +13,10 @@ channel API.
 - **Image generation**: `GenerateImage` (non-streaming, direct images endpoint)
   and `GenerateImageStream` (synthesized streaming with keepalive and
   `image_generation.completed` events).
-- **Search**: `HTTPClient.Search` against the `/alpha/search` endpoint.
+- **Search**: `HTTPClient.Search` against the fixed official `/alpha/search` endpoint.
 - **Unified client**: all endpoints go through `HTTPClient` methods
   (`Do` / `Stream` / `Responses` / `GenerateImage` / `Search`), with
-  endpoints derived from the base URL.
+  fixed official endpoints (no base URL configuration).
 - **Authentication**: static PAT, OAuth with refresh callback, and
   `OAuthWithRotation` (rotating state machine with single-flight refresh,
   fatal-account detection, and 401 auto-rotation).
@@ -56,7 +56,7 @@ func main() {
 
 	client := codexsdk.NewHTTPClient(auth)
 
-	// Search (endpoint derived from the base URL).
+	// Search (fixed official endpoint).
 	payload := []byte(`{"query":"example"}`)
 	resp, err := client.Search(ctx, payload)
 	if err != nil {

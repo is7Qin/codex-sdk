@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,10 +90,6 @@ func (e *DialError) Unwrap() error { return e.Err }
 
 // options 是 Dial / NewHTTPClient 的共享配置（无关字段按形态忽略）。
 type options struct {
-	baseURL    string     // 上游 responses 端点（默认 DefaultResponsesURL；WithBaseURL 覆盖；Search 方法由该值尾段派生）
-	baseURLSet bool       // WithBaseURL 是否被调用（GenerateImage 据此区分默认 images 端点）
-	query      url.Values // WithQuery 注入的 URL query 参数（HTTP/WS 双形态）
-
 	compression  CompressionMode
 	readLimit    int64
 	pingInterval time.Duration
@@ -119,7 +114,6 @@ type options struct {
 
 func defaultOptions() options {
 	return options{
-		baseURL:      DefaultResponsesURL,
 		compression:  CompressionDisabled,
 		readLimit:    defaultReadLimit,
 		pingInterval: defaultPingInterval,
@@ -133,28 +127,6 @@ func defaultOptions() options {
 
 // Option 配置 Dial / NewHTTPClient。
 type Option func(*options)
-
-// WithBaseURL 覆盖内置上游 URL（默认 DefaultResponsesURL）——覆盖值按完整
-// 端点语义直用：SDK 不再自动拼接 /responses（与旧版 baseURL 参数语义不同，
-// 显式行为变更——自建上游传 https://selfhost/v1 将打 /v1 而非
-// /v1/responses，避免静默 404 请传完整端点）。HTTP 与 WS（Dial 由该值派生
-// scheme）双形态生效；Search 方法由该值尾段派生 search 端点。
-func WithBaseURL(u string) Option {
-	return func(o *options) { o.baseURL = u; o.baseURLSet = true }
-}
-
-// WithQuery 注入 URL query 参数（HTTP 请求与 WS 升级 URL 双形态生效；
-// 与 WithBaseURL 同用时拼接到覆盖 URL；base URL 自带 query 时追加而非覆盖）。
-// 保留面非对齐面——真实客户端 Responses 本无 query 版本参数
-// （IMPERSONATION.md:130），本选项为既有调用方注入能力（beta 等）的延续。
-func WithQuery(key, value string) Option {
-	return func(o *options) {
-		if o.query == nil {
-			o.query = make(url.Values)
-		}
-		o.query.Add(key, value)
-	}
-}
 
 // WithCompression 设置 WS 压缩模式（默认 CompressionDisabled）。
 func WithCompression(mode CompressionMode) Option {
@@ -297,10 +269,8 @@ type Client struct {
 	closeErr  error
 }
 
-// Dial 建立到内置上游的 Responses WebSocket 连接：URL 由 SDK 维护——
-// 默认 DefaultResponsesURL 派生（http→ws / https→wss 换 scheme，path/query
-// 保留，对齐真实客户端 provider.rs:92-103），WithBaseURL / WithQuery 可覆盖
-// 与追加（query 与 WithBaseURL 同用时拼接到覆盖 URL）。
+// Dial 建立到内置上游的 Responses WebSocket 连接：URL 由 SDK 固定维护——
+// DefaultResponsesWSURL（wss 完整端点直用，不再从 HTTP URL 派生）。
 //
 // auth 注入升级请求的 Authorization 头（PAT 静态 / OAuth 每次升级取新 token）。
 //
@@ -321,10 +291,7 @@ func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	wsURL, err := wsURLOf(cfg.baseURL, cfg.query)
-	if err != nil {
-		return nil, err
-	}
+	wsURL := DefaultResponsesWSURL
 
 	// 升级头组装（重连时以新 at 重取）。
 	buildHeaders := func(ctx context.Context) (http.Header, error) {
@@ -432,53 +399,6 @@ func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 		go c.heartbeat(cctx)
 	}
 	return c, nil
-}
-
-// buildURL 解析 base + 追加 WithQuery 参数（base URL 自带 query 时追加而非覆盖）。
-func buildURL(base string, query url.Values) (string, error) {
-	u, err := url.Parse(base)
-	if err != nil {
-		return "", fmt.Errorf("codexsdk: 解析上游 URL %q 失败: %w", base, err)
-	}
-	appendQuery(u, query)
-	return u.String(), nil
-}
-
-// wsURLOf 由 responses HTTP 端点派生 WS 端点：scheme 替换（http→ws /
-// https→wss；ws/wss 原样保留），path/query 保留 + 追加 WithQuery 参数
-// （对齐真实客户端 provider.rs:92-103 url_for_path 的 scheme 替换与
-// query 双形态拼接）。
-func wsURLOf(base string, query url.Values) (string, error) {
-	u, err := url.Parse(base)
-	if err != nil {
-		return "", fmt.Errorf("codexsdk: 解析上游 URL %q 失败: %w", base, err)
-	}
-	switch u.Scheme {
-	case "http":
-		u.Scheme = "ws"
-	case "https":
-		u.Scheme = "wss"
-	case "ws", "wss":
-		// 原样保留
-	default:
-		return "", fmt.Errorf("codexsdk: 不支持的上游 scheme %q（期望 http/https）", u.Scheme)
-	}
-	appendQuery(u, query)
-	return u.String(), nil
-}
-
-// appendQuery 把 WithQuery 参数追加到 URL（已存在同 key 时为多值追加）。
-func appendQuery(u *url.URL, query url.Values) {
-	if len(query) == 0 {
-		return
-	}
-	q := u.Query()
-	for k, vs := range query {
-		for _, v := range vs {
-			q.Add(k, v)
-		}
-	}
-	u.RawQuery = q.Encode()
 }
 
 // dialStatus 提取升级失败响应状态码（coderws 非 101 时返回响应）。

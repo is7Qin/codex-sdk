@@ -221,7 +221,7 @@ func TestResponsesAggregateWire(t *testing.T) {
 		[]string{respCreatedEvent, respItemAddedEv, respDeltaEv, respItemMsgDoneEv, respItemFCDoneEv, respCompletedEv},
 		true, &cap)
 
-	hc := NewHTTPClient(PAT("pat-resp"), WithBaseURL(srv))
+	hc := NewHTTPClient(PAT("pat-resp"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
 	resp, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":"hi"}`))
 	if err != nil {
 		t.Fatalf("Responses: %v", err)
@@ -269,7 +269,7 @@ func TestResponsesStreamFalseOverridden(t *testing.T) {
 	srv := startResponsesMock(t, nil,
 		[]string{respCreatedEvent, respItemMsgDoneEv, respCompletedEv}, true, &cap)
 
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
 	if _, err := hc.Responses(context.Background(), []byte(`{"model":"m","stream":false}`)); err != nil {
 		t.Fatalf("Responses: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestResponsesInvalidPayloadAbandonInjection(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	_, err := hc.Responses(context.Background(), []byte(`{"broken`))
 	var he *HTTPError
 	if !errors.As(err, &he) {
@@ -316,7 +316,7 @@ func TestResponsesInvalidPayloadAbandonInjection(t *testing.T) {
 // 错误返回（截断 = 失败，不返回 status=completed 的半截响应）。
 func TestResponsesTruncatedEOF(t *testing.T) {
 	srv := startResponsesMock(t, nil, []string{respCreatedEvent, respItemMsgDoneEv}, false, nil)
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
 	_, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
 	if err == nil {
 		t.Fatal("EOF 截断应错误返回")
@@ -334,7 +334,7 @@ func TestResponsesTruncatedEOF(t *testing.T) {
 // response.completed → 同样错误（终态事件缺失 = 截断，[DONE] 与 EOF 统一判定）。
 func TestResponsesTruncatedDoneWithoutCompleted(t *testing.T) {
 	srv := startResponsesMock(t, nil, []string{respCreatedEvent, respItemMsgDoneEv}, true, nil)
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
 	if _, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`)); err == nil {
 		t.Fatal("[DONE] 而无 completed 应错误返回")
 	}
@@ -345,7 +345,7 @@ func TestResponsesTruncatedDoneWithoutCompleted(t *testing.T) {
 func TestResponsesFailedEventWire(t *testing.T) {
 	failedEv := `{"type":"response.failed","error":{"code":"server_error","message":"upstream exploded"}}`
 	srv := startResponsesMock(t, nil, []string{respCreatedEvent, failedEv}, true, nil)
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
 	_, err := hc.Responses(context.Background(), []byte(`{}`))
 	var he *HTTPError
 	if !errors.As(err, &he) {
@@ -373,7 +373,7 @@ func TestResponsesZeroCopyBigItem(t *testing.T) {
 	srv := startResponsesMock(t, nil,
 		[]string{respCreatedEvent, bigEvent, filler, `{"type":"output_item.done","item":` + item2 + `}`, respCompletedEv},
 		true, nil)
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
 	resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
 	if err != nil {
 		t.Fatalf("Responses: %v", err)
@@ -413,7 +413,7 @@ func TestResponses403Passthrough(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	_, err := hc.Responses(context.Background(), []byte(`{}`))
 	var he *HTTPError
 	if !errors.As(err, &he) {
@@ -439,7 +439,7 @@ func TestResponses401Fatal(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-	hc := NewHTTPClient(auth, WithBaseURL(srv.URL))
+	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	_, err := hc.Responses(context.Background(), []byte(`{}`))
 	var are *AuthPermanentlyRevokedError
 	if !errors.As(err, &are) {
@@ -488,7 +488,7 @@ func TestResponses401Rotate(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
-	hc := NewHTTPClient(auth, WithBaseURL(srv.URL))
+	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
 	if err != nil {
 		t.Fatalf("Responses: %v", err)
@@ -532,7 +532,7 @@ func TestResponsesConnectionReuse(t *testing.T) {
 	srv.Start()
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	for i := 0; i < 2; i++ {
 		resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
 		if err != nil {
@@ -558,7 +558,7 @@ func TestResponsesClientMetadataWire(t *testing.T) {
 	srv := startResponsesMock(t, nil,
 		[]string{respCreatedEvent, respItemMsgDoneEv, respCompletedEv}, true, &cap)
 
-	hc := NewHTTPClient(PAT("p"), WithBaseURL(srv),
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)),
 		WithCodexMeta(CodexMeta{
 			InstallationID: "inst-1",
 			SessionID:      "sess-1",
@@ -603,7 +603,7 @@ func TestResponsesClientMetadataWire(t *testing.T) {
 
 // TestResponsesNilAuth：auth 为 nil 直接报错（不发出请求）。
 func TestResponsesNilAuth(t *testing.T) {
-	hc := NewHTTPClient(nil, WithBaseURL("http://127.0.0.1:1"))
+	hc := NewHTTPClient(nil, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", "http://127.0.0.1:1")))
 	if _, err := hc.Responses(context.Background(), []byte(`{}`)); err == nil {
 		t.Fatal("auth 为 nil 应报错")
 	}
