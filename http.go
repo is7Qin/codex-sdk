@@ -79,8 +79,8 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("codexsdk: upstream HTTP %d", e.StatusCode)
 }
 
-// Do 发送 POST <responses 端点> 请求（端点方法族成员——search 端点经
-// Search 方法派生；payload 为完整 JSON 请求体，调用方决定 stream 等字段），
+// Do 发送 POST <responses 端点> 请求（端点方法族成员——固定官方端点
+// DefaultResponsesURL；payload 为完整 JSON 请求体，调用方决定 stream 等字段），
 // 原样返回非流式响应。非 2xx 返回 *HTTPError。
 //
 // 401 自动轮转（OAuthWithRotation 专属）：每次 401 先做判死分类（响应体
