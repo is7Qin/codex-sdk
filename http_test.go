@@ -28,7 +28,7 @@ func TestHTTPDoRaw(t *testing.T) {
 		gotUA = r.Header.Get("User-Agent")
 		gotOriginator = r.Header.Get("Originator")
 		gotTraceparent = r.Header.Get("traceparent")
-		if r.URL.Path != "/v1/responses" {
+		if r.URL.Path != "/backend-api/codex/responses" {
 			http.Error(w, "bad path: "+r.URL.Path, http.StatusNotFound)
 			return
 		}
@@ -39,9 +39,7 @@ func TestHTTPDoRaw(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	// 内置上游 URL 下沉：WithBaseURL 覆盖值按完整 responses 端点语义直用
-	// （不再自动拼接 /responses），故测试传完整端点 srv.URL+"/v1/responses"。
-	hc := NewHTTPClient(PAT("pat-http"), WithBaseURL(srv.URL+"/v1/responses"))
+	hc := NewHTTPClient(PAT("pat-http"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	resp, err := hc.Do(context.Background(), []byte(`{"model":"gpt-5","input":"hi"}`))
 	if err != nil {
 		t.Fatalf("Do: %v", err)
@@ -85,7 +83,7 @@ func TestHTTPBetaOverride(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL), WithHeader("OpenAI-Beta", "responses=v2"))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)), WithHeader("OpenAI-Beta", "responses=v2"))
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
@@ -106,7 +104,7 @@ func TestHTTPResponsesLiteHeader(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	// 默认：不带 lite 头
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
 		t.Fatalf("Do（默认）: %v", err)
 	}
@@ -115,7 +113,7 @@ func TestHTTPResponsesLiteHeader(t *testing.T) {
 	}
 
 	// WithHeader 透传
-	hc = NewHTTPClient(PAT("t"), WithBaseURL(srv.URL), WithHeader(HeaderResponsesLite, "true"))
+	hc = NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)), WithHeader(HeaderResponsesLite, "true"))
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
 		t.Fatalf("Do（lite）: %v", err)
 	}
@@ -134,7 +132,7 @@ func TestHTTPDoErrorStatus(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("wrong"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("wrong"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	_, err := hc.Do(context.Background(), []byte(`{}`))
 	var he *HTTPError
 	if !errors.As(err, &he) {
@@ -175,7 +173,7 @@ func TestHTTPStreamSSE(t *testing.T) {
 	hc := NewHTTPClient(OAuth(func(ctx context.Context) (string, error) {
 		providerCalls.Add(1)
 		return "oauth-1", nil
-	}), WithBaseURL(srv.URL))
+	}), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 
 	// 回调内的原始字节引用 scanner 复用缓冲（仅在回调执行期间有效）——回调内拷贝。
 	var got []string
@@ -209,7 +207,7 @@ func TestHTTPStreamErrorStatus(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	err := hc.Stream(context.Background(), []byte(`{"stream":true}`), func(raw []byte) error { return nil })
 	var he *HTTPError
 	if !errors.As(err, &he) || he.StatusCode != http.StatusTooManyRequests {
@@ -227,7 +225,7 @@ func TestHTTPCallbackErrorAbortsStream(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	sentinel := errors.New("stop")
 	err := hc.Stream(context.Background(), []byte(`{}`), func(raw []byte) error {
 		return sentinel
@@ -237,42 +235,6 @@ func TestHTTPCallbackErrorAbortsStream(t *testing.T) {
 	}
 }
 
-// TestHTTPBaseURLFullEndpointSemantics：WithBaseURL 覆盖值按完整端点语义直用
-// ——不再自动拼接 /responses（与旧版 baseURL 参数语义不同，显式行为变更）：
-// 传 srv.URL+"/v1" 打 /v1 而非 /v1/responses；传完整端点原样命中。
-func TestHTTPBaseURLFullEndpointSemantics(t *testing.T) {
-	// 完整端点原样命中
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/custom/responses" {
-			http.Error(w, "bad path: "+r.URL.Path, http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"x"}`))
-	}))
-	t.Cleanup(srv.Close)
-
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL+"/custom/responses"))
-	if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
-		t.Fatalf("Do（完整端点）: %v", err)
-	}
-
-	// 不自动拼接 /responses：/v1 打 /v1
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1" {
-			http.Error(w, "bad path: "+r.URL.Path, http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"x"}`))
-	}))
-	t.Cleanup(srv2.Close)
-
-	hc2 := NewHTTPClient(PAT("t"), WithBaseURL(srv2.URL+"/v1"))
-	if _, err := hc2.Do(context.Background(), []byte(`{}`)); err != nil {
-		t.Fatalf("Do（/v1 应直用不拼接）: %v", err)
-	}
-}
 
 // TestHTTPNilAuth：auth 为 nil 直接报错。
 func TestHTTPNilAuth(t *testing.T) {
@@ -281,7 +243,7 @@ func TestHTTPNilAuth(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(nil, WithBaseURL(srv.URL))
+	hc := NewHTTPClient(nil, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	if _, err := hc.Do(context.Background(), []byte(`{}`)); err == nil {
 		t.Fatal("auth 为 nil 应报错")
 	}
@@ -316,7 +278,7 @@ func TestHTTPConnectionReuse(t *testing.T) {
 	srv.Start()
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	for i := 0; i < 3; i++ {
 		if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
 			t.Fatalf("Do #%d: %v", i, err)
@@ -340,7 +302,7 @@ func TestHTTPTurnStateNoEcho(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	for i := 0; i < 3; i++ {
 		resp, err := hc.Do(context.Background(), []byte(`{}`))
 		if err != nil {
@@ -383,7 +345,7 @@ func TestHTTPStreamDoneDrainsBodyForReuse(t *testing.T) {
 	srv.Start()
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	for i := 0; i < 2; i++ {
 		if err := hc.Stream(context.Background(), []byte(`{}`), func(raw []byte) error { return nil }); err != nil {
 			t.Fatalf("Stream #%d: %v", i+1, err)
@@ -415,7 +377,7 @@ func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -463,7 +425,7 @@ func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL),
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
 		WithCodexMeta(CodexMeta{
 			InstallationID: "inst-meta",
 			SessionID:      "sess-meta",
@@ -533,7 +495,7 @@ func TestHTTPStreamClientMetadataPassthrough(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL),
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
 		WithCodexMeta(CodexMeta{InstallationID: "inst-1", TurnID: "meta-turn", Subagent: "meta-sub"}))
 	payload := []byte(`{"model":"m","client_metadata":{"turn_id":"payload-turn","x-openai-subagent":"keep"}}`)
 	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
@@ -565,7 +527,7 @@ func TestHTTPStreamClientMetadataQuotedValueEdge(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	payload := []byte(`{"model":"m","prompt":"client_metadata"}`)
 	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
@@ -589,7 +551,7 @@ func TestHTTPStreamClientMetadataSessionFallback(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL),
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
 		WithSession(Session{SessionID: "sess-s", ThreadID: "thread-s", WindowID: "win-s:1"}))
 	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
@@ -627,7 +589,7 @@ func TestHTTPStreamClientMetadataInvalidJSON(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL),
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
 		WithCodexMeta(CodexMeta{InstallationID: "inst-1"}))
 	err := hc.Stream(context.Background(), []byte(`{"broken`), func(raw []byte) error { return nil })
 	var he *HTTPError
@@ -656,7 +618,7 @@ func TestHTTPStreamCapturesTurnState(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithBaseURL(srv.URL))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	if err := hc.Stream(context.Background(), []byte(`{"stream":true}`), func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
