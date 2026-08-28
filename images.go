@@ -8,17 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 )
 
-// DefaultImagesURL 是内置默认上游 images generations 完整端点
-// （与 DefaultResponsesURL 同源派生：chatgpt.com/backend-api/codex +
-// /images/generations；实证见 .superpowers/sdd/sdk-image-gen-v1v3-validation.md
-// V2：codex-api/src/endpoint/images.rs:33-54 + model-provider-info/src/lib.rs:243-257）。
-// WithBaseURL 可覆盖（覆盖值同样按完整 generations 端点语义直用）。
+// DefaultImagesURL 是官方上游 images generations 完整端点（固定）。
 const DefaultImagesURL = "https://chatgpt.com/backend-api/codex/images/generations"
+
+// DefaultImagesEditsURL 是官方上游 images edits 完整端点（固定）。
+const DefaultImagesEditsURL = "https://chatgpt.com/backend-api/codex/images/edits"
 
 // maxEditImages 是单次 edits 输入图上限（codex-rs MAX_EDIT_IMAGES=5，
 // ext/image-generation/src/tool.rs:58）。
@@ -98,14 +95,12 @@ type ImageStreamEvent struct {
 var keepaliveInterval = 60 * time.Second
 
 // GenerateImage 非流式生图（codex 凭据直连 images 端点）：POST
-// {imagesBase}/images/generations|edits（JSON 非流式——上游无流式路径，
+// DefaultImagesURL 或 DefaultImagesEditsURL（JSON 非流式——上游无流式路径，
 // 流式语义见 GenerateImageStream——合成 completed 事件包装本方法）。
 // edits 由 Images 非空判定；输入图 Raw 字节经 data URL 直嵌
 // （MIME 魔数检测 PNG/JPEG，默认 image/png——codex-rs 恒 PNG 先例）。
 //
-// 端点：默认 DefaultImagesURL（与 DefaultResponsesURL 同源派生）；
-// WithBaseURL 覆盖值 = 完整 generations 端点直用（与既有 HTTPClient 语义
-// 一致）；edits = 端点尾段 /images/generations → /images/edits 派生。
+// 端点：固定官方端点（DefaultImagesURL / DefaultImagesEditsURL）。
 //
 // 传输层复用 Do：鉴权头注入 / 懒构建 / 401 判死分类 + 单飞 refresh + 自动
 // 重试一次 / fatal 类错误透传（不被 HTTPError 吞掉，errors.As 可区分）/
@@ -120,13 +115,9 @@ func (c *HTTPClient) GenerateImage(ctx context.Context, p *ImageGenParams) (*Ima
 	if err != nil {
 		return nil, err
 	}
-	imagesURL, err := c.imagesEndpoint(len(p.Images) > 0)
-	if err != nil {
-		return nil, err
-	}
-	targetURL, err := buildURL(imagesURL, c.opts.query)
-	if err != nil {
-		return nil, err
+	targetURL := DefaultImagesURL
+	if len(p.Images) > 0 {
+		targetURL = DefaultImagesEditsURL
 	}
 	resp, err := c.doURL(ctx, targetURL, http.MethodPost, payload)
 	if err != nil {
@@ -207,30 +198,6 @@ func (c *HTTPClient) GenerateImageStream(ctx context.Context, p *ImageGenParams,
 		}
 	}
 	return nil
-}
-
-// imagesEndpoint 返回 images 端点：generations = WithBaseURL 覆盖值（有覆盖时，
-// 完整 generations 端点直用）否则 DefaultImagesURL；edits 由尾段
-// /images/generations → /images/edits 派生。
-func (c *HTTPClient) imagesEndpoint(edits bool) (string, error) {
-	generations := DefaultImagesURL
-	if c.opts.baseURLSet {
-		generations = c.opts.baseURL
-	}
-	if !edits {
-		return generations, nil
-	}
-	u, err := url.Parse(generations)
-	if err != nil {
-		return "", fmt.Errorf("codexsdk: 解析 images 端点 %q 失败: %w", generations, err)
-	}
-	path := u.Path
-	i := strings.LastIndex(path, "/")
-	if i < 0 || path[i+1:] != "generations" {
-		return "", fmt.Errorf("codexsdk: edits 端点派生失败：%q 尾段非 /images/generations", generations)
-	}
-	u.Path = path[:i] + "/edits"
-	return u.String(), nil
 }
 
 // imageGenerationRequest 是上游 images 端点 JSON 请求体（对齐 codex-rs

@@ -17,43 +17,35 @@ import (
 // defaultMaxLineSize HTTP SSE 单行上限（与 WS ReadLimit 同量级）。
 const defaultMaxLineSize = 16 * 1024 * 1024
 
-// DefaultResponsesURL 是内置默认上游 responses 完整端点（用户拍板 2026-08-12：
-// SDK 内维护请求 url，网关不传 url；完整端点直用，SDK 不再拼 /responses）。
-// WS 由该端点派生（http→ws / https→wss 换 scheme，path/query 保留）。
-// WithBaseURL 可覆盖。
+// DefaultResponsesURL 是内置官方上游 responses HTTP 完整端点（固定）。
 const DefaultResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
+
+// DefaultResponsesWSURL 是内置官方上游 responses WebSocket 完整端点（固定）。
+const DefaultResponsesWSURL = "wss://chatgpt.com/backend-api/codex/responses"
 
 // HTTPClient 是统一端点方法 HTTP 客户端（懒构建：NewHTTPClient 零开销，
 // 首次 Do/Stream 才创建 http.Client，连接池复用）。端点方法族：
-// Do/Stream（构造期 URL 固定）、GenerateImage / Search（方法内由 baseURL
-// 派生端点）、Responses（合成非流式）。
+// Do/Stream（responses 固定端点）、GenerateImage / Search / GetUsage（各自固定官方端点）、Responses（合成非流式）。
 //
 // x-codex-turn-state 仅响应侧（真实 codex 客户端行为）：响应头/SSE 中的
 // turn-state 自动捕获，经 TurnState() / HTTPResponse.TurnState 暴露给网关；
 // HTTP 请求不携带 x-codex-turn-state 头（头回传仅 WS 路径，见 Client）。
 type HTTPClient struct {
-	baseURL string // 上游 responses 端点（默认 DefaultResponsesURL；Search 方法由该值尾段派生）
-	auth    Auth
-	opts    options
+	auth Auth
+	opts options
 
 	mu        sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
 	client    *http.Client
 	turnState atomic.Value // string；x-codex-turn-state 响应侧捕获值
 }
 
-// NewHTTPClient 创建 Responses HTTP 客户端（端点方法族客户端——search
-// 端点无独立构造器，经 Search 方法由 baseURL 尾段派生）。上游 URL 由 SDK
-// 内置维护：默认 DefaultResponsesURL（完整 responses 端点，不再自动拼接
-// /responses），WithBaseURL 可覆盖（覆盖值同样按完整端点语义直用——传
-// https://selfhost/v1 将打 /v1 而非 /v1/responses，与旧版 baseURL 语义
-// 不同，显式行为变更；自建上游请传完整 responses 端点 URL）。WithQuery
-// 注入的 query 参数拼接到最终 URL。
+// NewHTTPClient 创建 Responses HTTP 客户端（端点方法族客户端，所有数据面 URL 由 SDK 固定维护，不可覆盖）。
 func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 	cfg := defaultOptions()
 	for _, o := range opts {
 		o(&cfg)
 	}
-	return &HTTPClient{baseURL: cfg.baseURL, auth: auth, opts: cfg}
+	return &HTTPClient{auth: auth, opts: cfg}
 }
 
 // CloseIdleConnections 关闭底层空闲连接（懒构建未使用时为零开销调用；
@@ -261,11 +253,7 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	targetURL, err := buildURL(c.baseURL, c.opts.query)
-	if err != nil {
-		return nil, err
-	}
-	return c.doURL(ctx, targetURL, http.MethodPost, payload)
+	return c.doURL(ctx, DefaultResponsesURL, http.MethodPost, payload)
 }
 
 // doURL 发送指定 method 请求到指定完整端点并应用 401 自动轮转（do 的 URL

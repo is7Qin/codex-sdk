@@ -9,17 +9,15 @@
 //   - Responses HTTP：POST 请求构造 / 非流式响应 / 流式 SSE 事件帧提取
 //   - 生图（HTTPClient 方法）：GenerateImage 非流式直连 images 端点
 //     （generations/edits、JSON 非流式——上游无流式路径；输入图 Raw 字节 →
-//     data URL 直嵌、usage image_tokens 提取；端点默认 DefaultImagesURL 与
-//     DefaultResponsesURL 同源派生，WithBaseURL 覆盖值 = 完整 generations
-//     端点直用；传输层复用 Do：401 轮转 / 判死分类 / 错误透传零新增）；
+//     data URL 直嵌、usage image_tokens 提取；端点固定官方 DefaultImagesURL /
+//     DefaultImagesEditsURL；传输层复用 Do：401 轮转 / 判死分类 / 错误透传零新增）；
 //     GenerateImageStream 合成流式（内部调 GenerateImage，等待期间每 60s
 //     合成 keepalive 事件——CF 524 免疫；成功后每张图合成一个
 //     image_generation.completed 事件回调——usage 仅最后一个携带；错误原样
 //     透传、无 partial_image 合成、无会话维持）
-//   - 上游 URL 内置维护：默认 DefaultResponsesURL（完整 responses 端点直用，
-//     不再拼 /responses）；WS 由该端点派生（http→ws / https→wss 换 scheme，
-//     path/query 保留，对齐真实客户端 provider.rs:92-103）；WithBaseURL 覆盖
-//     （覆盖值按完整端点语义直用）、WithQuery 追加 query（HTTP/WS 双形态）
+//   - 上游 URL 固定官方端点：DefaultResponsesURL（responses HTTP）、
+//     DefaultResponsesWSURL（responses WS wss）、DefaultSearchURL、
+//     DefaultImagesURL / DefaultImagesEditsURL、DefaultUsageURL；所有操作直接使用对应常量，不可覆盖或追加 query
 //   - 升级与请求鉴权注入（PAT 静态 / OAuth 刷新回调 / OAuthWithRotation 轮转
 //     状态机，Auth 接口）：401 自动轮转（判死分类 + 单飞 refresh + 重试一次，
 //     WS 升级 401 自动重连一次并带 DialError.Refreshed 标记）、RT 判死码集 /
