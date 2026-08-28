@@ -257,7 +257,7 @@ func TestGenerateImageGenerations(t *testing.T) {
 		t.Fatalf("GenerateImage: %v", err)
 	}
 	if gotPath != "/backend-api/codex/images/generations" {
-		t.Fatalf("路径 = %q（覆盖值按完整 generations 端点直用）", gotPath)
+		t.Fatalf("路径 = %q（固定官方 generations 端点）", gotPath)
 	}
 	if gotAuth != "Bearer pat-img" {
 		t.Fatalf("Authorization = %q", gotAuth)
@@ -282,7 +282,7 @@ func TestGenerateImageGenerations(t *testing.T) {
 	}
 }
 
-// TestGenerateImageEdits：edits 端点派生（/images/edits）+ Raw 字节 →
+// TestGenerateImageEdits：固定官方 edits 端点（/images/edits）+ Raw 字节 →
 // data URL 直嵌。
 func TestGenerateImageEdits(t *testing.T) {
 	png := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 7, 7, 7}
@@ -307,7 +307,7 @@ func TestGenerateImageEdits(t *testing.T) {
 		t.Fatalf("GenerateImage: %v", err)
 	}
 	if gotPath != "/backend-api/codex/images/edits" {
-		t.Fatalf("edits 路径 = %q（尾段 /images/generations → /images/edits）", gotPath)
+		t.Fatalf("edits 路径 = %q（固定官方 edits 端点）", gotPath)
 	}
 	wantBody := `{"prompt":"add a red hat","model":"gpt-image-1.5","images":[{"image_url":"data:image/png;base64,` +
 		base64.StdEncoding.EncodeToString(png) + `"}]}`
