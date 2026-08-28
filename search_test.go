@@ -181,4 +181,3 @@ func TestSearch401Rotate(t *testing.T) {
 		t.Fatalf("请求序列 = %v, 期望 [Bearer at-old, Bearer at-new]", auths)
 	}
 }
-
