@@ -278,16 +278,25 @@ func TestRotationSharedAuthMultiClient401(t *testing.T) {
 		clients[i] = NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", respSrv.URL)))
 	}
 	var wg sync.WaitGroup
+	errCh := make(chan error, n)
 	for _, c := range clients {
 		wg.Add(1)
 		go func(hc *HTTPClient) {
 			defer wg.Done()
 			if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
-				t.Errorf("Do: %v", err)
+				errCh <- err
+			} else {
+				errCh <- nil
 			}
 		}(c)
 	}
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+	}
 
 	if m.callCount() != 1 {
 		t.Fatalf("refresh 次数 = %d, 期望恰一次（共享 Auth 单飞）", m.callCount())
