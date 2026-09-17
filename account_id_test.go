@@ -3,6 +3,7 @@ package codexsdk
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -357,11 +358,12 @@ func TestAccountIDRefreshEndpointExcluded(t *testing.T) {
 	}
 }
 
-// T7：值卫生——含 \r\n / 纯空白的 id 被跳过（不注入脏值）。
+// T7：值卫生——含控制字节 / 纯空白的 id 被跳过（不注入脏值）。
+// 口径：<0x20（TAB 除外）与 0x7f 一律拒绝（对齐 net/http 头字节合法性）。
 func TestAccountIDValueHygiene(t *testing.T) {
-	ids := []string{"a\rb", "a\nb", "a\r\nb", "a\x00b", "   ", ""}
+	ids := []string{"a\rb", "a\nb", "a\r\nb", "a\x00b", "a\x01b", "a\x7fb", "   ", ""}
 	for _, id := range ids {
-		t.Run("oauth:"+strings.ReplaceAll(strings.ReplaceAll(id, "\r", "\\r"), "\n", "\\n"), func(t *testing.T) {
+		t.Run("oauth:"+dirtyTestName(id), func(t *testing.T) {
 			tr := &accountIDCaptureTransport{body: `{}`}
 			hc := NewHTTPClient(
 				OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID(id)),
@@ -375,7 +377,7 @@ func TestAccountIDValueHygiene(t *testing.T) {
 				}
 			}
 		})
-		t.Run("pat:"+strings.ReplaceAll(strings.ReplaceAll(id, "\r", "\\r"), "\n", "\\n"), func(t *testing.T) {
+		t.Run("pat:"+dirtyTestName(id), func(t *testing.T) {
 			tr := &accountIDCaptureTransport{body: `{}`}
 			hc := NewHTTPClient(PAT("t", WithPATAccountID(id)), WithTransport(tr))
 			if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
@@ -388,6 +390,12 @@ func TestAccountIDValueHygiene(t *testing.T) {
 			}
 		})
 	}
+}
+
+// dirtyTestName 把脏值转义为可读子测试名（控制字节原样进测试名会污染输出）。
+func dirtyTestName(id string) string {
+	r := strings.NewReplacer("\r", "\\r", "\n", "\\n", "\x00", "\\x00", "\x01", "\\x01", "\x7f", "\\x7f")
+	return r.Replace(id)
 }
 
 // T8：覆盖语义——调用方 WithHeader 覆盖默认注入值（循环后写赢）。
@@ -577,19 +585,78 @@ func TestFetchPATMetadata(t *testing.T) {
 			t.Fatalf("非 2xx 应返回带状态码错误, got %v", err)
 		}
 	})
+
+	t.Run("200 非 JSON 报 error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`not json`))
+		}))
+		t.Cleanup(srv.Close)
+		t.Setenv("CODEX_AUTHAPI_BASE_URL", srv.URL)
+
+		if _, err := FetchPATMetadata(ctx, "pat-123"); err == nil {
+			t.Fatal("200 非 JSON 应返回 error（缺失字段宽松 ≠ 体裁宽松）")
+		}
+	})
+
+	t.Run("base 尾斜杠归一", func(t *testing.T) {
+		var gotPath string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"chatgpt_account_id":"acc-slash"}`))
+		}))
+		t.Cleanup(srv.Close)
+		t.Setenv("CODEX_AUTHAPI_BASE_URL", srv.URL+"/")
+
+		md, err := FetchPATMetadata(ctx, "pat-123")
+		if err != nil {
+			t.Fatalf("FetchPATMetadata: %v", err)
+		}
+		if md.AccountID != "acc-slash" {
+			t.Fatalf("AccountID = %q, 期望 acc-slash", md.AccountID)
+		}
+		if gotPath != "/v1/user-auth-credential/whoami" {
+			t.Fatalf("请求路径 = %q, 期望尾斜杠归一后无双斜杠", gotPath)
+		}
+	})
+
+	t.Run("ctx 取消可辨识", func(t *testing.T) {
+		cctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := FetchPATMetadata(cctx, "pat-123")
+		if err == nil || (!errors.Is(err, context.Canceled) &&
+			!strings.Contains(err.Error(), "context canceled")) {
+			t.Fatalf("取消的 ctx 应返回可辨识错误, got %v", err)
+		}
+	})
 }
 
-// T13：无网络契约——PAT() 与 OAuthWithRotation 构造期零出站；whoami 仅在
-// 显式 FetchPATMetadata 调用时发生。
+// countingRoundTripper 是计数 RoundTripper（T13 出站观测用——替换
+// http.DefaultClient.Transport，杜绝「mock 服务器未被访问即算零出站」的假绿）。
+type countingRoundTripper struct {
+	calls *atomic.Int32
+	body  string
+}
+
+func (tr *countingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	tr.calls.Add(1)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(tr.body)),
+		Request:    req,
+	}, nil
+}
+
+// T13：无网络契约——替换 http.DefaultClient.Transport 为计数 RoundTripper
+// （保存/恢复）→ PAT() 与 OAuthWithRotation 构造期计数 = 0；显式
+// FetchPATMetadata 时计数 = 1。
 func TestAccountIDNoNetworkAtConstruction(t *testing.T) {
 	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	t.Cleanup(srv.Close)
-	t.Setenv("CODEX_AUTHAPI_BASE_URL", srv.URL)
+	prev := http.DefaultClient.Transport
+	http.DefaultClient.Transport = &countingRoundTripper{calls: &calls, body: `{}`}
+	t.Cleanup(func() { http.DefaultClient.Transport = prev })
 
 	_ = PAT("tok", WithPATAccountID("acc-t13"))
 	_ = OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-t13"))
@@ -603,4 +670,55 @@ func TestAccountIDNoNetworkAtConstruction(t *testing.T) {
 	if n := calls.Load(); n != 1 {
 		t.Fatalf("显式 whoami 后出站 = %d, 期望 1", n)
 	}
+}
+
+// T14：WS 面覆盖语义 + 值卫生补强——WS 握手 WithHeader 覆盖默认注入；
+// AccountID() 值含首尾空白时发送 trim 后结果。
+func TestAccountIDWSOverrideAndTrim(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("WS WithHeader 后写赢", func(t *testing.T) {
+		url, st := startEchoServer(t, "")
+		c, err := Dial(ctx,
+			OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-default")),
+			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
+			WithHeader("ChatGPT-Account-ID", "ws-override"))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer c.Close(StatusGoingAway, "")
+		waitFor(t, func() bool {
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			return st.hasAccountID
+		})
+		st.mu.Lock()
+		got := st.accountID
+		st.mu.Unlock()
+		if got != "ws-override" {
+			t.Fatalf("WS 覆盖后头 = %q, 期望 ws-override（WithHeader 后写赢）", got)
+		}
+	})
+
+	t.Run("首尾空白 trim 后发送", func(t *testing.T) {
+		url, st := startEchoServer(t, "")
+		c, err := Dial(ctx,
+			PAT("t", WithPATAccountID("  acc-trim  ")),
+			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer c.Close(StatusGoingAway, "")
+		waitFor(t, func() bool {
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			return st.hasAccountID
+		})
+		st.mu.Lock()
+		got := st.accountID
+		st.mu.Unlock()
+		if got != "acc-trim" {
+			t.Fatalf("WS 头 = %q, 期望 trim 后 acc-trim", got)
+		}
+	})
 }

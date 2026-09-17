@@ -22,15 +22,26 @@ func applyAccountID(h http.Header, auth Auth) {
 		return
 	}
 	id := strings.TrimSpace(p.AccountID())
-	if id == "" || strings.ContainsAny(id, "\r\n\x00") {
-		return // 空 = 不发（向后兼容）；含控制字符的值会让 Transport 直接拒绝整请求，跳过
+	if id == "" || hasControlByte(id) {
+		return // 空 = 不发（向后兼容）；任何控制字节都会让 Transport 直接拒绝整请求，跳过
 	}
 	h.Set(ChatGPTAccountIDHeader, id)
 }
 
-// chatGPTAuthClaimsNamespace 是 ChatGPT 身份 JWT 的 claims 命名空间
-// （access_token 与 id_token 共享同一命名空间）。
-const chatGPTAuthClaimsNamespace = "https://api.openai.com/auth"
+// hasControlByte 值卫生：<0x20（TAB 除外）与 0x7f 一律拒绝——对齐 net/http
+// httpguts.ValidHeaderFieldByte 口径（CR/LF/NUL 最小集之上的加固）。
+func hasControlByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\t' {
+			continue
+		}
+		if c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
+}
 
 // AccountIDFromToken 从 ChatGPT 身份 JWT（access_token 或 id_token——两者共享
 // 同一 claims 命名空间）提取 chatgpt_account_id。只解 payload 的
