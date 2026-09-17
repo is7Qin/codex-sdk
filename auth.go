@@ -22,3 +22,12 @@ type Auth interface {
 	// （唯一跨边界点：SDK 不解析业务事件帧）。PAT / oauthAuth 实现为 no-op。
 	Fatal(err error)
 }
+
+// AccountIDProvider 由已知上游账号/空间标识（ChatGPT account id）的 Auth 实现。
+//
+// 可选接口：未实现、返回空串或仅空白 = 不发送 ChatGPT-Account-ID 头
+// （向后兼容——既有自定义 Auth 实现零改动）。真客户端由 BearerAuthProvider
+// 对 ChatGPT 系 auth 恒发此头（含 WS 握手），SDK 由此对齐。
+type AccountIDProvider interface {
+	AccountID() string
+}

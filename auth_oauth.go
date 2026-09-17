@@ -25,8 +25,12 @@ func OAuth(tokenProvider func(ctx context.Context) (string, error)) Auth {
 
 // oauthAuth 是 OAuth 鉴权实现（值类型，零分配）。
 type oauthAuth struct {
-	provider func(ctx context.Context) (string, error)
+	provider  func(ctx context.Context) (string, error)
+	accountID string // ChatGPT account id（无来源时为空 = 不发头，行为=现状）
 }
+
+// AccountID 返回账号标识（可选接口 AccountIDProvider；空 = 不发送头）。
+func (a oauthAuth) AccountID() string { return a.accountID }
 
 // Authorization 取最新 token 并组装 "Bearer <token>"。
 func (a oauthAuth) Authorization(ctx context.Context) (string, error) {
@@ -87,6 +91,7 @@ func OAuthWithRotation(refreshToken string, opts ...OAuthOption) Auth {
 	}
 	r := &rotationAuth{
 		rt:                refreshToken,
+		accountID:         cfg.accountID,
 		refreshTimeout:    cfg.refreshTimeout,
 		backoffBase:       cfg.backoffBase,
 		backoffCap:        cfg.backoffCap,
@@ -125,6 +130,11 @@ type rotationAuth struct {
 	inflight  *refreshRun // 进行中的单飞 refresh（nil 表示无）
 
 	rt string // 当前 refresh_token（仅单飞 leader 在锁内读写）
+
+	// accountID 是 ChatGPT account id（账号级常量，不随 refresh 轮转变化；
+	// 空 = 不发送 ChatGPT-Account-ID 头）。SDK 不从 initialAT 自行派生——
+	// 派生点唯一在消费方落库处，结果经 WithOAuthAccountID 显式注入。
+	accountID string
 
 	// D4 回调重试状态（仅单飞 leader 在锁内读写）。
 	pendingAt, pendingRt string
@@ -183,6 +193,10 @@ func (r *rotationAuth) Authorization(ctx context.Context) (string, error) {
 func (r *rotationAuth) Invalidate() {
 	r.at.Store(nil)
 }
+
+// AccountID 返回账号标识（可选接口 AccountIDProvider；直接返回构造期
+// 固定值，无锁——account id 是账号级常量，不随 refresh 轮转变化）。
+func (r *rotationAuth) AccountID() string { return r.accountID }
 
 // Fatal 显式终止（网关解析到 WS 判死事件帧时调用）：置账号级终止状态，
 // 后续 Authorization 恒返回该错误。不触发 OnAuthFatal（调用方已获知）。
@@ -554,6 +568,7 @@ type OAuthOption func(*oauthConfig)
 
 type oauthConfig struct {
 	initialAT         string
+	accountID         string
 	onTokenRotated    func(at, rt string)
 	onAuthFatal       func(err error)
 	refreshTimeout    time.Duration
@@ -574,6 +589,14 @@ func defaultOAuthConfig() oauthConfig {
 		maxAttempts:       3,
 		tokenRotatedRetry: 3,
 	}
+}
+
+// WithOAuthAccountID 设置 ChatGPT account id（账号级常量，随
+// ChatGPT-Account-ID 头注入全部 WS/HTTP 请求面）。空值 = 不发送该头
+// （向后兼容默认）。SDK 不从 initialAT 派生——调用方先经 AccountIDFromToken
+// 离线解析（落库点）再显式传入。
+func WithOAuthAccountID(id string) OAuthOption {
+	return func(c *oauthConfig) { c.accountID = id }
 }
 
 // WithInitialAccessToken 预置初始 access token（裸 token）：传了直接用，

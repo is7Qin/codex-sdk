@@ -25,7 +25,7 @@
 //     OnAuthFatal 通知），Invalidate() / Fatal(err) 显式入口（网关解析 WS 判死
 //     事件帧时调用）
 //   - 伪装层（真实 codex 客户端形态对齐，对照见 IMPERSONATION.md）：默认
-//     codex-tui UA/originator（0.147.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
+//     codex-tui UA/originator（0.154.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
 //     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata 组装（WS 帧面
 //     8 key 恒发：installation_id/session_id/thread_id/turn_id/window_id/
 //     turn-metadata/traceparent/tracestate；HTTP 体面恒 4 key + turn_id +
@@ -35,6 +35,10 @@
 //     HeaderResponsesLite / MetaResponsesLiteKey）、会话标识握手头（WithSession）、
 //     x-codex-turn-state（WS：升级响应头签发 → 帧内 client_metadata 回传；
 //     HTTP：仅响应侧捕获，请求不带头）、每帧新 trace 与 turn_id（UUIDv7）
+//     ChatGPT-Account-ID（AccountIDProvider 可选接口：rotationAuth /
+//     oauthAuth / patAuth 经 WithOAuthAccountID / WithPATAccountID 显式注入——
+//     空 = 不发，向后兼容；来源见 AccountIDFromToken 离线 claims 解析与
+//     FetchPATMetadata 在线 whoami，SDK 拨号侧不自行派生）
 //
 // SDK 零协议解析：type / usage / 事件构造与业务语义（计费、透传编排、failover、
 // 会话粘性、内容审核）全部在网关侧（go-proxy-mini）——网关在 SDK 交付的完整

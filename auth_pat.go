@@ -27,9 +27,18 @@ func WithPATOnAuthFatal(fn func(error)) PATOption {
 	return func(a *patAuth) { a.onAuthFatal = fn }
 }
 
+// WithPATAccountID 设置 ChatGPT account id（账号级常量，随
+// ChatGPT-Account-ID 头注入全部 WS/HTTP 请求面）。空值 = 不发送该头
+// （向后兼容默认）。PAT() 本身零网络——调用方先经 FetchPATMetadata
+// 在线查询（落库点）再显式传入。
+func WithPATAccountID(id string) PATOption {
+	return func(a *patAuth) { a.accountID = id }
+}
+
 // patAuth 是 PAT 鉴权实现（指针状态，毒化后 fail-closed）。
 type patAuth struct {
 	token       string
+	accountID   string // ChatGPT account id（空 = 不发头）
 	fatal       atomic.Pointer[fatalState]
 	onAuthFatal func(error)
 }
@@ -44,6 +53,11 @@ func (a *patAuth) Authorization(context.Context) (string, error) {
 
 // Invalidate：PAT 无轮转状态，no-op。
 func (a *patAuth) Invalidate() {}
+
+// AccountID 返回账号标识（可选接口 AccountIDProvider；空 = 不发送头）。
+// 纯内存读取，零网络（PAT() 构造与本方法均不触发 whoami——在线查询只经
+// 显式 FetchPATMetadata 调用）。
+func (a *patAuth) AccountID() string { return a.accountID }
 
 // Fatal 显式终止（网关解析到 WS 判死事件帧时调用）：置账号级终止状态，
 // 后续 Authorization 恒返回该错误。不触发 OnAuthFatal（调用方已获知）。

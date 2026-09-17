@@ -21,11 +21,11 @@ import (
 // WithHeader("Originator", ...) 可覆盖。
 const DefaultOriginator = "codex-tui"
 
-// DefaultCodexUserAgent 默认 codex UA（用户拍板：codex-tui/0.147.0 +
+// DefaultCodexUserAgent 默认 codex UA（用户拍板：codex-tui/0.154.0 +
 // Ubuntu 指纹；真实形态 "{originator}/{version} ({os} {os_version}; {arch})
 // {terminal} ({originator}; {version})"——UA 前缀与 originator 保持一致）。
 // WithHeader("User-Agent", ...) 可覆盖。
-const DefaultCodexUserAgent = "codex-tui/0.147.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tui; 0.147.0)"
+const DefaultCodexUserAgent = "codex-tui/0.154.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tui; 0.154.0)"
 
 // DefaultBetaWS 是现役唯一的 Responses WS beta 值（真实源码全仓库唯一常量；
 // 2026-02-04 为旧值、无真实来源），仅 WS 握手注入。

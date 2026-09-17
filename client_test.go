@@ -31,6 +31,8 @@ type echoState struct {
 	threadID        string
 	clientRequestID string
 	windowID        string
+	accountID       string
+	hasAccountID    bool // ChatGPT-Account-ID 槽位级存在（防 Header.Get 空串假绿）
 	texts           [][]byte
 	binaryCount     int
 	closeCode       websocket.StatusCode
@@ -55,6 +57,8 @@ func startEchoServer(t *testing.T, wantAuth string) (string, *echoState) {
 		st.threadID = r.Header.Get(HeaderThreadID)
 		st.clientRequestID = r.Header.Get(HeaderClientRequestID)
 		st.windowID = r.Header.Get(HeaderWindowID)
+		st.accountID = r.Header.Get("ChatGPT-Account-ID")
+		_, st.hasAccountID = r.Header[http.CanonicalHeaderKey("ChatGPT-Account-ID")]
 		st.mu.Unlock()
 		if wantAuth != "" && r.Header.Get("Authorization") != wantAuth {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)

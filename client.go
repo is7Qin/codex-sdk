@@ -324,6 +324,8 @@ func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 				hdr.Set(HeaderWindowID, s.WindowID)
 			}
 		}
+		// 账号标识头（ChatGPT 系 auth 恒发；空 = 不发，向后兼容）。
+		applyAccountID(hdr, auth)
 		// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
 		for k, vals := range cfg.headers {
 			hdr.Del(k)

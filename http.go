@@ -328,6 +328,8 @@ func (c *HTTPClient) sendRequest(ctx context.Context, targetURL string, method s
 	req.Header.Set("Originator", DefaultOriginator)
 	// 注意：HTTP 请求不携带 x-codex-turn-state 头（真实客户端行为——
 	// turn-state 仅响应侧，WS 路径才回传，见 Client）。
+	// 账号标识头（ChatGPT 系 auth 恒发；空 = 不发，向后兼容）。
+	applyAccountID(req.Header, c.auth)
 	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
 	for k, vals := range c.opts.headers {
 		req.Header.Del(k)
