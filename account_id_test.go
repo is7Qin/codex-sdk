@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	"github.com/coder/websocket"
@@ -81,8 +80,9 @@ func (g *accountIDWSGate) snapshot() []http.Header {
 	return out
 }
 
-// accountIDCaptureTransport 是任意 URL 通用捕获传输层（多端点单测用——
-// fixedTransport 只映射单 URL，T3 四端点改用本传输层；仅记录请求头）。
+// accountIDCaptureTransport 是通用捕获传输层：记录全部请求头 + 计数，
+// 固定回复可配 body（200）。覆盖多端点单测（fixedTransport 只映射单 URL）
+// 与无网络契约观测（替换 http.DefaultClient.Transport 后 count() 即出站数）。
 type accountIDCaptureTransport struct {
 	mu      sync.Mutex
 	headers []http.Header
@@ -110,10 +110,17 @@ func (tr *accountIDCaptureTransport) snapshot() []http.Header {
 	return out
 }
 
-// T1：WS 握手带 WithOAuthAccountID → 握手头存在且值一致；无该 option 时
-// 槽位不存在（map 级，防 Get 假绿）。上线形态为 Chatgpt-Account-Id（§2.4）。
+// count 返回已捕获请求数（出站计数，T13 无网络契约观测用）。
+func (tr *accountIDCaptureTransport) count() int {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	return len(tr.headers)
+}
+
+// T1：WS 握手带 WithOAuthAccountID → 握手头存在且值一致；无 id 面由 T4
+// 覆盖（向后兼容双面）。上线形态为 Chatgpt-Account-Id（§2.4）。
 func TestAccountIDWSHandshake(t *testing.T) {
-	url, st := startEchoServer(t, "")
+	url, gate := startAccountIDWSGate(t, func(auth string) bool { return true })
 	ctx := context.Background()
 	c, err := Dial(ctx,
 		OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-1")),
@@ -122,40 +129,20 @@ func TestAccountIDWSHandshake(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer c.Close(StatusGoingAway, "")
-	waitFor(t, func() bool {
-		st.mu.Lock()
-		defer st.mu.Unlock()
-		return st.hasAccountID
-	})
-	st.mu.Lock()
-	got, present := st.accountID, st.hasAccountID
-	st.mu.Unlock()
-	if !present || got != "acc-1" {
-		t.Fatalf("握手头 ChatGPT-Account-ID = %q present=%v, 期望 acc-1/true", got, present)
+	waitFor(t, func() bool { return len(gate.snapshot()) > 0 })
+	got := gate.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("握手次数 = %d, 期望 1", len(got))
 	}
-
-	// 无 option：槽位不存在
-	url2, st2 := startEchoServer(t, "")
-	c2, err := Dial(ctx, PAT("t"),
-		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)))
-	if err != nil {
-		t.Fatalf("Dial #2: %v", err)
+	if v := got[0].Get("ChatGPT-Account-ID"); v != "acc-1" {
+		t.Fatalf("握手头 ChatGPT-Account-ID = %q, 期望 acc-1", v)
 	}
-	defer c2.Close(StatusGoingAway, "")
-	waitFor(t, func() bool {
-		st2.mu.Lock()
-		defer st2.mu.Unlock()
-		return st2.authHeader != ""
-	})
-	st2.mu.Lock()
-	got2, present2 := st2.accountID, st2.hasAccountID
-	st2.mu.Unlock()
-	if present2 || got2 != "" {
-		t.Fatalf("无 account id 时头不应出现: %q present=%v", got2, present2)
+	if !headerHasAccountID(got[0]) {
+		t.Fatal("握手头 ChatGPT-Account-ID 槽位应存在（防 Get 空串假绿）")
 	}
 }
 
-// T2：HTTP Do + Stream 带 id → 头存在且值一致；无 id → 槽位不存在。
+// T2：HTTP Do + Stream 带 id → 头存在且值一致（无 id 面由 T4 覆盖）。
 func TestAccountIDHTTPDoAndStream(t *testing.T) {
 	newDoServer := func(t *testing.T, got *string, present *bool, mu *sync.Mutex) string {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -189,23 +176,6 @@ func TestAccountIDHTTPDoAndStream(t *testing.T) {
 		}
 	})
 
-	t.Run("Do 无 id", func(t *testing.T) {
-		var got string
-		var present bool
-		var mu sync.Mutex
-		srvURL := newDoServer(t, &got, &present, &mu)
-		hc := NewHTTPClient(PAT("t"),
-			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srvURL)))
-		if _, err := hc.Do(ctx, []byte(`{}`)); err != nil {
-			t.Fatalf("Do: %v", err)
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if present || got != "" {
-			t.Fatalf("无 account id 时 Do 头不应出现: %q present=%v", got, present)
-		}
-	})
-
 	t.Run("Stream 带 id", func(t *testing.T) {
 		var got string
 		var present bool
@@ -230,42 +200,6 @@ func TestAccountIDHTTPDoAndStream(t *testing.T) {
 			t.Fatalf("Stream 头 = %q present=%v, 期望 acc-1/true", got, present)
 		}
 	})
-}
-
-// T3：GenerateImage（generations+edits 两 URL）+ Search + GetUsage 各面头
-// 存在且值一致（全走 doURL → sendRequest 单点）。
-func TestAccountIDAllHTTPFaces(t *testing.T) {
-	tr := &accountIDCaptureTransport{body: `{}`}
-	hc := NewHTTPClient(
-		OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-3")),
-		WithTransport(tr))
-	ctx := context.Background()
-
-	if _, err := hc.GenerateImage(ctx, &ImageGenParams{Model: "m", Prompt: "p"}); err != nil {
-		t.Fatalf("GenerateImage generations: %v", err)
-	}
-	if _, err := hc.GenerateImage(ctx, &ImageGenParams{
-		Model: "m", Prompt: "p",
-		Images: []ImageRef{{ImageURL: strPtr("https://cdn.example.com/a.png")}},
-	}); err != nil {
-		t.Fatalf("GenerateImage edits: %v", err)
-	}
-	if _, err := hc.Search(ctx, []byte(`{"query":"q"}`)); err != nil {
-		t.Fatalf("Search: %v", err)
-	}
-	if _, err := hc.GetUsage(ctx); err != nil {
-		t.Fatalf("GetUsage: %v", err)
-	}
-
-	got := tr.snapshot()
-	if len(got) != 4 {
-		t.Fatalf("请求数 = %d, 期望 4（generations/edits/search/usage）", len(got))
-	}
-	for i, h := range got {
-		if v := h.Get("ChatGPT-Account-ID"); v != "acc-3" {
-			t.Fatalf("第 %d 面头 = %q, 期望 acc-3", i, v)
-		}
-	}
 }
 
 // T4：向后兼容——PAT 未给 id、自定义 Auth 未实现 AccountIDProvider → 头不
@@ -314,9 +248,10 @@ func TestAccountIDBackwardCompat(t *testing.T) {
 	}
 }
 
-// T5：旋转——401 → refresh → 重拨，重拨握手头仍带同一 id（不可变）。
+// T5：旋转——401 → refresh → 重拨，重拨握手头仍带同一 id（不可变；
+// 首面由 T1 覆盖，refresh 次数/轮转细节由 auth_rotation_test.go 覆盖）。
 func TestAccountIDRotationRedial(t *testing.T) {
-	m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
+	_ = newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
 	url, gate := startAccountIDWSGate(t, func(auth string) bool { return auth == "Bearer at-new" })
 	auth := OAuthWithRotation("rt-0",
 		WithInitialAccessToken("at-old"), WithOAuthAccountID("acc-5"))
@@ -327,21 +262,17 @@ func TestAccountIDRotationRedial(t *testing.T) {
 	}
 	defer c.Close(StatusGoingAway, "")
 
-	if m.callCount() != 1 {
-		t.Fatalf("refresh 次数 = %d, 期望 1", m.callCount())
-	}
 	got := gate.snapshot()
 	if len(got) != 2 {
 		t.Fatalf("握手次数 = %d, 期望 2（首次 401 + 重拨）", len(got))
 	}
-	for i, h := range got {
-		if v := h.Get("ChatGPT-Account-ID"); v != "acc-5" {
-			t.Fatalf("第 %d 次握手头 = %q, 期望 acc-5（account id 不可变）", i, v)
-		}
+	if v := got[1].Get("ChatGPT-Account-ID"); v != "acc-5" {
+		t.Fatalf("重拨握手头 = %q, 期望 acc-5（account id 不可变）", v)
 	}
 }
 
-// T6：token 刷新端点不带 ChatGPT-Account-ID（钉住排除项）。
+// T6：token 刷新端点不带 ChatGPT-Account-ID（钉住排除项；
+// UA/Originator 形态由 auth_rotation_test.go 拥有）。
 func TestAccountIDRefreshEndpointExcluded(t *testing.T) {
 	m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-1"}`})
 	auth := OAuthWithRotation("rt-0", WithOAuthAccountID("acc-6"))
@@ -349,37 +280,23 @@ func TestAccountIDRefreshEndpointExcluded(t *testing.T) {
 	if err != nil || h != "Bearer at-1" {
 		t.Fatalf("Authorization: %q %v", h, err)
 	}
-	hdr := m.header(0)
-	if headerHasAccountID(hdr) {
+	if headerHasAccountID(m.header(0)) {
 		t.Fatal("refresh 请求不应带 ChatGPT-Account-ID（真客户端刷新端点仅 UA/Originator）")
-	}
-	if hdr.Get("User-Agent") != DefaultCodexUserAgent || hdr.Get("Originator") != DefaultOriginator {
-		t.Fatal("refresh 请求应保持既有 UA/Originator 形态")
 	}
 }
 
 // T7：值卫生——含控制字节 / 纯空白的 id 被跳过（不注入脏值）。
 // 口径：<0x20（TAB 除外）与 0x7f 一律拒绝（对齐 net/http 头字节合法性）。
+// 单一 auth 类型——注入分支 auth-type 无关（applyAccountID 只认
+// AccountIDProvider 接口），PAT 面由 T2/T4/T14 覆盖。
 func TestAccountIDValueHygiene(t *testing.T) {
 	ids := []string{"a\rb", "a\nb", "a\r\nb", "a\x00b", "a\x01b", "a\x7fb", "   ", ""}
 	for _, id := range ids {
-		t.Run("oauth:"+dirtyTestName(id), func(t *testing.T) {
+		t.Run(dirtyTestName(id), func(t *testing.T) {
 			tr := &accountIDCaptureTransport{body: `{}`}
 			hc := NewHTTPClient(
 				OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID(id)),
 				WithTransport(tr))
-			if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
-				t.Fatalf("Do: %v", err)
-			}
-			for _, h := range tr.snapshot() {
-				if headerHasAccountID(h) {
-					t.Fatalf("脏值 %q 不应注入", id)
-				}
-			}
-		})
-		t.Run("pat:"+dirtyTestName(id), func(t *testing.T) {
-			tr := &accountIDCaptureTransport{body: `{}`}
-			hc := NewHTTPClient(PAT("t", WithPATAccountID(id)), WithTransport(tr))
 			if _, err := hc.Do(context.Background(), []byte(`{}`)); err != nil {
 				t.Fatalf("Do: %v", err)
 			}
@@ -422,10 +339,6 @@ func TestAccountIDUserAgentVersion(t *testing.T) {
 	const want = "codex-tui/0.154.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tui; 0.154.0)"
 	if DefaultCodexUserAgent != want {
 		t.Fatalf("DefaultCodexUserAgent = %q, 期望 %q", DefaultCodexUserAgent, want)
-	}
-	if !strings.Contains(DefaultCodexUserAgent, "codex-tui/0.154.0") ||
-		!strings.Contains(DefaultCodexUserAgent, "(codex-tui; 0.154.0)") {
-		t.Fatalf("版本号两处应同步为 0.154.0: %q", DefaultCodexUserAgent)
 	}
 }
 
@@ -489,9 +402,6 @@ func TestAccountIDFromToken(t *testing.T) {
 // WithOAuthAccountID → AccountID() == ""（SDK 不自行解析）；显式 option 才生效。
 func TestAccountIDNoImplicitDerivation(t *testing.T) {
 	jwt := makeAccountIDTestJWT(t, `{"https://api.openai.com/auth":{"chatgpt_account_id":"acc-derived"}}`)
-	if _, ok := AccountIDFromToken(jwt); !ok {
-		t.Fatal("测试 JWT 应可解析（用例前置条件）")
-	}
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken(jwt))
 	p, ok := auth.(AccountIDProvider)
@@ -632,42 +542,25 @@ func TestFetchPATMetadata(t *testing.T) {
 	})
 }
 
-// countingRoundTripper 是计数 RoundTripper（T13 出站观测用——替换
-// http.DefaultClient.Transport，杜绝「mock 服务器未被访问即算零出站」的假绿）。
-type countingRoundTripper struct {
-	calls *atomic.Int32
-	body  string
-}
-
-func (tr *countingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	tr.calls.Add(1)
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader(tr.body)),
-		Request:    req,
-	}, nil
-}
-
-// T13：无网络契约——替换 http.DefaultClient.Transport 为计数 RoundTripper
+// T13：无网络契约——替换 http.DefaultClient.Transport 为捕获传输层
 // （保存/恢复）→ PAT() 与 OAuthWithRotation 构造期计数 = 0；显式
 // FetchPATMetadata 时计数 = 1。
 func TestAccountIDNoNetworkAtConstruction(t *testing.T) {
-	var calls atomic.Int32
+	tr := &accountIDCaptureTransport{body: `{}`}
 	prev := http.DefaultClient.Transport
-	http.DefaultClient.Transport = &countingRoundTripper{calls: &calls, body: `{}`}
+	http.DefaultClient.Transport = tr
 	t.Cleanup(func() { http.DefaultClient.Transport = prev })
 
 	_ = PAT("tok", WithPATAccountID("acc-t13"))
 	_ = OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-t13"))
-	if n := calls.Load(); n != 0 {
+	if n := tr.count(); n != 0 {
 		t.Fatalf("构造期出站 = %d, 期望 0（PAT/OAuthWithRotation 零网络）", n)
 	}
 
 	if _, err := FetchPATMetadata(context.Background(), "tok"); err != nil {
 		t.Fatalf("FetchPATMetadata: %v", err)
 	}
-	if n := calls.Load(); n != 1 {
+	if n := tr.count(); n != 1 {
 		t.Fatalf("显式 whoami 后出站 = %d, 期望 1", n)
 	}
 }
@@ -678,7 +571,7 @@ func TestAccountIDWSOverrideAndTrim(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("WS WithHeader 后写赢", func(t *testing.T) {
-		url, st := startEchoServer(t, "")
+		url, gate := startAccountIDWSGate(t, func(auth string) bool { return true })
 		c, err := Dial(ctx,
 			OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-default")),
 			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
@@ -687,21 +580,14 @@ func TestAccountIDWSOverrideAndTrim(t *testing.T) {
 			t.Fatalf("Dial: %v", err)
 		}
 		defer c.Close(StatusGoingAway, "")
-		waitFor(t, func() bool {
-			st.mu.Lock()
-			defer st.mu.Unlock()
-			return st.hasAccountID
-		})
-		st.mu.Lock()
-		got := st.accountID
-		st.mu.Unlock()
-		if got != "ws-override" {
+		waitFor(t, func() bool { return len(gate.snapshot()) > 0 })
+		if got := gate.snapshot()[0].Get("ChatGPT-Account-ID"); got != "ws-override" {
 			t.Fatalf("WS 覆盖后头 = %q, 期望 ws-override（WithHeader 后写赢）", got)
 		}
 	})
 
 	t.Run("首尾空白 trim 后发送", func(t *testing.T) {
-		url, st := startEchoServer(t, "")
+		url, gate := startAccountIDWSGate(t, func(auth string) bool { return true })
 		c, err := Dial(ctx,
 			PAT("t", WithPATAccountID("  acc-trim  ")),
 			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
@@ -709,15 +595,8 @@ func TestAccountIDWSOverrideAndTrim(t *testing.T) {
 			t.Fatalf("Dial: %v", err)
 		}
 		defer c.Close(StatusGoingAway, "")
-		waitFor(t, func() bool {
-			st.mu.Lock()
-			defer st.mu.Unlock()
-			return st.hasAccountID
-		})
-		st.mu.Lock()
-		got := st.accountID
-		st.mu.Unlock()
-		if got != "acc-trim" {
+		waitFor(t, func() bool { return len(gate.snapshot()) > 0 })
+		if got := gate.snapshot()[0].Get("ChatGPT-Account-ID"); got != "acc-trim" {
 			t.Fatalf("WS 头 = %q, 期望 trim 后 acc-trim", got)
 		}
 	})

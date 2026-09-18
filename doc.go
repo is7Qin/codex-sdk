@@ -35,10 +35,15 @@
 //     HeaderResponsesLite / MetaResponsesLiteKey）、会话标识握手头（WithSession）、
 //     x-codex-turn-state（WS：升级响应头签发 → 帧内 client_metadata 回传；
 //     HTTP：仅响应侧捕获，请求不带头）、每帧新 trace 与 turn_id（UUIDv7）
-//     ChatGPT-Account-ID（AccountIDProvider 可选接口：rotationAuth /
-//     oauthAuth / patAuth 经 WithOAuthAccountID / WithPATAccountID 显式注入——
-//     空 = 不发，向后兼容；来源见 AccountIDFromToken 离线 claims 解析与
-//     FetchPATMetadata 在线 whoami，SDK 拨号侧不自行派生）
+//     ChatGPT-Account-ID（AccountIDProvider 可选接口：rotationAuth 经
+//     WithOAuthAccountID / patAuth 经 WithPATAccountID 显式注入——空 = 不发，
+//     向后兼容；OAuth(tokenProvider) 回调型不实现该接口）：上线形态经 Go
+//     textproto 规范化为 Chatgpt-Account-Id（头名大小写不敏感）；来源二选一——
+//     OAuth 系 AccountIDFromToken 离线解析 access_token/id_token JWT 的
+//     https://api.openai.com/auth.chatgpt_account_id（不验签/exp，rt 无 claims），
+//     PAT 系 FetchPATMetadata 在线 whoami（base 默认
+//     https://auth.openai.com/api/accounts，env CODEX_AUTHAPI_BASE_URL 覆盖，
+//     默认 10s 超时）；SDK 零隐式派生 + 构造零网络（落库点显式注入，拨号侧不派生）
 //
 // SDK 零协议解析：type / usage / 事件构造与业务语义（计费、透传编排、failover、
 // 会话粘性、内容审核）全部在网关侧（go-proxy-mini）——网关在 SDK 交付的完整

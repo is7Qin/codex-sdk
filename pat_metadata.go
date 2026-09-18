@@ -30,13 +30,18 @@ type PATMetadata struct {
 	FedRAMP   bool
 }
 
+// resolveEnvBaseURL 读 env base：TrimSpace + 去尾部斜杠，空回默认。
+func resolveEnvBaseURL(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return def
+}
+
 // resolveAuthAPIBase 解析 whoami 端点 base（env CODEX_AUTHAPI_BASE_URL
 // 覆盖默认，与真客户端同名）。
 func resolveAuthAPIBase() string {
-	if v := strings.TrimSpace(os.Getenv("CODEX_AUTHAPI_BASE_URL")); v != "" {
-		return strings.TrimRight(v, "/")
-	}
-	return DefaultAuthAPIBaseURL
+	return resolveEnvBaseURL("CODEX_AUTHAPI_BASE_URL", DefaultAuthAPIBaseURL)
 }
 
 // FetchPATMetadata 调用 PAT whoami 端点获取账号元数据。请求形态与 SDK 既有

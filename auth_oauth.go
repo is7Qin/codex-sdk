@@ -25,12 +25,8 @@ func OAuth(tokenProvider func(ctx context.Context) (string, error)) Auth {
 
 // oauthAuth 是 OAuth 鉴权实现（值类型，零分配）。
 type oauthAuth struct {
-	provider  func(ctx context.Context) (string, error)
-	accountID string // ChatGPT account id（无来源时为空 = 不发头，行为=现状）
+	provider func(ctx context.Context) (string, error)
 }
-
-// AccountID 返回账号标识（可选接口 AccountIDProvider；空 = 不发送头）。
-func (a oauthAuth) AccountID() string { return a.accountID }
 
 // Authorization 取最新 token 并组装 "Bearer <token>"。
 func (a oauthAuth) Authorization(ctx context.Context) (string, error) {
@@ -546,12 +542,10 @@ func firstNonEmpty(a, b string) string {
 }
 
 // resolveRefreshTokenURL 解析 refresh 端点 URL（CODEX_REFRESH_TOKEN_URL_OVERRIDE
-// 覆盖默认，同名对齐真实客户端 env，构造期解析）。
+// 覆盖默认，同名对齐真实客户端 env，构造期解析；与 whoami base 同口径
+// TrimSpace + 去尾斜杠——默认 RefreshTokenURL 本无尾斜杠，行为兼容）。
 func resolveRefreshTokenURL() string {
-	if v := os.Getenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE"); v != "" {
-		return v
-	}
-	return RefreshTokenURL
+	return resolveEnvBaseURL("CODEX_REFRESH_TOKEN_URL_OVERRIDE", RefreshTokenURL)
 }
 
 // resolveOAuthClientID 解析 OAuth client_id（CODEX_APP_SERVER_LOGIN_CLIENT_ID
