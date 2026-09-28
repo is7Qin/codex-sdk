@@ -14,6 +14,46 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func BenchmarkRewriteEnvironmentContextMiss(b *testing.B) {
+	raw := []byte(`{"type":"response.create","model":"gpt-5","input":[{"role":"user","content":"plain text without the environment block"}]}`)
+	now := time.Date(2026, time.July, 4, 3, 30, 0, 0, time.UTC)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for b.Loop() {
+		if out := RewriteEnvironmentContextTime(raw, now); len(out) != len(raw) {
+			b.Fatal(len(out))
+		}
+	}
+}
+
+func BenchmarkRewriteEnvironmentContextHit(b *testing.B) {
+	raw := []byte(`{"type":"response.create","model":"gpt-5","input":[{"role":"user","content":"<environment_context>\n  <current_date>2026-09-28</current_date>\n  <timezone>Asia/Shanghai</timezone>\n</environment_context>"}]}`)
+	now := time.Date(2026, time.July, 4, 3, 30, 0, 0, time.UTC)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for b.Loop() {
+		if out := RewriteEnvironmentContextTime(raw, now); len(out) == 0 {
+			b.Fatal("empty")
+		}
+	}
+}
+
+func TestRewriteEnvironmentContextTime(t *testing.T) {
+	now := time.Date(2026, time.July, 4, 3, 30, 0, 0, time.UTC)
+	in := []byte(`{"input":[{"role":"user","content":"<environment_context>\n  <current_date>2026-09-28</current_date>\n  <timezone>Asia/Shanghai</timezone>\n</environment_context>"}]}`)
+	out := RewriteEnvironmentContextTime(in, now)
+	text := gjson.GetBytes(out, "input.0.content").String()
+	if !strings.Contains(text, "<current_date>2026-07-03</current_date>") || !strings.Contains(text, "<timezone>America/New_York</timezone>") {
+		t.Fatalf("环境时间未改成美东时间: %s", text)
+	}
+	if !strings.Contains(text, "<environment_context>") || !strings.Contains(text, "</environment_context>") {
+		t.Fatalf("环境上下文边界被破坏: %s", text)
+	}
+	if got := RewriteEnvironmentContextTime([]byte(`{"input":"plain"}`), now); string(got) != `{"input":"plain"}` {
+		t.Fatalf("无环境上下文应原样返回: %s", got)
+	}
+}
+
 // TestFilterCodexPayload：顶层 key 白名单过滤（纯函数）。
 func TestFilterCodexPayload(t *testing.T) {
 	in := []byte(`{"type":"response.create","model":"gpt-5","input":"hi","stream_options":{"reasoning_summary_delivery":"sequential_cutoff"},"evil":"x","foo":{"bar":1}}`)

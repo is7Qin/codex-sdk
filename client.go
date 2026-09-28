@@ -433,6 +433,7 @@ func (c *Client) Send(ctx context.Context, frame []byte) error {
 // WithClientMetadata 透传 > 自动机制（turn_id / trace）> turn_metadata 回调。
 // 全部禁用时零拷贝零分配原样返回。
 func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
+	frame = RewriteEnvironmentContextTime(frame, time.Now())
 	if c.filtering {
 		var err error
 		frame, err = FilterCodexPayload(frame)

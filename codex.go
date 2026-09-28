@@ -1,15 +1,25 @@
 package codexsdk
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+var easternTime = func() *time.Location {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		loc = time.FixedZone("EST", -5*60*60)
+	}
+	return loc
+}()
 
 // 伪装层：Codex 客户端形态对齐（真实源码对照见 IMPERSONATION.md）。
 // UA / originator / beta 头、头常量、字段白名单、client_metadata 组装、
@@ -135,6 +145,76 @@ func FilterCodexPayload(raw []byte) ([]byte, error) {
 		return nil, ErrEmptyFrame
 	}
 	return filtered, nil
+}
+
+// RewriteEnvironmentContextTime 把 Codex 环境上下文中的本地时间改成美东时间。
+// 只替换 <current_date> 与 <timezone> 的文本内容，其余字节保持不变。
+func RewriteEnvironmentContextTime(raw []byte, now time.Time) []byte {
+	if len(raw) == 0 || !bytes.Contains(raw, []byte("<environment_context>")) || !gjson.ValidBytes(raw) {
+		return raw
+	}
+	date := now.In(easternTime).Format("2006-01-02")
+	var out []byte
+	cursor := 0
+	changed := false
+	root := gjson.ParseBytes(raw)
+	var rewrite func(gjson.Result)
+	rewrite = func(v gjson.Result) {
+		if v.Type == gjson.String && strings.Contains(v.Str, "<environment_context>") {
+			next := replaceEnvironmentTime(v.Str, date)
+			if next != v.Str {
+				encoded, err := sjson.SetBytes([]byte("{}"), "v", next)
+				if err == nil {
+					value := gjson.GetBytes(encoded, "v").Raw
+					start := v.Index
+					out = append(out, raw[cursor:start]...)
+					out = append(out, value...)
+					cursor = start + len(v.Raw)
+					changed = true
+					return
+				}
+			}
+		}
+		if v.IsArray() || v.IsObject() {
+			v.ForEach(func(_, child gjson.Result) bool {
+				rewrite(child)
+				return true
+			})
+		}
+	}
+	rewrite(root)
+	if !changed {
+		return raw
+	}
+	return append(out, raw[cursor:]...)
+}
+
+func replaceEnvironmentTime(value, date string) string {
+	value = replaceXMLElement(value, "current_date", date)
+	return replaceXMLElement(value, "timezone", "America/New_York")
+}
+
+func replaceXMLElement(value, name, replacement string) string {
+	open := "<" + name + ">"
+	close := "</" + name + ">"
+	var b strings.Builder
+	rest := value
+	for {
+		start := strings.Index(rest, open)
+		if start < 0 {
+			b.WriteString(rest)
+			return b.String()
+		}
+		from := start + len(open)
+		rel := strings.Index(rest[from:], close)
+		if rel < 0 {
+			b.WriteString(rest)
+			return b.String()
+		}
+		b.WriteString(rest[:from])
+		b.WriteString(replacement)
+		rest = rest[from+rel:]
+	}
 }
 
 // Session 是会话级标识（真实 codex 客户端 WS 握手恒带
