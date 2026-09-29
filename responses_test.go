@@ -32,11 +32,11 @@ const (
 	respItemMsg = `{"id":"msg_1","status":"completed","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}`
 	respItemFC  = `{"id":"fc_1","status":"completed","type":"function_call","name":"get_weather","arguments":"{\"city\":\"SF\"}"}`
 
-	respItemMsgDoneEv = `{"type":"output_item.done","item":` + respItemMsg + `}`
-	respItemFCDoneEv  = `{"type":"output_item.done","item":` + respItemFC + `}`
+	respItemMsgDoneEv = `{"type":"response.output_item.done","item":` + respItemMsg + `}`
+	respItemFCDoneEv  = `{"type":"response.output_item.done","item":` + respItemFC + `}`
 
 	respUsage        = `{"input_tokens":10,"output_tokens":20,"total_tokens":30}`
-	respCompletedEv  = `{"type":"response.completed","response":{"id":"resp_001","object":"response","status":"completed"},"usage":` + respUsage + `}`
+	respCompletedEv  = `{"type":"response.completed","response":{"id":"resp_001","object":"response","status":"completed","usage":` + respUsage + `}}`
 	respCompletedNoU = `{"type":"response.completed","response":{"id":"resp_001","object":"response","status":"completed"}}`
 )
 
@@ -365,13 +365,13 @@ func TestResponsesFailedEventWire(t *testing.T) {
 func TestResponsesZeroCopyBigItem(t *testing.T) {
 	blob := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xAB}, 900*1024)) // ~1.2MB base64
 	bigItem := `{"id":"big_1","status":"completed","type":"message","content":[{"type":"output_image","image_url":"data:image/png;base64,` + blob + `"}]}`
-	bigEvent := `{"type":"output_item.done","item":` + bigItem + `}`
+	bigEvent := `{"type":"response.output_item.done","item":` + bigItem + `}`
 	// 300KB 长 delta 行：扫描器复用大缓冲时覆盖其头部字节——未拷贝实现被污染
 	filler := `{"type":"response.output_text.delta","item_id":"big_1","delta":"` + strings.Repeat("B", 300*1024) + `"}`
 	item2 := `{"id":"small_1","status":"completed","type":"message","content":[{"type":"output_text","text":"C"}]}`
 
 	srv := startResponsesMock(t, nil,
-		[]string{respCreatedEvent, bigEvent, filler, `{"type":"output_item.done","item":` + item2 + `}`, respCompletedEv},
+		[]string{respCreatedEvent, bigEvent, filler, `{"type":"response.output_item.done","item":` + item2 + `}`, respCompletedEv},
 		true, nil)
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
 	resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))

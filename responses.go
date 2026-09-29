@@ -15,7 +15,7 @@ import (
 // 截断错误兜底（与"不做流中断恢复"边界一致）。
 const (
 	responseEventCreated   = "response.created"
-	responseEventItemDone  = "output_item.done"
+	responseEventItemDone  = "response.output_item.done"
 	responseEventCompleted = "response.completed"
 	responseEventFailed    = "response.failed"
 )
@@ -91,8 +91,8 @@ func (a *responsesAggregator) feed(raw []byte) error {
 		}
 	case responseEventCompleted:
 		a.completed = true
-		if usage := gjson.GetBytes(raw, "usage"); usage.Exists() {
-			a.usage = json.RawMessage(usage.Raw)
+		if usage := responseUsage(raw); len(usage) > 0 {
+			a.usage = usage
 		}
 	case responseEventFailed:
 		return a.failedError(raw)
@@ -102,6 +102,14 @@ func (a *responsesAggregator) feed(raw []byte) error {
 
 // failedError 把 response.failed 事件合成为错误（Raw=事件 error 字段 JSON，
 // error 字段缺失时兜底整个事件 JSON）。
+func responseUsage(raw []byte) json.RawMessage {
+	usage := gjson.GetBytes(raw, "response.usage")
+	if usage.Exists() && usage.Type != gjson.Null {
+		return json.RawMessage(usage.Raw)
+	}
+	return nil
+}
+
 func (a *responsesAggregator) failedError(raw []byte) error {
 	rawErr := raw
 	if e := gjson.GetBytes(raw, "error"); e.Exists() {
