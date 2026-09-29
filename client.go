@@ -99,7 +99,7 @@ type options struct {
 	// 伪装层（Send 帧 / 升级与请求头）。
 	filtering       bool // Send 白名单过滤（默认开）
 	meta            *CodexMeta
-	metaPassthrough []metadataEntry // WithClientMetadata 透传项（WS client_metadata 任意键，只透传不解析）
+	metaPassthrough []metadataEntry // WithClientMetadata 注入项（WS client_metadata 任意键，只注入不解析）
 	session         *Session        // 会话标识（握手头 + 帧内 metadata）
 	trace           *TraceContext   // 外部注入（WS 帧 metadata，优先于自动生成）
 	traceAuto       bool            // 每帧自动生成 trace（默认开，WS 专用）
@@ -169,15 +169,15 @@ func WithPayloadFiltering(enabled bool) Option {
 }
 
 // WithCodexMeta 设置 client_metadata 静态载体（值由调用方提供，
-// SDK 只组装不生成；帧内已存在的 key 不覆盖）。
+// SDK 只组装不生成）。
 func WithCodexMeta(meta CodexMeta) Option {
 	return func(o *options) { o.meta = &meta }
 }
 
-// WithClientMetadata 注入 client_metadata 任意键值（透传面：SDK 只透传不解析，
+// WithClientMetadata 注入 client_metadata 任意键值（网关面：SDK 只注入不解析，
 // 键名由调用方自定或引用 Meta* 常量，如 MetaResponsesLiteKey="true"）。
-// 与其余注入同优先级——帧内已存在的 key 不覆盖；多次调用为多键注入。
-// 仅作用于 WS——HTTP 无 client_metadata，对应请求头透传用 WithHeader。
+// 注入按 entries 内部优先级取首次出现；对帧恒覆盖（网关值恒为准）。
+// 仅作用于 WS——HTTP 侧的对应能力用 WithHeader（请求头）。
 func WithClientMetadata(key, value string) Option {
 	return func(o *options) {
 		o.metaPassthrough = append(o.metaPassthrough, metadataEntry{key, value})
@@ -254,7 +254,7 @@ type Client struct {
 	// 伪装层（Send 帧组装）。
 	filtering       bool
 	meta            *CodexMeta
-	metaPassthrough []metadataEntry // WithClientMetadata 透传项（只透传不解析）
+	metaPassthrough []metadataEntry // WithClientMetadata 注入项（只注入不解析）
 	session         *Session        // 会话标识（握手头 + 帧内 metadata）
 	trace           *TraceContext   // 外部注入（每帧静态，优先于自动生成）
 	traceAuto       bool            // 每帧自动生成 trace
@@ -415,7 +415,7 @@ func dialStatus(resp *http.Response) int {
 //
 // 伪装层默认生效（Options 可关）：白名单过滤（FilterCodexPayload，过滤后为空
 // 返回 ErrEmptyFrame 不入网）+ client_metadata 组装（CodexMeta 静态值 /
-// trace / turn_metadata；浅合并，帧内已存在的 key 不覆盖）。
+// trace / turn_metadata；整体替换帧内 client_metadata——客户端自带的永不透传）。
 // 关闭过滤且无任何注入时为零拷贝零分配快速路径；Write 同步消费——
 // Send 返回前不得复用 frame。
 func (c *Client) Send(ctx context.Context, frame []byte) error {

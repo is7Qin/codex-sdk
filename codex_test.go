@@ -159,9 +159,8 @@ func TestSendDefaultFiltering(t *testing.T) {
 	}
 }
 
-// TestCodexMetaInjection：Send 顶层 client_metadata 组装（网关覆盖语义：注入项
-// 恒覆盖帧内已有同 key——客户端自带的 client_metadata 永不透传；仅网关未管理的
-// 键原样保留）。
+// TestCodexMetaInjection：Send 顶层 client_metadata **整体替换**（网关覆盖语义：
+// codex 面客户端自带的 client_metadata **永不透传**——连同非网关键一并丢弃）。
 func TestCodexMetaInjection(t *testing.T) {
 	url, st := startEchoServer(t, "")
 	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
@@ -201,9 +200,9 @@ func TestCodexMetaInjection(t *testing.T) {
 	if v := gjson.Get(got, "client_metadata.ws_request_header_traceparent").String(); v != "tp-1" {
 		t.Fatalf("traceparent = %q, 期望 tp-1（静态值优先于自动生成）", v)
 	}
-	// 网关未管理的键（user）原样保留
-	if v := gjson.Get(got, "client_metadata.user.a").Int(); v != 1 {
-		t.Fatalf("非网关键内容应保留: %s", got)
+	// 客户端非网关键（user）随整体替换一并丢弃（客户端 client_metadata 永不透传）
+	if gjson.Get(got, "client_metadata.user").Exists() {
+		t.Fatalf("客户端非网关键应被丢弃: %s", got)
 	}
 	// 顶层其余字段保留
 	if gjson.Get(got, "model").String() != "gpt-5" {
@@ -527,8 +526,8 @@ func TestTurnIDOverride(t *testing.T) {
 	if v := gjson.GetBytes(got0, "client_metadata.turn_id").String(); v == "existing-turn" {
 		t.Fatal("客户端 turn_id 不应透传")
 	}
-	if v := gjson.GetBytes(got0, "client_metadata.user.a").Int(); v != 1 {
-		t.Fatalf("非网关键 metadata 应保留: %s", got0)
+	if gjson.GetBytes(got0, "client_metadata.user").Exists() {
+		t.Fatalf("客户端非网关键 metadata 应被丢弃: %s", got0)
 	}
 	if v := gjson.GetBytes(got1, "client_metadata.turn_id").String(); !uuidv7Re.MatchString(v) {
 		t.Fatalf("无值帧应自动生成 UUIDv7 turn_id, got %q", v)

@@ -26,13 +26,13 @@
 //     事件帧时调用）
 //   - 伪装层（真实 codex 客户端形态对齐，对照见 IMPERSONATION.md）：默认
 //     codex-tui UA/originator（0.154.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
-//     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata 组装（WS 帧面
-//     8 key 恒发：installation_id/session_id/thread_id/turn_id/window_id/
-//     turn-metadata/traceparent/tracestate；HTTP 体面恒 4 key + turn_id +
-//     条件键，不含 trace/turn-state，见 injectResponsesClientMetadata）、
-//     透传（HTTP 头 WithHeader / WS client_metadata
-//     任意键 WithClientMetadata，只透传不解析——如 responses-lite 标记
-//     HeaderResponsesLite / MetaResponsesLiteKey）、会话标识握手头（WithSession）、
+//     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata **整体替换**组装
+//     （WS 帧面 8 key 恒发：installation_id/session_id/thread_id/turn_id/
+//     window_id/turn-metadata/traceparent/tracestate；HTTP 体面恒 4 key +
+//     turn_id + 条件键，不含 trace/turn-state，见 injectResponsesClientMetadata；
+//     客户端自带的 client_metadata 永不透传）、透传（HTTP 头 WithHeader / WS
+//     client_metadata 任意键 WithClientMetadata，只注入不解析——如 responses-lite
+//     标记 HeaderResponsesLite / MetaResponsesLiteKey）、会话标识握手头（WithSession）、
 //     x-codex-turn-state（WS：升级响应头签发 → 帧内 client_metadata 回传；
 //     HTTP：仅响应侧捕获，请求不带头）、每帧新 trace 与 turn_id（UUIDv7）
 //     ChatGPT-Account-ID（AccountIDProvider 可选接口：rotationAuth 经
@@ -101,7 +101,7 @@
 // responses-lite 非独立端点：与 /responses 同端点同事件集，
 // 仅 internal 标记区分——HTTP 头 x-openai-internal-codex-responses-lite（WithHeader
 // 透传）与 WS client_metadata 键 ws_request_header_x_openai_internal_codex_responses_lite
-// （WithClientMetadata 透传），SDK 只透传不解析。
+// （WithClientMetadata 注入），SDK 只注入不解析。
 // 传输常量对齐参考实现：16MiB ReadLimit（coder 默认 32KB 过小）、
 // CompressionContextTakeover 压缩、WS 层 ping 心跳（30s 间隔 + 2s 超时）、
 // data: SSE 行提取与 [DONE] 终止、response.create 18 字段白名单、

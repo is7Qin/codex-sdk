@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -303,23 +304,21 @@ type metadataEntry struct {
 	value string
 }
 
-// injectClientMetadataKeys 把 entries 写入帧顶层 client_metadata（网关**覆盖**
-// 语义：注入项恒覆盖帧/请求体内已有同 key——codex 面客户端自带的 client_metadata
-// **永不透传**，伪装身份恒以网关值为准；client_metadata 不存在时创建）。entries
-// 为空时帧零改动。只动顶层 client_metadata key，其余字节零改动。返回帧（可能为
-// 新分配）。
-func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {
+// clientMetadataObject 组装 client_metadata 对象字节：entries 按**首次出现**去重
+// （entries 自身优先级：CodexMeta > WithSession > turn-state > WithClientMetadata >
+// 自动机制）、空值跳过；值经 encoding/json 转义（与 sjson 逐字节一致）。无有效
+// entry → nil（调用方不动帧）。
+func clientMetadataObject(entries []metadataEntry) []byte {
 	if len(entries) == 0 {
-		return frame
+		return nil
 	}
-	out := frame
+	buf := make([]byte, 0, 4+len(entries)*32)
+	buf = append(buf, '{')
+	first := true
 	for i, e := range entries {
 		if e.value == "" {
 			continue
 		}
-		// 同一 key 只取 entries 内**首次**出现（entries 自身优先级：CodexMeta >
-		// WithSession > turn-state > WithClientMetadata > 自动机制）；对帧/请求体
-		// 则是覆盖写（网关值恒为准）。entries 规模恒小，O(n²) 判重避免每帧 map 分配。
 		dup := false
 		for j := 0; j < i; j++ {
 			if entries[j].key == e.key && entries[j].value != "" {
@@ -330,11 +329,42 @@ func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {
 		if dup {
 			continue
 		}
-		next, err := sjson.SetBytes(out, "client_metadata."+e.key, e.value)
+		k, err := json.Marshal(e.key)
 		if err != nil {
-			return out // 非法 JSON：放弃本次注入，保持帧原样
+			continue
 		}
-		out = next
+		v, err := json.Marshal(e.value)
+		if err != nil {
+			continue
+		}
+		if !first {
+			buf = append(buf, ',')
+		}
+		first = false
+		buf = append(buf, k...)
+		buf = append(buf, ':')
+		buf = append(buf, v...)
+	}
+	if first {
+		return nil
+	}
+	return append(buf, '}')
+}
+
+// injectClientMetadataKeys 用网关身份**整体替换**帧/请求体顶层 client_metadata
+// （单遍 sjson.SetRawBytes——protoconv 字节级拼接同款：只做一次改写真）：
+// codex 面客户端自带的 client_metadata **永不透传**（连同非网关键一并丢弃，网关
+// 身份恒为准）。整体替换实测优于逐键覆盖（逐键 N 次重序列化整份 body，整体替换
+// 1 次；256KB 体：~0.72ms/35 allocs → ~0.28ms/2 allocs）。entries 无有效项 → 帧
+// 零改动返回。
+func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {
+	obj := clientMetadataObject(entries)
+	if obj == nil {
+		return frame
+	}
+	out, err := sjson.SetRawBytes(frame, "client_metadata", obj)
+	if err != nil {
+		return frame // 非法 JSON：放弃本次注入，保持帧原样
 	}
 	return out
 }

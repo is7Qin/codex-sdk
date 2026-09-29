@@ -182,9 +182,9 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 //   - 恒 4 key：x-codex-installation-id / session_id / thread_id /
 //     x-codex-window-id（CodexMeta 与 WithSession 同 key 时 CodexMeta 优先
 //     ——对齐 WS 组装优先级 client.go:522-578；空值跳过）；
-//   - 恒带 turn_id：payload 已含 → 原值透传（不覆盖）；CodexMeta.TurnID
-//     静态值其次；否则每请求自动 UUIDv7（网关每请求即一轮，对齐真实
-//     "每轮新 sub_id"语义）；
+//   - 恒带 turn_id：CodexMeta.TurnID 静态值优先；否则每请求自动 UUIDv7
+//     （网关每请求即一轮，对齐真实"每轮新 sub_id"语义）；客户端自带 turn_id
+//     不参与透传；
 //   - 条件键（仅配置了才带）：x-openai-subagent / x-codex-parent-thread-id /
 //     parent_turn_id / x-codex-turn-metadata；
 //   - 不注入：traceparent/tracestate（HTTP 体面真实不带——trace 仅 WS
@@ -192,12 +192,13 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 //   - 不做 metaPassthrough / turn_metadata 回调（WS 帧面扩展——真实 HTTP
 //     client_metadata() 是静态键集）。
 //
-// 预筛短路：payload 已含 client_metadata 键 → 零注入原样返回（真实客户端
-// 自带完整 metadata 才自己组装——透传优先语义，缺键不补齐；bytes.Contains
-// memchr 级，免 ValidBytes 全量 JSON 扫描，常见场景注入成本归零；判据为
-// 带引号 token "client_metadata"——键名恒带引号，字符串值里的裸词不误判）。
-// 非法 JSON payload 放弃注入保持原样（对齐 responses.go:37 先例——sjson
-// SetBytes 对非法 JSON 静默产出损坏字节，须前置 gjson.ValidBytes）。
+// 整体替换：payload 顶层 client_metadata 由网关身份**整体重建**（单次
+// sjson.SetRawBytes）——codex 面客户端自带的 client_metadata **永不透传**，
+// 连同非网关键一并丢弃（网关身份恒为准）。实测整体替换优于逐键覆盖：逐键
+// N 次重序列化整份 body，整体替换 1 次（256KB 体 ~0.73ms/25 allocs →
+// ~0.29ms/32 allocs，内存 ~1.4MB → ~0.29MB）。非法 JSON payload 放弃注入
+// 保持原样（对齐 responses.go:37 先例——实测 sjson.SetRawBytes 对非法 JSON
+// 静默产出损坏字节（err=nil），故须前置 gjson.ValidBytes）。
 func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
 	payload = RewriteEnvironmentContextTime(payload, time.Now())
 	// codex 面客户端自带的 client_metadata **永不透传**：不做对象级短路、也不做
