@@ -2,8 +2,8 @@ package codexsdk
 
 import (
 	"crypto/rand"
-	"fmt"
 	"math/big"
+	"strconv"
 )
 
 // 身份轮换（网关伪装身份的“会话池”语义）：把 codex 的自动压缩规则搬过来，
@@ -66,7 +66,7 @@ func NewIdentityState(installationID string, p RotatePolicy) IdentityState {
 
 // WindowID 返回注入用的 window_id："{thread_id}:{window_n}"。
 func (s IdentityState) WindowID() string {
-	return fmt.Sprintf("%s:%d", s.ThreadID, s.WindowN)
+	return s.ThreadID + ":" + strconv.FormatUint(s.WindowN, 10)
 }
 
 // Session 返回注入用的会话标识（根线程语义：session_id == thread_id）。

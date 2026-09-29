@@ -80,7 +80,13 @@ func ResolvedContextWindow(slug string) int64 {
 // 全为 null，故实际等于 resolved × 9/10；上游若收紧该值会自动生效。
 func AutoCompactTokens(slug string) int64 {
 	l := ModelLimitsFor(slug)
-	contextLimit := ResolvedContextWindow(slug) * 9 / 10
+	// 就地算 resolved_context_window（context_window 优先，缺失回退
+	// max_context_window），省去 ResolvedContextWindow 的二次查表。
+	resolved := l.ContextWindow
+	if resolved <= 0 {
+		resolved = l.MaxContextWindow
+	}
+	contextLimit := resolved * 9 / 10
 	if l.AutoCompactTokenLimit != nil && *l.AutoCompactTokenLimit < contextLimit {
 		return *l.AutoCompactTokenLimit
 	}
