@@ -297,31 +297,37 @@ func randomBytes(n int) []byte {
 	return b
 }
 
-// hasClientMetadataKey 判断帧内 client_metadata 是否已含 key
-// （透传优先预检：帧内已有值时零生成直接透传）。
-func hasClientMetadataKey(frame []byte, key string) bool {
-	return gjson.GetBytes(frame, "client_metadata."+key).Exists()
-}
-
 // metadataEntry 是 client_metadata 注入项（key 值均由调用方/机制提供）。
 type metadataEntry struct {
 	key   string
 	value string
 }
 
-// injectClientMetadataKeys 把 entries 写入帧顶层 client_metadata（浅合并：
-// 帧内已存在的 key 不覆盖，只补充缺失；client_metadata 不存在时创建）。
-// 只动顶层 client_metadata key，其余字节零改动。返回帧（可能为新分配）。
+// injectClientMetadataKeys 把 entries 写入帧顶层 client_metadata（网关**覆盖**
+// 语义：注入项恒覆盖帧/请求体内已有同 key——codex 面客户端自带的 client_metadata
+// **永不透传**，伪装身份恒以网关值为准；client_metadata 不存在时创建）。entries
+// 为空时帧零改动。只动顶层 client_metadata key，其余字节零改动。返回帧（可能为
+// 新分配）。
 func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {
 	if len(entries) == 0 {
 		return frame
 	}
 	out := frame
-	for _, e := range entries {
+	for i, e := range entries {
 		if e.value == "" {
 			continue
 		}
-		if gjson.GetBytes(out, "client_metadata."+e.key).Exists() {
+		// 同一 key 只取 entries 内**首次**出现（entries 自身优先级：CodexMeta >
+		// WithSession > turn-state > WithClientMetadata > 自动机制）；对帧/请求体
+		// 则是覆盖写（网关值恒为准）。entries 规模恒小，O(n²) 判重避免每帧 map 分配。
+		dup := false
+		for j := 0; j < i; j++ {
+			if entries[j].key == e.key && entries[j].value != "" {
+				dup = true
+				break
+			}
+		}
+		if dup {
 			continue
 		}
 		next, err := sjson.SetBytes(out, "client_metadata."+e.key, e.value)

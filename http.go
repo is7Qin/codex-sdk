@@ -200,17 +200,10 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 // SetBytes 对非法 JSON 静默产出损坏字节，须前置 gjson.ValidBytes）。
 func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
 	payload = RewriteEnvironmentContextTime(payload, time.Now())
-	// 预筛短路：payload 已含 JSON 键 "client_metadata"（真实 codex 客户端
-	// 自带完整 metadata 的请求体）→ 透传优先语义，零注入直接返回（省掉
-	// ValidBytes 全量 JSON 扫描——常见场景注入成本归零）。判据为带引号
-	// token（JSON 键名恒带引号）：字符串值里的裸词不误判（评审 P2-2）。
-	// 判据局限（评审 P3-B'）：值恰为 "client_metadata" 的字符串值（如
-	// prompt 值）仍命中短路——概率低且无害：仅跳过注入、请求合法，
-	// 退化为缺 metadata 而非错误；假阴性（非标准写法）无害——走注入链
-	// 补全更完整。
-	if bytes.Contains(payload, []byte(`"client_metadata"`)) {
-		return payload
-	}
+	// codex 面客户端自带的 client_metadata **永不透传**：不做对象级短路、也不做
+	// 键级透传——下方 entries 由网关伪装身份构造，注入时覆盖请求体内已有同 key
+	//（injectClientMetadataKeys 覆盖语义）。非法 JSON 放弃注入、保持原样由上游
+	// 400 透传。
 	if !gjson.ValidBytes(payload) {
 		return payload
 	}
@@ -244,9 +237,9 @@ func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
 		appendEntry(codexMetaThreadKey, s.ThreadID)
 		appendEntry(codexMetaWindowKey, s.WindowID)
 	}
-	// turn_id 恒带：payload 已含 → injectClientMetadataKeys 不覆盖（透传）；
-	// 无静态值才自动 UUIDv7（对齐 WS 组装条件 client.go:560）。
-	if (c.opts.meta == nil || c.opts.meta.TurnID == "") && !hasClientMetadataKey(payload, codexMetaTurnKey) {
+	// turn_id 恒带且覆盖：无静态值 → 每请求自动 UUIDv7（客户端自带 turn_id
+	// 不参与透传——网关值恒为准，对齐 WS 组装条件）。
+	if c.opts.meta == nil || c.opts.meta.TurnID == "" {
 		appendEntry(codexMetaTurnKey, NewUUIDv7())
 	}
 	return injectClientMetadataKeys(payload, entries)

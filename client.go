@@ -429,9 +429,10 @@ func (c *Client) Send(ctx context.Context, frame []byte) error {
 }
 
 // prepareFrame 应用伪装层：白名单过滤 + client_metadata 组装。
-// 优先级：帧内已存在 > CodexMeta 静态值 > WithSession > turn-state 回传 >
-// WithClientMetadata 透传 > 自动机制（turn_id / trace）> turn_metadata 回调。
-// 全部禁用时零拷贝零分配原样返回。
+// 优先级：CodexMeta 静态值 > WithSession > turn-state 回传 > WithClientMetadata
+// 透传 > 自动机制（turn_id / trace）> turn_metadata 回调；注入**恒覆盖**帧内已有
+// 同 key——codex 面客户端自带的 client_metadata 永不透传。全部禁用时零拷贝零
+// 分配原样返回。
 func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 	frame = RewriteEnvironmentContextTime(frame, time.Now())
 	if c.filtering {
@@ -475,25 +476,23 @@ func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 	if ts := c.TurnState(); ts != "" {
 		appendEntry(codexMetaTurnStateKey, ts)
 	}
-	// 调用方透传键（WithClientMetadata）：只透传不解析，帧内已有同 key 不覆盖
-	// （注入顺序在自动机制之前，同 key 不会覆盖静态/会话值）。
+	// 调用方透传键（WithClientMetadata）：只透传不解析，恒覆盖帧内已有同 key
+	//（网关值为准——注入顺序在自动机制之前，同 key 由网关决定）。
 	for _, e := range c.metaPassthrough {
 		appendEntry(e.key, e.value)
 	}
-	// turn_id 透传优先：帧内已有 client_metadata.turn_id 时原值透传（零生成——
-	// turn_id 有身份语义，透传保持 turn 链一致；常态路径省掉每帧 UUIDv7 生成）；
-	// 无则自动生成 UUIDv7 兜底（CodexMeta.TurnID 静态值优先）。
-	// 与 turn 计数联动不变：计数仍每帧自增，仅 id 值优先透传。
-	if c.turnAuto && (c.meta == nil || c.meta.TurnID == "") && !hasClientMetadataKey(frame, codexMetaTurnKey) {
+	// turn_id 恒带且覆盖：帧内已有 client_metadata.turn_id 不参与透传——
+	// 无静态值时每帧自动生成 UUIDv7（CodexMeta.TurnID 静态值优先），网关值恒为准。
+	if c.turnAuto && (c.meta == nil || c.meta.TurnID == "") {
 		appendEntry(codexMetaTurnKey, NewUUIDv7())
 	}
 	// 每帧 trace：外部 WithTraceContext 静态值优先，否则每帧自动生成
-	// （真实客户端每请求新 span，同轮多请求 traceparent 不同；
-	// 帧内已有 traceparent 时同样透传零生成）。
+	// （真实客户端每请求新 span，同轮多请求 traceparent 不同；帧内已有
+	// traceparent 不参与透传，网关值恒为准）。
 	if c.trace != nil {
 		appendEntry(codexMetaTraceparentKey, c.trace.Traceparent)
 		appendEntry(codexMetaTracestateKey, c.trace.Tracestate)
-	} else if c.traceAuto && !hasClientMetadataKey(frame, codexMetaTraceparentKey) {
+	} else if c.traceAuto {
 		tc := NewTraceContext()
 		appendEntry(codexMetaTraceparentKey, tc.Traceparent)
 		appendEntry(codexMetaTracestateKey, tc.Tracestate)

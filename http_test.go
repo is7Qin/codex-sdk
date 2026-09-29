@@ -480,11 +480,10 @@ func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
 	}
 }
 
-// TestHTTPStreamClientMetadataPassthrough：payload 已含 client_metadata →
-// 预筛短路零注入（透传优先语义——真实客户端自带完整 metadata，注入仅面向
-// 无 client_metadata 的组装请求体）：整包逐字节原样上送，不补键不覆盖
-// （CodexMeta 配置不生效）。
-func TestHTTPStreamClientMetadataPassthrough(t *testing.T) {
+// TestHTTPStreamClientMetadataOverride：payload 已含 client_metadata → 网关仍
+// 注入并**覆盖**同 key（codex 面客户端自带的 client_metadata 永不透传）；
+// CodexMeta 值恒为准，缺失键补齐。
+func TestHTTPStreamClientMetadataOverride(t *testing.T) {
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBody, _ = io.ReadAll(r.Body)
@@ -501,21 +500,24 @@ func TestHTTPStreamClientMetadataPassthrough(t *testing.T) {
 	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	// 预筛短路：整包零注入原样透传（含 client_metadata 即免注入，逐字节一致）
-	if !bytes.Equal(gotBody, payload) {
-		t.Fatalf("含 client_metadata 的 payload 应零注入原样上送（透传零改动）\n got: %s\nwant: %s", gotBody, payload)
+	// 覆盖：payload 内 turn_id/subagent 被 CodexMeta 值覆盖；缺失键补齐。
+	if got := gjson.GetBytes(gotBody, "client_metadata.turn_id").String(); got != "meta-turn" {
+		t.Fatalf("turn_id 应被网关覆盖为 meta-turn, got %q: %s", got, gotBody)
 	}
-	// 缺 key 不补（评审 P3-D'）：payload 含 metadata 但缺 x-codex-installation-id
-	// → 不补齐（透传优先语义——即使 CodexMeta 已配置）
-	if gjson.GetBytes(gotBody, "client_metadata.x-codex-installation-id").Exists() {
-		t.Fatalf("缺键不应补齐 x-codex-installation-id: %s", gotBody)
+	if got := gjson.GetBytes(gotBody, "client_metadata.x-openai-subagent").String(); got != "meta-sub" {
+		t.Fatalf("subagent 应被网关覆盖为 meta-sub, got %q: %s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "client_metadata.x-codex-installation-id").String(); got != "inst-1" {
+		t.Fatalf("缺失键应补齐 inst-1, got %q: %s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "m" {
+		t.Fatalf("model 应保留, got %q", got)
 	}
 }
 
-// TestHTTPStreamClientMetadataQuotedValueEdge：判据边界（评审 P3-D'）——
-// 字符串值恰为 "client_metadata"（JSON 值恒带引号，与键 token 不可区分）→
-// 命中短路：零注入原样上送、不报错（仅跳过注入、请求合法——退化为缺
-// metadata 而非错误）。
+// TestHTTPStreamClientMetadataQuotedValueEdge：值恰为键名的字符串（如
+// prompt="client_metadata"）不再触发任何短路——注入照常执行（原对象级短路已
+// 移除）：prompt 值原样保留、client_metadata 正常注入。
 func TestHTTPStreamClientMetadataQuotedValueEdge(t *testing.T) {
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -532,8 +534,11 @@ func TestHTTPStreamClientMetadataQuotedValueEdge(t *testing.T) {
 	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if !bytes.Equal(gotBody, payload) {
-		t.Fatalf("值恰为键名的字符串应短路零注入原样上送（不报错）\n got: %s\nwant: %s", gotBody, payload)
+	if got := gjson.GetBytes(gotBody, "prompt").String(); got != "client_metadata" {
+		t.Fatalf("prompt 值应原样保留, got %q: %s", got, gotBody)
+	}
+	if v := gjson.GetBytes(gotBody, "client_metadata.turn_id").String(); !uuidv7Re.MatchString(v) {
+		t.Fatalf("注入应照常执行（自动 turn_id UUIDv7）, got client_metadata=%s", gjson.GetBytes(gotBody, "client_metadata").Raw)
 	}
 }
 
