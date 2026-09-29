@@ -464,7 +464,7 @@ func hexDigit(b byte) byte {
 // （单遍 sjson.SetRawBytes——protoconv 字节级拼接同款：只做一次改写真）：
 // codex 面客户端自带的 client_metadata **永不透传**（连同非网关键一并丢弃，网关
 // 身份恒为准）。整体替换实测优于逐键覆盖（逐键 N 次重序列化整份 body，整体替换
-// 1 次；256KB 体 ~0.73ms/25 allocs → ~0.29ms/32 allocs，内存 ~1.4MB → ~0.29MB）。
+// 1 次；256KB 体 ~0.73ms/25 allocs → ~0.29ms/11 allocs，内存 ~1.4MB → ~0.29MB）。
 // entries 无有效项 → 帧
 // 零改动返回。
 func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {

@@ -412,7 +412,7 @@ func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 // TestHTTPStreamClientMetadataFullKeys：配置 CodexMeta（全键）+ WithSession
 // （不同值）→ 恒 4 key + turn_id（meta 静态值优先于自动生成）+ 条件键全带
 // （subagent/parent-thread-id/parent_turn_id/turn-metadata）；meta 与 session
-// 同 key 时 meta 优先（对齐 WS 组装优先级 client.go:522-578）。不注入 trace
+// 同 key 时 meta 优先（对齐 WS 组装优先级 client.go prepareFrame）。不注入 trace
 // 与 turn-state 键（HTTP 体面真实不带）。
 func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
 	var gotBody []byte
@@ -583,7 +583,7 @@ func TestHTTPStreamClientMetadataSessionFallback(t *testing.T) {
 }
 
 // TestHTTPStreamClientMetadataInvalidJSON：非法 JSON payload → 放弃注入保持
-// 原样（对齐 responses.go:37 先例）→ 上游 400 原样透传。
+// 原样（对齐 responses.go Responses() 的 gjson.ValidBytes 前置校验先例）→ 上游 400 原样透传。
 func TestHTTPStreamClientMetadataInvalidJSON(t *testing.T) {
 	errorBody := []byte(`{"error":{"code":"invalid_request","message":"bad json"}}`)
 	var gotBody []byte

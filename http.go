@@ -181,7 +181,7 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 // turn_id 恒带）：
 //   - 恒 4 key：x-codex-installation-id / session_id / thread_id /
 //     x-codex-window-id（CodexMeta 与 WithSession 同 key 时 CodexMeta 优先
-//     ——对齐 WS 组装优先级 client.go:522-578；空值跳过）；
+//     ——对齐 WS 组装优先级（client.go prepareFrame；空值跳过）；
 //   - 恒带 turn_id：CodexMeta.TurnID 静态值优先；否则每请求自动 UUIDv7
 //     （网关每请求即一轮，对齐真实"每轮新 sub_id"语义）；客户端自带 turn_id
 //     不参与透传；
@@ -196,9 +196,10 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 // sjson.SetRawBytes）——codex 面客户端自带的 client_metadata **永不透传**，
 // 连同非网关键一并丢弃（网关身份恒为准）。实测整体替换优于逐键覆盖：逐键
 // N 次重序列化整份 body，整体替换 1 次（256KB 体 ~0.73ms/25 allocs →
-// ~0.29ms/32 allocs，内存 ~1.4MB → ~0.29MB）。非法 JSON payload 放弃注入
-// 保持原样（对齐 responses.go:37 先例——实测 sjson.SetRawBytes 对非法 JSON
-// 静默产出损坏字节（err=nil），故须前置 gjson.ValidBytes）。
+// ~0.29ms/11 allocs，内存 ~1.4MB → ~0.29MB）。非法 JSON payload 放弃注入
+// 保持原样（对齐 responses.go Responses() 的 gjson.ValidBytes 前置校验先例——
+// 实测 sjson.SetRawBytes 对非法 JSON 静默产出损坏字节（err=nil），故须前置
+// gjson.ValidBytes）。
 func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
 	payload = RewriteEnvironmentContextTime(payload, time.Now())
 	// codex 面客户端自带的 client_metadata **永不透传**：不做对象级短路、也不做

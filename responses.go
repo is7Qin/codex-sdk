@@ -100,8 +100,7 @@ func (a *responsesAggregator) feed(raw []byte) error {
 	return nil
 }
 
-// failedError 把 response.failed 事件合成为错误（Raw=事件 error 字段 JSON，
-// error 字段缺失时兜底整个事件 JSON）。
+// responseUsage 返回事件内 response.usage 的原始 JSON（缺失或显式 null → nil）。
 func responseUsage(raw []byte) json.RawMessage {
 	usage := gjson.GetBytes(raw, "response.usage")
 	if usage.Exists() && usage.Type != gjson.Null {
@@ -110,6 +109,8 @@ func responseUsage(raw []byte) json.RawMessage {
 	return nil
 }
 
+// failedError 把 response.failed 事件合成为错误（Raw=事件 error 字段 JSON，
+// error 字段缺失时兜底整个事件 JSON）。
 func (a *responsesAggregator) failedError(raw []byte) error {
 	rawErr := raw
 	if e := gjson.GetBytes(raw, "error"); e.Exists() {

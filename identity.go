@@ -37,8 +37,8 @@ type RotatePolicy struct {
 	Scope CompactScope
 }
 
-// IdentityState 是一个槽位的身份状态。可整体拷贝/序列化，用于跨实例借用时的
-// 快照传递（网关侧持有，SDK 不落任何存储）。
+// IdentityState 是一个槽位的身份状态。纯值类型（可整体拷贝），由网关侧持有，
+// SDK 不落任何存储。
 type IdentityState struct {
 	InstallationID string // 账号级永久
 	ThreadID       string // 当前线程（UUIDv7）
