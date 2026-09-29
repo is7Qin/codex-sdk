@@ -442,64 +442,47 @@ func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	// 惰性组装 entries：无任何注入时零分配。
-	var entries []metadataEntry
-	appendEntry := func(key, value string) {
-		if value == "" {
-			return
-		}
-		if entries == nil {
-			entries = make([]metadataEntry, 0, 8)
-		}
-		entries = append(entries, metadataEntry{key, value})
-	}
+	// 惰性组装 entries（与 HTTP 面共用 metaEntries 累积器与键序）：无任何
+	// 注入时零分配。
+	var entries metaEntries
+	entries.addCodexMetaIdentity(c.meta)
 	if m := c.meta; m != nil {
-		appendEntry(codexMetaInstallationKey, m.InstallationID)
-		appendEntry(codexMetaSessionKey, m.SessionID)
-		appendEntry(codexMetaThreadKey, m.ThreadID)
-		appendEntry(codexMetaTurnKey, m.TurnID)
-		appendEntry(codexMetaWindowKey, m.WindowID)
-		appendEntry(codexMetaSubagentKey, m.Subagent)
-		appendEntry(codexMetaTurnMetadataKey, m.TurnMetadata)
-		appendEntry(codexMetaTraceparentKey, m.Traceparent)
-		appendEntry(codexMetaTracestateKey, m.Tracestate)
+		entries.add(codexMetaTurnMetadataKey, m.TurnMetadata)
+		entries.add(codexMetaTraceparentKey, m.Traceparent)
+		entries.add(codexMetaTracestateKey, m.Tracestate)
 	}
-	if s := c.session; s != nil {
-		appendEntry(codexMetaSessionKey, s.SessionID)
-		appendEntry(codexMetaThreadKey, s.ThreadID)
-		appendEntry(codexMetaWindowKey, s.WindowID)
-	}
+	entries.addSessionIdentity(c.session)
 	// turn-state 回传（TurnState 非空时帧 metadata 恒带）：真实 codex WS
 	// 发送路径显式追加注入（client.rs:1626-1631，帧体携带 :1702-1711），与
 	// HTTP 头面（client.rs:1202）构成双面机制——此注入与真实逐点一致，勿删
 	// （完整实证见 doc.go"上游协议与参考"）。
 	if ts := c.TurnState(); ts != "" {
-		appendEntry(codexMetaTurnStateKey, ts)
+		entries.add(codexMetaTurnStateKey, ts)
 	}
 	// 调用方透传键（WithClientMetadata）：只透传不解析，恒覆盖帧内已有同 key
 	//（网关值为准——注入顺序在自动机制之前，同 key 由网关决定）。
 	for _, e := range c.metaPassthrough {
-		appendEntry(e.key, e.value)
+		entries.add(e.key, e.value)
 	}
 	// turn_id 恒带且覆盖：帧内已有 client_metadata.turn_id 不参与透传——
 	// 无静态值时每帧自动生成 UUIDv7（CodexMeta.TurnID 静态值优先），网关值恒为准。
 	if c.turnAuto && (c.meta == nil || c.meta.TurnID == "") {
-		appendEntry(codexMetaTurnKey, NewUUIDv7())
+		entries.add(codexMetaTurnKey, NewUUIDv7())
 	}
 	// 每帧 trace：外部 WithTraceContext 静态值优先，否则每帧自动生成
 	// （真实客户端每请求新 span，同轮多请求 traceparent 不同；帧内已有
 	// traceparent 不参与透传，网关值恒为准）。
 	if c.trace != nil {
-		appendEntry(codexMetaTraceparentKey, c.trace.Traceparent)
-		appendEntry(codexMetaTracestateKey, c.trace.Tracestate)
+		entries.add(codexMetaTraceparentKey, c.trace.Traceparent)
+		entries.add(codexMetaTracestateKey, c.trace.Tracestate)
 	} else if c.traceAuto {
 		tc := NewTraceContext()
-		appendEntry(codexMetaTraceparentKey, tc.Traceparent)
-		appendEntry(codexMetaTracestateKey, tc.Tracestate)
+		entries.add(codexMetaTraceparentKey, tc.Traceparent)
+		entries.add(codexMetaTracestateKey, tc.Tracestate)
 	}
 	if c.turnProvider != nil {
 		turn := c.turn.Add(1)
-		appendEntry(codexMetaTurnMetadataKey, c.turnProvider(turn))
+		entries.add(codexMetaTurnMetadataKey, c.turnProvider(turn))
 	}
 	return injectClientMetadataKeys(frame, entries), nil
 }

@@ -208,40 +208,22 @@ func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
 	if !gjson.ValidBytes(payload) {
 		return payload
 	}
-	// 惰性组装 entries（同 WS prepareFrame 键序与优先级）；零配置时仍带
-	// turn_id（真实恒发）。
-	var entries []metadataEntry
-	appendEntry := func(key, value string) {
-		if value == "" {
-			return
-		}
-		if entries == nil {
-			entries = make([]metadataEntry, 0, 8)
-		}
-		entries = append(entries, metadataEntry{key, value})
-	}
+	// 惰性组装 entries（与 WS prepareFrame 共用 metaEntries 累积器与键序，
+	// 面特有键各自补充）；零配置时仍带 turn_id（真实恒发）。
+	var entries metaEntries
+	entries.addCodexMetaIdentity(c.opts.meta)
 	if m := c.opts.meta; m != nil {
-		appendEntry(codexMetaInstallationKey, m.InstallationID)
-		appendEntry(codexMetaSessionKey, m.SessionID)
-		appendEntry(codexMetaThreadKey, m.ThreadID)
-		appendEntry(codexMetaTurnKey, m.TurnID)
-		appendEntry(codexMetaWindowKey, m.WindowID)
-		appendEntry(codexMetaSubagentKey, m.Subagent)
-		appendEntry(codexMetaParentThreadKey, m.ParentThreadID)
-		appendEntry(codexMetaParentTurnKey, m.ParentTurnID)
-		appendEntry(codexMetaTurnMetadataKey, m.TurnMetadata)
+		entries.add(codexMetaParentThreadKey, m.ParentThreadID)
+		entries.add(codexMetaParentTurnKey, m.ParentTurnID)
+		entries.add(codexMetaTurnMetadataKey, m.TurnMetadata)
 		// 注意：HTTP 体面不含 trace 键（真实 client_metadata() 无
 		// ws_request_header_trace* 注入——trace 仅 WS 帧面扩展）。
 	}
-	if s := c.opts.session; s != nil {
-		appendEntry(codexMetaSessionKey, s.SessionID)
-		appendEntry(codexMetaThreadKey, s.ThreadID)
-		appendEntry(codexMetaWindowKey, s.WindowID)
-	}
+	entries.addSessionIdentity(c.opts.session)
 	// turn_id 恒带且覆盖：无静态值 → 每请求自动 UUIDv7（客户端自带 turn_id
 	// 不参与透传——网关值恒为准，对齐 WS 组装条件）。
 	if c.opts.meta == nil || c.opts.meta.TurnID == "" {
-		appendEntry(codexMetaTurnKey, NewUUIDv7())
+		entries.add(codexMetaTurnKey, NewUUIDv7())
 	}
 	return injectClientMetadataKeys(payload, entries)
 }
