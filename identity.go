@@ -16,10 +16,6 @@ import (
 // 依据（openai/codex c248f6d48）：window_id = "{thread_id}:{window_number}"，
 // window_number 是“上下文窗口被填满过几次”（core/src/session/mod.rs current_window）。
 // codex 本身没有“线程退休”；WMax 是本 SDK 为伪装身份合成的策略。
-//
-// 注：旧实现按观测 token 水位（θ_w 上升沿 + 回落到 θ_w 以下重新武装）推进；该口径在
-// 「一条槽被多个 vibe 用户交替复用」时按同槽 in-band 用户数近似倍率放大（window 虚高
-// → 线程早退），已废弃，改为与 token 完全解耦的轮次驱动。
 const (
 	spanLo = 48 // 每窗口最少轮数
 	spanHi = 96 // 每窗口最多轮数

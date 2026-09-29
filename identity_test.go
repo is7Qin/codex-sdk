@@ -39,13 +39,18 @@ func TestNewIdentityState(t *testing.T) {
 // TestWindowSpanRangeAndIrregular：确定性纯函数、落 [spanLo,spanHi]、边界不等间隔。
 func TestWindowSpanRangeAndIrregular(t *testing.T) {
 	const tid = "0193-fixed-tid-for-span"
+	// pin 该固定 tid 下 i=0..15 的具体期望值序列（防止 FNV 派生口径被无声改动）。
+	want := []uint64{70, 72, 62, 66, 84, 88, 76, 80, 51, 53, 92, 96, 65, 69, 57, 61}
 	min, max := uint64(1<<63), uint64(0)
-	for i := uint64(0); i < 16; i++ {
-		got := windowSpan(tid, i)
+	for i, w := range want {
+		got := windowSpan(tid, uint64(i))
+		if got != w {
+			t.Fatalf("windowSpan(%q,%d) = %d, want %d", tid, i, got, w)
+		}
 		if got < spanLo || got > spanHi {
 			t.Fatalf("windowSpan(%q,%d) = %d, want ∈[%d,%d]", tid, i, got, spanLo, spanHi)
 		}
-		if again := windowSpan(tid, i); again != got {
+		if again := windowSpan(tid, uint64(i)); again != got {
 			t.Fatalf("windowSpan 非纯函数：%d vs %d", got, again)
 		}
 		if got < min {
