@@ -10,6 +10,7 @@ import (
 	"time"
 
 	coderws "github.com/coder/websocket"
+	"github.com/tidwall/gjson"
 )
 
 // 传输常量（对齐参考实现 sub2api openai_ws_*）。
@@ -441,6 +442,11 @@ func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	// 非法 JSON 放弃注入、帧原样返回（对齐 HTTP 面 injectResponsesClientMetadata
+	// 前置守卫——实测 sjson.SetRawBytes 对非法 JSON 静默产出损坏字节且 err=nil）。
+	if !gjson.ValidBytes(frame) {
+		return frame, nil
 	}
 	// 惰性组装 entries（与 HTTP 面共用 metaEntries 累积器与键序）：无任何
 	// 注入时零分配。
