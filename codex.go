@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -306,8 +306,9 @@ type metadataEntry struct {
 
 // clientMetadataObject 组装 client_metadata 对象字节：entries 按**首次出现**去重
 // （entries 自身优先级：CodexMeta > WithSession > turn-state > WithClientMetadata >
-// 自动机制）、空值跳过；值经 encoding/json 转义（与 sjson 逐字节一致）。无有效
-// entry → nil（调用方不动帧）。
+// 自动机制）、空值跳过。键/值按 encoding/json 规则转义（含 `<`/`>`/`&` 的 HTML
+// 转义 \u003c/\u003e/\u0026 与 U+2028/U+2029——与 sjson 对已有字节的原样直写
+// 不同）。无有效 entry → nil（调用方不动帧）。
 func clientMetadataObject(entries []metadataEntry) []byte {
 	if len(entries) == 0 {
 		return nil
@@ -329,26 +330,90 @@ func clientMetadataObject(entries []metadataEntry) []byte {
 		if dup {
 			continue
 		}
-		k, err := json.Marshal(e.key)
-		if err != nil {
-			continue
-		}
-		v, err := json.Marshal(e.value)
-		if err != nil {
-			continue
-		}
 		if !first {
 			buf = append(buf, ',')
 		}
 		first = false
-		buf = append(buf, k...)
+		buf = appendJSONString(buf, e.key)
 		buf = append(buf, ':')
-		buf = append(buf, v...)
+		buf = appendJSONString(buf, e.value)
 	}
 	if first {
 		return nil
 	}
 	return append(buf, '}')
+}
+
+// appendJSONString 按 encoding/json 规则把 s 作为 JSON 字符串追加到 out，
+// 与 json.Marshal(string) 逐字节一致：`"`/`\` 与 \n\r\t\b\f 快捷转义、其余
+// 控制字符 \u00XX、HTML 敏感字符 & < > → \u0026/\u003c/\u003e、行分隔符
+// U+2028/U+2029 → \uXXXX、非法 UTF-8 字节 → \ufffd。相对 json.Marshal 省去
+// 每个键/值一次 []byte 分配（键多为常量、值为 UUID/ASCII，通常走零转义快路径）。
+func appendJSONString(out []byte, s string) []byte {
+	out = append(out, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < utf8.RuneSelf {
+			if c != '"' && c != '\\' && c >= 0x20 && c != '&' && c != '<' && c != '>' {
+				i++
+				continue
+			}
+			out = append(out, s[start:i]...)
+			switch c {
+			case '"':
+				out = append(out, '\\', '"')
+			case '\\':
+				out = append(out, '\\', '\\')
+			case '\n':
+				out = append(out, '\\', 'n')
+			case '\r':
+				out = append(out, '\\', 'r')
+			case '\t':
+				out = append(out, '\\', 't')
+			case '\b':
+				out = append(out, '\\', 'b')
+			case '\f':
+				out = append(out, '\\', 'f')
+			case '&':
+				out = append(out, '\\', 'u', '0', '0', '2', '6')
+			case '<':
+				out = append(out, '\\', 'u', '0', '0', '3', 'c')
+			case '>':
+				out = append(out, '\\', 'u', '0', '0', '3', 'e')
+			default: // c < 0x20
+				out = append(out, '\\', 'u', '0', '0', hexDigit(c>>4), hexDigit(c&0xf))
+			}
+			i++
+			start = i
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			out = append(out, s[start:i]...)
+			out = append(out, '\\', 'u', 'f', 'f', 'f', 'd')
+			i++
+			start = i
+			continue
+		}
+		if r == '\u2028' || r == '\u2029' {
+			out = append(out, s[start:i]...)
+			out = append(out, '\\', 'u', '2', '0', '2', hexDigit(byte(r)&0xf))
+			i += size
+			start = i
+			continue
+		}
+		i += size
+	}
+	out = append(out, s[start:]...)
+	return append(out, '"')
+}
+
+func hexDigit(b byte) byte {
+	if b < 10 {
+		return '0' + b
+	}
+	return 'a' + b - 10
 }
 
 // injectClientMetadataKeys 用网关身份**整体替换**帧/请求体顶层 client_metadata
