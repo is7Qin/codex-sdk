@@ -2,29 +2,27 @@ package codexsdk
 
 import (
 	"crypto/rand"
+	"encoding/binary"
+	"hash/fnv"
 	"math/big"
 	"strconv"
 )
 
-// 身份轮换（网关伪装身份的“会话池”语义）：把 codex 的自动压缩规则搬过来，
-// 用观测到的上下文水位驱动 thread_id / window_id 的演化。
+// 身份轮换（网关伪装身份的“会话池”语义）：每槽一个 thread_id，window_id =
+// "{thread_id}:{n}"。窗口推进由**本槽已服务的完成轮数**驱动（与观测 token 解耦）：
+// 每完成一轮 Turns++；跨过本窗口阈值 → window_number +1，阈值按随机 span ∈ [spanLo,
+// spanHi] 递进（窗口边界不等间隔）。本线程窗口数达 WMax → 退休换新线程。
 //
-// 依据（openai/codex c248f6d48）：
-//   - window_id = "{thread_id}:{window_number}"，window_number 是“上下文窗口被
-//     填满过几次”（core/src/session/mod.rs current_window）。
-//   - codex 默认口径 AutoCompactTokenLimitScope::Total：用最近一轮的
-//     total_tokens 水位直接比 θ_w（protocol/src/config_types.rs 默认 Total）。
-//   - θ_w = min(auto_compact_token_limit, resolved_context_window × 9/10)。
-//   - codex 本身没有“线程退休”；WMax 是本 SDK 为伪装身份合成的策略。
-
-// CompactScope 对应 codex AutoCompactTokenLimitScope。
-type CompactScope int
-
+// 依据（openai/codex c248f6d48）：window_id = "{thread_id}:{window_number}"，
+// window_number 是“上下文窗口被填满过几次”（core/src/session/mod.rs current_window）。
+// codex 本身没有“线程退休”；WMax 是本 SDK 为伪装身份合成的策略。
+//
+// 注：旧实现按观测 token 水位（θ_w 上升沿 + 回落到 θ_w 以下重新武装）推进；该口径在
+// 「一条槽被多个 vibe 用户交替复用」时按同槽 in-band 用户数近似倍率放大（window 虚高
+// → 线程早退），已废弃，改为与 token 完全解耦的轮次驱动。
 const (
-	// ScopeTotal 用最近一轮的 total_tokens 水位直接比 θ_w（codex 默认口径）。
-	ScopeTotal CompactScope = iota
-	// ScopeBodyAfterPrefix 只计入“窗口起点之后增长的部分”（θ_w 不变）。
-	ScopeBodyAfterPrefix
+	spanLo = 48 // 每窗口最少轮数
+	spanHi = 96 // 每窗口最多轮数
 )
 
 // RotatePolicy 是轮换策略（网关侧参数；SDK 负责按它抽样与演进）。
@@ -33,33 +31,46 @@ type RotatePolicy struct {
 	// WMaxHi == 0 表示不退休（WMax 恒 0，线程不换）。
 	WMaxLo uint64
 	WMaxHi uint64
-	// Scope 决定用哪种口径比 θ_w；零值 = ScopeTotal。
-	Scope CompactScope
+}
+
+// DefaultRotatePolicy 是默认轮换策略：每线程活 16–48 个窗口。
+func DefaultRotatePolicy() RotatePolicy {
+	return RotatePolicy{WMaxLo: 16, WMaxHi: 48}
+}
+
+// windowSpan 由 (ThreadID, 窗口序号) 确定性派生该窗口的轮数跨度 ∈ [spanLo, spanHi]。
+// 纯函数、无 RNG、无全局态 → Step 对给定状态确定可测；对外表现为窗口边界不等间隔。
+func windowSpan(threadID string, windowIndex uint64) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(threadID))
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], windowIndex)
+	_, _ = h.Write(b[:])
+	return spanLo + h.Sum64()%(spanHi-spanLo+1)
 }
 
 // IdentityState 是一个槽位的身份状态。纯值类型（可整体拷贝），由网关侧持有，
-// SDK 不落任何存储。
+// SDK 不落任何存储。Step 是唯一变更入口。
 type IdentityState struct {
 	InstallationID string // 账号级永久
 	ThreadID       string // 当前线程（UUIDv7）
-	WindowN        uint64 // window_id 后缀
-	// Baseline 仅 ScopeBodyAfterPrefix 用：本窗口起点水位；-1 = 未初始化。
-	Baseline int64
-	// Armed 仅 ScopeTotal 用：水位已回落到 θ_w 以下、可再次触发边沿。
-	Armed bool
-	// WMax 本线程的窗口数上限（0 = 不退休）。
-	WMax uint64
+	Turns          uint64 // 已服务完成轮数——唯一驱动量
+	WindowN        uint64 // 当前 window_number
+	// NextWindowAt 下一个窗口递增的 Turns 阈值（= Σ_{i=0..WindowN} windowSpan(ThreadID,i)）。
+	NextWindowAt uint64
+	WMax         uint64 // 本线程窗口数上限（0 = 不退休）
 }
 
-// NewIdentityState 开一个新线程：新 thread_id、WindowN=0、Armed=true、按策略
-// 抽 WMax。
+// NewIdentityState 开一个新线程：新 thread_id、Turns=0、WindowN=0、下一个窗口阈值按
+// windowSpan(thread_id,0) 起算、按策略抽 WMax。
 func NewIdentityState(installationID string, p RotatePolicy) IdentityState {
+	tid := NewUUIDv7()
 	return IdentityState{
 		InstallationID: installationID,
-		ThreadID:       NewUUIDv7(),
+		ThreadID:       tid,
+		Turns:          0,
 		WindowN:        0,
-		Baseline:       -1,
-		Armed:          true,
+		NextWindowAt:   windowSpan(tid, 0),
 		WMax:           drawWMax(p),
 	}
 }
@@ -74,37 +85,18 @@ func (s IdentityState) Session() Session {
 	return Session{SessionID: s.ThreadID, ThreadID: s.ThreadID, WindowID: s.WindowID()}
 }
 
-// Step 用一次观测（该响应的 total_tokens）推进身份状态，返回新状态。
+// Step 推进一个完成轮：Turns++；跨过本窗口阈值 → WindowN++ 并叠加下一个随机 span；
+// window_number 达 WMax（且 WMax>0）→ 退休换新线程。
 //
-//	ScopeTotal：水位跨过 θ_w 的上升沿 → WindowN++（持续高位不重复计数；回落
-//	            到 θ_w 以下后重新武装）。
-//	ScopeBodyAfterPrefix：先记 baseline；之后 (observed - baseline) ≥ θ_w 时
-//	            WindowN++ 并把 baseline 前移。
-//	两种口径下：WindowN ≥ WMax（且 WMax>0）→ 退休换新线程。
-//
-// slug 未知 → 用 fallback 模型的 θ_w。
-func Step(s IdentityState, observedTotalTokens int64, slug string, p RotatePolicy) IdentityState {
+// 仅接受 NewIdentityState / 前次 Step 产出的状态（保证 NextWindowAt-Turns ≥ spanLo）。
+func Step(s IdentityState, p RotatePolicy) IdentityState {
 	if s.ThreadID == "" {
 		s = NewIdentityState(s.InstallationID, p)
 	}
-	limit := AutoCompactTokens(slug)
-	switch p.Scope {
-	case ScopeBodyAfterPrefix:
-		if s.Baseline < 0 {
-			s.Baseline = observedTotalTokens
-		} else if observedTotalTokens-s.Baseline >= limit {
-			s.WindowN++
-			s.Baseline = observedTotalTokens
-		}
-	default:
-		if observedTotalTokens >= limit {
-			if s.Armed {
-				s.WindowN++
-				s.Armed = false
-			}
-		} else {
-			s.Armed = true
-		}
+	s.Turns++
+	if s.Turns >= s.NextWindowAt {
+		s.WindowN++
+		s.NextWindowAt += windowSpan(s.ThreadID, s.WindowN)
 	}
 	if s.WMax > 0 && s.WindowN >= s.WMax {
 		s = NewIdentityState(s.InstallationID, p)

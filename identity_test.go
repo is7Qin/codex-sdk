@@ -2,192 +2,168 @@ package codexsdk
 
 import "testing"
 
-// TestIdentityWindowIDAndSession：window_id = "{thread_id}:{n}"，session 语义为
-// 根线程（session_id == thread_id == 当前线程）。
-func TestIdentityWindowIDAndSession(t *testing.T) {
+// TestWindowIDDerivesWindowN：window_id = "{thread_id}:{window_n}"，Session 同步。
+func TestWindowIDDerivesWindowN(t *testing.T) {
 	s := IdentityState{ThreadID: "0193-tid", WindowN: 3}
 	if got := s.WindowID(); got != "0193-tid:3" {
-		t.Fatalf("WindowID = %q, want %q", got, "0193-tid:3")
+		t.Fatalf("WindowID() = %q, want %q", got, "0193-tid:3")
 	}
-	sess := s.Session()
-	if sess.SessionID != "0193-tid" || sess.ThreadID != "0193-tid" || sess.WindowID != "0193-tid:3" {
-		t.Fatalf("Session = %+v, want session=thread=tid, window=tid:3", sess)
+	if got := s.Session().WindowID; got != "0193-tid:3" {
+		t.Fatalf("Session().WindowID = %q, want %q", got, "0193-tid:3")
 	}
 }
 
-// TestNewIdentityState：开新线程的初始不变量（新 UUIDv7 / n=0 / Armed / baseline
-// 未初始化 / WMax 落在策略区间）。
+// TestNewIdentityState：开新线程的初值。
 func TestNewIdentityState(t *testing.T) {
 	s := NewIdentityState("inst-1", RotatePolicy{WMaxLo: 3, WMaxHi: 5})
 	if s.InstallationID != "inst-1" {
-		t.Fatalf("InstallationID = %q", s.InstallationID)
+		t.Fatalf("InstallationID = %q, want %q", s.InstallationID, "inst-1")
 	}
 	if s.ThreadID == "" {
 		t.Fatal("ThreadID 不应为空")
 	}
+	if s.Turns != 0 {
+		t.Fatalf("Turns = %d, want 0", s.Turns)
+	}
 	if s.WindowN != 0 {
 		t.Fatalf("WindowN = %d, want 0", s.WindowN)
 	}
-	if !s.Armed {
-		t.Fatal("新线程应 Armed")
-	}
-	if s.Baseline != -1 {
-		t.Fatalf("Baseline = %d, want -1", s.Baseline)
+	if want := windowSpan(s.ThreadID, 0); s.NextWindowAt != want {
+		t.Fatalf("NextWindowAt = %d, want %d", s.NextWindowAt, want)
 	}
 	if s.WMax < 3 || s.WMax > 5 {
-		t.Fatalf("WMax = %d, 应在 [3,5]", s.WMax)
+		t.Fatalf("WMax = %d, want ∈[3,5]", s.WMax)
 	}
 }
 
-// TestStepScopeTotalEdge：ScopeTotal 下水位跨 θ_w 的上升沿才 +1；持续高位不重复
-// 计数；回落后重新武装。
-func TestStepScopeTotalEdge(t *testing.T) {
-	p := RotatePolicy{Scope: ScopeTotal} // WMaxHi=0 → 不退休
-	limit := AutoCompactTokens("gpt-5.5")
-	s := NewIdentityState("inst", p)
-	tid := s.ThreadID
-
-	s = Step(s, limit-1, "gpt-5.5", p)
-	if s.WindowN != 0 || !s.Armed {
-		t.Fatalf("低于 θ_w：WindowN=%d Armed=%v, want 0/true", s.WindowN, s.Armed)
+// TestWindowSpanRangeAndIrregular：确定性纯函数、落 [spanLo,spanHi]、边界不等间隔。
+func TestWindowSpanRangeAndIrregular(t *testing.T) {
+	const tid = "0193-fixed-tid-for-span"
+	min, max := uint64(1<<63), uint64(0)
+	for i := uint64(0); i < 16; i++ {
+		got := windowSpan(tid, i)
+		if got < spanLo || got > spanHi {
+			t.Fatalf("windowSpan(%q,%d) = %d, want ∈[%d,%d]", tid, i, got, spanLo, spanHi)
+		}
+		if again := windowSpan(tid, i); again != got {
+			t.Fatalf("windowSpan 非纯函数：%d vs %d", got, again)
+		}
+		if got < min {
+			min = got
+		}
+		if got > max {
+			max = got
+		}
 	}
-
-	s = Step(s, limit, "gpt-5.5", p)
-	if s.WindowN != 1 || s.Armed {
-		t.Fatalf("触达 θ_w：WindowN=%d Armed=%v, want 1/false", s.WindowN, s.Armed)
-	}
-
-	s = Step(s, limit+12345, "gpt-5.5", p)
-	if s.WindowN != 1 {
-		t.Fatalf("持续高位不应重复计数：WindowN=%d, want 1", s.WindowN)
-	}
-
-	s = Step(s, limit-1, "gpt-5.5", p)
-	if s.WindowN != 1 || !s.Armed {
-		t.Fatalf("回落应重新武装：WindowN=%d Armed=%v, want 1/true", s.WindowN, s.Armed)
-	}
-
-	s = Step(s, limit, "gpt-5.5", p)
-	if s.WindowN != 2 {
-		t.Fatalf("再次上升沿：WindowN=%d, want 2", s.WindowN)
-	}
-
-	if s.ThreadID != tid {
-		t.Fatalf("不退休时线程不应变化: %q → %q", tid, s.ThreadID)
+	if max-min < 1 {
+		t.Fatalf("窗口跨度不等间隔：min=%d max=%d", min, max)
 	}
 }
 
-// TestStepScopeBodyAfterPrefix：ScopeBodyAfterPrefix 记本窗口 baseline，窗口内
-// 增长达 θ_w 才 +1 并把 baseline 前移。
-func TestStepScopeBodyAfterPrefix(t *testing.T) {
-	p := RotatePolicy{Scope: ScopeBodyAfterPrefix}
-	limit := AutoCompactTokens("gpt-5.5")
-	s := NewIdentityState("inst", p)
-
-	s = Step(s, 1000, "gpt-5.5", p)
-	if s.Baseline != 1000 || s.WindowN != 0 {
-		t.Fatalf("首观测应记 baseline：Baseline=%d WindowN=%d, want 1000/0", s.Baseline, s.WindowN)
-	}
-
-	s = Step(s, 1000+limit-1, "gpt-5.5", p)
-	if s.WindowN != 0 || s.Baseline != 1000 {
-		t.Fatalf("增长不足 θ_w：WindowN=%d Baseline=%d, want 0/1000", s.WindowN, s.Baseline)
-	}
-
-	s = Step(s, 1000+limit, "gpt-5.5", p)
-	if s.WindowN != 1 || s.Baseline != 1000+limit {
-		t.Fatalf("增长达 θ_w：WindowN=%d Baseline=%d, want 1/%d", s.WindowN, s.Baseline, 1000+limit)
-	}
-
-	s = Step(s, 1000+2*limit, "gpt-5.5", p)
-	if s.WindowN != 2 || s.Baseline != 1000+2*limit {
-		t.Fatalf("再满一窗：WindowN=%d Baseline=%d, want 2/%d", s.WindowN, s.Baseline, 1000+2*limit)
+// TestStepAccumulatesTurns：WMaxHi=0 不退休，每 Step 一次 Turns+1。
+func TestStepAccumulatesTurns(t *testing.T) {
+	p := RotatePolicy{}
+	s := NewIdentityState("i", p)
+	for i := 1; i <= 100; i++ {
+		s = Step(s, p)
+		if s.Turns != uint64(i) {
+			t.Fatalf("第 %d 次 Step 后 Turns=%d, want %d", i, s.Turns, i)
+		}
 	}
 }
 
-// TestStepRetiresAtWMax：WindowN 达到 WMax 时退休（换新 thread / n 归 0 / 重抽
-// WMax）。
-func TestStepRetiresAtWMax(t *testing.T) {
-	p := RotatePolicy{WMaxLo: 2, WMaxHi: 2, Scope: ScopeTotal}
-	limit := AutoCompactTokens("gpt-5.5")
-	s := NewIdentityState("inst", p)
-	if s.WMax != 2 {
-		t.Fatalf("WMax = %d, want 2", s.WMax)
+// TestStepWindowBoundary：跨过 span(0) 时 WindowN++ 且阈值叠加 span(1)。
+func TestStepWindowBoundary(t *testing.T) {
+	p := RotatePolicy{}
+	s := NewIdentityState("i", p)
+	s0 := windowSpan(s.ThreadID, 0)
+	s1 := windowSpan(s.ThreadID, 1)
+	for i := uint64(0); i < s0-1; i++ {
+		s = Step(s, p)
 	}
-	tid := s.ThreadID
-
-	s = Step(s, limit, "gpt-5.5", p)   // WindowN 1
-	s = Step(s, limit-1, "gpt-5.5", p) // 重新武装
-	s = Step(s, limit, "gpt-5.5", p)   // WindowN 2 → 退休
 	if s.WindowN != 0 {
-		t.Fatalf("退休后 WindowN 应归 0, got %d", s.WindowN)
+		t.Fatalf("前 %d 次 Step 后 WindowN=%d, want 0", s0-1, s.WindowN)
 	}
-	if s.ThreadID == tid {
-		t.Fatal("退休后应换新 thread_id")
+	s = Step(s, p) // 第 s0 次
+	if s.WindowN != 1 {
+		t.Fatalf("第 %d 次 Step 后 WindowN=%d, want 1", s0, s.WindowN)
 	}
-	if s.Baseline != -1 || !s.Armed {
-		t.Fatalf("退休后应重置 baseline/Armed, got Baseline=%d Armed=%v", s.Baseline, s.Armed)
-	}
-	if s.WMax != 2 {
-		t.Fatalf("退休后 WMax 应重抽为 2, got %d", s.WMax)
+	if want := s0 + s1; s.NextWindowAt != want {
+		t.Fatalf("NextWindowAt = %d, want %d", s.NextWindowAt, want)
 	}
 }
 
-// TestStepWMaxZeroNeverRetires：WMaxHi==0（WMax 恒 0）→ 线程永不退休。
+// TestStepRetiresAtWMax：WindowN 达 WMax 时退休换新线程。
+func TestStepRetiresAtWMax(t *testing.T) {
+	p := RotatePolicy{WMaxLo: 2, WMaxHi: 2}
+	s := NewIdentityState("i", p)
+	old := s.ThreadID
+	total := windowSpan(old, 0) + windowSpan(old, 1)
+	for i := uint64(1); i <= total-1; i++ {
+		s = Step(s, p)
+		if s.ThreadID != old {
+			t.Fatalf("第 %d 次 Step 提前退休", i)
+		}
+	}
+	s = Step(s, p) // 第 total 次
+	if s.ThreadID == old {
+		t.Fatal("第 total 次 Step 应退休换新线程")
+	}
+	if s.Turns != 0 {
+		t.Fatalf("退休后 Turns=%d, want 0", s.Turns)
+	}
+	if s.WindowN != 0 {
+		t.Fatalf("退休后 WindowN=%d, want 0", s.WindowN)
+	}
+	if want := windowSpan(s.ThreadID, 0); s.NextWindowAt != want {
+		t.Fatalf("退休后 NextWindowAt = %d, want %d", s.NextWindowAt, want)
+	}
+}
+
+// TestStepInitializesEmptyState：空状态先开新线程再推进。
+func TestStepInitializesEmptyState(t *testing.T) {
+	var s IdentityState
+	s = Step(s, RotatePolicy{WMaxHi: 0})
+	if s.ThreadID == "" {
+		t.Fatal("ThreadID 不应为空")
+	}
+	if s.Turns != 1 {
+		t.Fatalf("Turns = %d, want 1", s.Turns)
+	}
+}
+
+// TestStepWMaxZeroNeverRetires：WMaxHi=0 → 永不退休。
 func TestStepWMaxZeroNeverRetires(t *testing.T) {
 	p := RotatePolicy{WMaxHi: 0}
-	limit := AutoCompactTokens("gpt-5.5")
-	s := NewIdentityState("inst", p)
-	tid := s.ThreadID
-
-	for i := 0; i < 10; i++ {
-		s = Step(s, limit, "gpt-5.5", p) // 上升沿 +1
-		s = Step(s, 0, "gpt-5.5", p)     // 回落重新武装
+	s := NewIdentityState("i", p)
+	old := s.ThreadID
+	for i := 0; i < 10*spanHi; i++ {
+		s = Step(s, p)
 	}
-	if s.WindowN != 10 {
-		t.Fatalf("10 次上升沿后 WindowN = %d, want 10", s.WindowN)
-	}
-	if s.ThreadID != tid {
-		t.Fatalf("WMax=0 时不应退休: %q → %q", tid, s.ThreadID)
+	if s.ThreadID != old {
+		t.Fatalf("ThreadID 变了：%q → %q", old, s.ThreadID)
 	}
 }
 
-// TestStepInitializesEmptyState：零值 state 先补一个线程再推进。
-func TestStepInitializesEmptyState(t *testing.T) {
-	p := RotatePolicy{WMaxHi: 0}
-	var s IdentityState
-	s = Step(s, 0, "gpt-5.5", p)
-	if s.ThreadID == "" || s.WindowN != 0 || !s.Armed {
-		t.Fatalf("零值 state 应被初始化为新线程, got %+v", s)
+// TestDefaultRotatePolicy：默认 {16,48}。
+func TestDefaultRotatePolicy(t *testing.T) {
+	p := DefaultRotatePolicy()
+	if p.WMaxLo != 16 || p.WMaxHi != 48 {
+		t.Fatalf("DefaultRotatePolicy = %+v, want {16 48}", p)
 	}
 }
 
-// TestDrawWMaxNoRetire：WMaxHi==0 → 返回 0（不退休）。
-func TestDrawWMaxNoRetire(t *testing.T) {
-	if got := drawWMax(RotatePolicy{WMaxHi: 0}); got != 0 {
-		t.Fatalf("WMaxHi=0 应返回 0, got %d", got)
+// TestDrawWMax：WMaxHi==0 → 0；正序/反序均落 [3,7]。
+func TestDrawWMax(t *testing.T) {
+	if got := drawWMax(RotatePolicy{WMaxLo: 3, WMaxHi: 0}); got != 0 {
+		t.Fatalf("WMaxHi=0 时 drawWMax = %d, want 0", got)
 	}
-}
-
-// TestDrawWMaxRange：抽样落在 [Lo,Hi] 且覆盖多个取值；区间倒置自动纠正。
-func TestDrawWMaxRange(t *testing.T) {
-	p := RotatePolicy{WMaxLo: 3, WMaxHi: 7}
-	seen := map[uint64]bool{}
-	for i := 0; i < 500; i++ {
-		w := drawWMax(p)
-		if w < 3 || w > 7 {
-			t.Fatalf("drawWMax = %d, 应落在 [3,7]", w)
-		}
-		seen[w] = true
-	}
-	if len(seen) < 2 {
-		t.Fatalf("500 次抽样只见到 %d 个取值，疑似退化为定值", len(seen))
-	}
-
-	inverted := RotatePolicy{WMaxLo: 7, WMaxHi: 3}
-	for i := 0; i < 200; i++ {
-		if w := drawWMax(inverted); w < 3 || w > 7 {
-			t.Fatalf("倒置区间 drawWMax = %d, 应落在 [3,7]", w)
+	for _, p := range []RotatePolicy{{WMaxLo: 3, WMaxHi: 7}, {WMaxLo: 7, WMaxHi: 3}} {
+		for i := 0; i < 200; i++ {
+			got := drawWMax(p)
+			if got < 3 || got > 7 {
+				t.Fatalf("drawWMax(%+v) = %d, want ∈[3,7]", p, got)
+			}
 		}
 	}
 }
