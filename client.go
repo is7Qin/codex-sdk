@@ -448,47 +448,49 @@ func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 	if !gjson.ValidBytes(frame) {
 		return frame, nil
 	}
-	// 惰性组装 entries（与 HTTP 面共用 metaEntries 累积器与键序）：无任何
-	// 注入时零分配。
-	var entries metaEntries
-	entries.addCodexMetaIdentity(c.meta)
+	// 惰性组装 entries：先在栈上预留 8 项（典型身份键数），超出才转堆——
+	// shared helper 下须显式保留栈缓冲，否则返回切片的 helper 会使 entries
+	// 逃逸到堆、平白多一次分配（HTTP 面同理）。
+	var entryBuf [8]metadataEntry
+	entries := metaEntries(entryBuf[:0])
+	entries = entries.withCodexMetaIdentity(c.meta)
 	if m := c.meta; m != nil {
-		entries.add(codexMetaTurnMetadataKey, m.TurnMetadata)
-		entries.add(codexMetaTraceparentKey, m.Traceparent)
-		entries.add(codexMetaTracestateKey, m.Tracestate)
+		entries = entries.add(codexMetaTurnMetadataKey, m.TurnMetadata)
+		entries = entries.add(codexMetaTraceparentKey, m.Traceparent)
+		entries = entries.add(codexMetaTracestateKey, m.Tracestate)
 	}
-	entries.addSessionIdentity(c.session)
+	entries = entries.withSessionIdentity(c.session)
 	// turn-state 回传（TurnState 非空时帧 metadata 恒带）：真实 codex WS
 	// 发送路径显式追加注入（client.rs:1626-1631，帧体携带 :1702-1711），与
 	// HTTP 头面（client.rs:1202）构成双面机制——此注入与真实逐点一致，勿删
 	// （完整实证见 doc.go"上游协议与参考"）。
 	if ts := c.TurnState(); ts != "" {
-		entries.add(codexMetaTurnStateKey, ts)
+		entries = entries.add(codexMetaTurnStateKey, ts)
 	}
 	// 调用方透传键（WithClientMetadata）：只透传不解析，恒覆盖帧内已有同 key
 	//（网关值为准——注入顺序在自动机制之前，同 key 由网关决定）。
 	for _, e := range c.metaPassthrough {
-		entries.add(e.key, e.value)
+		entries = entries.add(e.key, e.value)
 	}
 	// turn_id 恒带且覆盖：帧内已有 client_metadata.turn_id 不参与透传——
 	// 无静态值时每帧自动生成 UUIDv7（CodexMeta.TurnID 静态值优先），网关值恒为准。
 	if c.turnAuto && (c.meta == nil || c.meta.TurnID == "") {
-		entries.add(codexMetaTurnKey, NewUUIDv7())
+		entries = entries.add(codexMetaTurnKey, NewUUIDv7())
 	}
 	// 每帧 trace：外部 WithTraceContext 静态值优先，否则每帧自动生成
 	// （真实客户端每请求新 span，同轮多请求 traceparent 不同；帧内已有
 	// traceparent 不参与透传，网关值恒为准）。
 	if c.trace != nil {
-		entries.add(codexMetaTraceparentKey, c.trace.Traceparent)
-		entries.add(codexMetaTracestateKey, c.trace.Tracestate)
+		entries = entries.add(codexMetaTraceparentKey, c.trace.Traceparent)
+		entries = entries.add(codexMetaTracestateKey, c.trace.Tracestate)
 	} else if c.traceAuto {
 		tc := NewTraceContext()
-		entries.add(codexMetaTraceparentKey, tc.Traceparent)
-		entries.add(codexMetaTracestateKey, tc.Tracestate)
+		entries = entries.add(codexMetaTraceparentKey, tc.Traceparent)
+		entries = entries.add(codexMetaTracestateKey, tc.Tracestate)
 	}
 	if c.turnProvider != nil {
 		turn := c.turn.Add(1)
-		entries.add(codexMetaTurnMetadataKey, c.turnProvider(turn))
+		entries = entries.add(codexMetaTurnMetadataKey, c.turnProvider(turn))
 	}
 	return injectClientMetadataKeys(frame, entries), nil
 }

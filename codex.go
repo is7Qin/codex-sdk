@@ -308,44 +308,49 @@ type metadataEntry struct {
 // 底层数组（全空 / 未注入路径零分配）。同名键取**首次出现**
 // （clientMetadataObject 去重，后写不覆盖）——WS prepareFrame 与 HTTP
 // injectResponsesClientMetadata 共用同一累积器与键序。
+//
+// 方法按值收发（如 append 的惯用法，返回新切片）——指针接收会让调用方的
+// entries 逃逸到堆，令 HTTP 注入路径平白多一次分配。
 type metaEntries []metadataEntry
 
-// add 追加一项，跳过空值。
-func (e *metaEntries) add(key, value string) {
+// add 追加一项，跳过空值，返回新切片。
+func (e metaEntries) add(key, value string) metaEntries {
 	if value == "" {
-		return
+		return e
 	}
-	if *e == nil {
-		*e = make(metaEntries, 0, 8)
+	if e == nil {
+		e = make(metaEntries, 0, 8)
 	}
-	*e = append(*e, metadataEntry{key, value})
+	return append(e, metadataEntry{key, value})
 }
 
-// addCodexMetaIdentity 追加 CodexMeta 的共有身份键（installation/session/
+// withCodexMetaIdentity 追加 CodexMeta 的共有身份键（installation/session/
 // thread/turn/window/subagent，与真实 client_metadata() 同序）。面特有键
 // （WS 的 turn_metadata/traceparent/tracestate、HTTP 的父键 + turn_metadata）
 // 由调用方紧随其后按各自键序补充。
-func (e *metaEntries) addCodexMetaIdentity(m *CodexMeta) {
+func (e metaEntries) withCodexMetaIdentity(m *CodexMeta) metaEntries {
 	if m == nil {
-		return
+		return e
 	}
-	e.add(codexMetaInstallationKey, m.InstallationID)
-	e.add(codexMetaSessionKey, m.SessionID)
-	e.add(codexMetaThreadKey, m.ThreadID)
-	e.add(codexMetaTurnKey, m.TurnID)
-	e.add(codexMetaWindowKey, m.WindowID)
-	e.add(codexMetaSubagentKey, m.Subagent)
+	e = e.add(codexMetaInstallationKey, m.InstallationID)
+	e = e.add(codexMetaSessionKey, m.SessionID)
+	e = e.add(codexMetaThreadKey, m.ThreadID)
+	e = e.add(codexMetaTurnKey, m.TurnID)
+	e = e.add(codexMetaWindowKey, m.WindowID)
+	e = e.add(codexMetaSubagentKey, m.Subagent)
+	return e
 }
 
-// addSessionIdentity 追加 Session 兜底身份键；CodexMeta 同名键已先入，按
+// withSessionIdentity 追加 Session 兜底身份键；CodexMeta 同名键已先入，按
 // 首现优先不覆盖。
-func (e *metaEntries) addSessionIdentity(s *Session) {
+func (e metaEntries) withSessionIdentity(s *Session) metaEntries {
 	if s == nil {
-		return
+		return e
 	}
-	e.add(codexMetaSessionKey, s.SessionID)
-	e.add(codexMetaThreadKey, s.ThreadID)
-	e.add(codexMetaWindowKey, s.WindowID)
+	e = e.add(codexMetaSessionKey, s.SessionID)
+	e = e.add(codexMetaThreadKey, s.ThreadID)
+	e = e.add(codexMetaWindowKey, s.WindowID)
+	return e
 }
 
 // clientMetadataObject 组装 client_metadata 对象字节：entries 按**首次出现**去重

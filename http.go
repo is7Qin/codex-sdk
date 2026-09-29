@@ -210,21 +210,23 @@ func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
 		return payload
 	}
 	// 惰性组装 entries（与 WS prepareFrame 共用 metaEntries 累积器与键序，
-	// 面特有键各自补充）；零配置时仍带 turn_id（真实恒发）。
-	var entries metaEntries
-	entries.addCodexMetaIdentity(c.opts.meta)
+	// 面特有键各自补充）；先在栈上预留 8 项，超出才转堆；零配置时仍带
+	// turn_id（真实恒发）。
+	var entryBuf [8]metadataEntry
+	entries := metaEntries(entryBuf[:0])
+	entries = entries.withCodexMetaIdentity(c.opts.meta)
 	if m := c.opts.meta; m != nil {
-		entries.add(codexMetaParentThreadKey, m.ParentThreadID)
-		entries.add(codexMetaParentTurnKey, m.ParentTurnID)
-		entries.add(codexMetaTurnMetadataKey, m.TurnMetadata)
+		entries = entries.add(codexMetaParentThreadKey, m.ParentThreadID)
+		entries = entries.add(codexMetaParentTurnKey, m.ParentTurnID)
+		entries = entries.add(codexMetaTurnMetadataKey, m.TurnMetadata)
 		// 注意：HTTP 体面不含 trace 键（真实 client_metadata() 无
 		// ws_request_header_trace* 注入——trace 仅 WS 帧面扩展）。
 	}
-	entries.addSessionIdentity(c.opts.session)
+	entries = entries.withSessionIdentity(c.opts.session)
 	// turn_id 恒带且覆盖：无静态值 → 每请求自动 UUIDv7（客户端自带 turn_id
 	// 不参与透传——网关值恒为准，对齐 WS 组装条件）。
 	if c.opts.meta == nil || c.opts.meta.TurnID == "" {
-		entries.add(codexMetaTurnKey, NewUUIDv7())
+		entries = entries.add(codexMetaTurnKey, NewUUIDv7())
 	}
 	return injectClientMetadataKeys(payload, entries)
 }
