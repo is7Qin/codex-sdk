@@ -12,6 +12,25 @@ import (
 // Chatgpt-Account-Id，头名大小写不敏感，见 §2.4）。
 const ChatGPTAccountIDHeader = "ChatGPT-Account-ID"
 
+// applyDefaultHeaders 注入伪装层默认头（codex UA + originator；断言值见
+// DefaultCodexUserAgent / DefaultOriginator）。调用方 WithHeader 经
+// applyHeaderOverrides 可覆盖，故本助手须在各面默认头之后、覆盖循环之前应用。
+func applyDefaultHeaders(h http.Header) {
+	h.Set("User-Agent", DefaultCodexUserAgent)
+	h.Set("Originator", DefaultOriginator)
+}
+
+// applyHeaderOverrides 应用调用方 WithHeader 注入项：同名先删后加（覆盖默认头），
+// 同名多次调用为扩展（多个值）。WS 升级头与 HTTP 请求头共用。
+func applyHeaderOverrides(h http.Header, overrides http.Header) {
+	for k, vals := range overrides {
+		h.Del(k)
+		for _, v := range vals {
+			h.Add(k, v)
+		}
+	}
+}
+
 // applyAccountID 在 auth 携带账号标识时注入 ChatGPT-Account-ID。
 //
 // 注入时机在各面默认头之后、调用方 WithHeader 覆盖循环之前 ——

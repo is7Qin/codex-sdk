@@ -51,8 +51,6 @@ const (
 	// RefreshTokenURL 是 OpenAI OAuth refresh_token 端点。
 	// 环境变量 CODEX_REFRESH_TOKEN_URL_OVERRIDE 可覆盖（同名对齐真实客户端）。
 	RefreshTokenURL = "https://auth.openai.com/oauth/token"
-	// RevokeTokenURL 是 OAuth revoke 端点（真实客户端同名常量；SDK 暂未使用）。
-	RevokeTokenURL = "https://auth.openai.com/oauth/revoke"
 
 	// defaultOAuthClientID 是 OpenAI app 默认 client_id（manager.rs:1618）。
 	// 环境变量 CODEX_APP_SERVER_LOGIN_CLIENT_ID 可覆盖（同名对齐真实客户端）。
@@ -154,6 +152,14 @@ type fatalState struct {
 	err error
 }
 
+// setFatalState 是终止态的通用 setter（rotationAuth 与 patAuth 共用）：CAS
+// 置入 fatal 并回调 onFatal（至多一次——CAS 胜者回调，败者并发调用不重复通知）。
+func setFatalState(fatal *atomic.Pointer[fatalState], onFatal func(error), err error) {
+	if fatal.CompareAndSwap(nil, &fatalState{err: err}) && onFatal != nil {
+		onFatal(err)
+	}
+}
+
 // refreshRun 是一次单飞 refresh 的结果容器：leader 置 err 后 close(done)，
 // waiters 在 done 上等待后读 err（close 同步建立 happens-before）。
 type refreshRun struct {
@@ -205,13 +211,9 @@ func (r *rotationAuth) Fatal(err error) {
 }
 
 // setFatal 置终止态并回调 OnAuthFatal（至多一次：CAS 胜者回调；败者并发
-// 调用不重复通知）。
+// 调用不重复通知）。委托通用 setFatalState。
 func (r *rotationAuth) setFatal(err error) {
-	if r.fatal.CompareAndSwap(nil, &fatalState{err: err}) {
-		if r.onAuthFatal != nil {
-			r.onAuthFatal(err)
-		}
-	}
+	setFatalState(&r.fatal, r.onAuthFatal, err)
 }
 
 // authFatal 是 AT 401 判死路径的终止入口（私有接口 authFatalTrigger）：与
@@ -374,8 +376,7 @@ func (r *rotationAuth) refreshOnce(ctx context.Context) (*refreshResponse, error
 	}
 	// 伪装层默认头（对齐默认 UA/Originator 形态）。
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", DefaultCodexUserAgent)
-	req.Header.Set("Originator", DefaultOriginator)
+	applyDefaultHeaders(req.Header)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -491,15 +492,26 @@ func isAccountDisabledMessage(msg string) bool {
 		strings.Contains(m, "identity verification is required")
 }
 
+// scanATFatalCode 扫描响应体/帧的 error.code / error.type，命中 AT 判死码集
+// （isATFatalCode，大小写不敏感）返回原始码与 true；未命中返回 ("", false)。
+// classifyAT401（HTTP 401 体）与 ClassifyAuthFatalFrame（WS 错误事件帧）共用，
+// 码集与扫描顺序单一真相。
+func scanATFatalCode(raw []byte) (string, bool) {
+	for _, p := range []string{"error.code", "error.type"} {
+		if code := gjson.GetBytes(raw, p).String(); isATFatalCode(code) {
+			return code, true
+		}
+	}
+	return "", false
+}
+
 // classifyAT401 分类 responses 请求路径 401（判死码，大小写不敏感）：
 // error.code/error.type ∈ {token_invalidated, token_revoked}（token 永久作废，
 // sub2api B1），或顶层 detail == "Unauthorized"（ChatGPT 内部 API 风格，
 // token 完全无效，sub2api B2）。非判死 401（过期/无效 AT）→ nil：走自动轮转。
 func classifyAT401(body []byte) *AuthPermanentlyRevokedError {
-	for _, p := range []string{"error.code", "error.type"} {
-		if code := gjson.GetBytes(body, p).String(); isATFatalCode(code) {
-			return &AuthPermanentlyRevokedError{Code: strings.ToLower(code), Raw: body}
-		}
+	if code, ok := scanATFatalCode(body); ok {
+		return &AuthPermanentlyRevokedError{Code: strings.ToLower(code), Raw: body}
 	}
 	if detail := gjson.GetBytes(body, "detail").String(); strings.EqualFold(strings.TrimSpace(detail), "unauthorized") {
 		return &AuthPermanentlyRevokedError{Code: "unauthorized", Raw: body}
@@ -650,4 +662,27 @@ type refreshTrigger interface {
 // oauthAuth/patAuth 不实现——PAT 场景 401 原样返回，本无判死分类。
 type authFatalTrigger interface {
 	authFatal(err error)
+}
+
+// rotateOn401 是 401 自动轮转的统一编排（WS 升级与 HTTP 请求共用）：仅
+// refreshTrigger 实现者参与轮转（PAT/oauthAuth 不轮转 → rotated=false）；
+// 实现者执行单飞 refresh，失败（fatal / RefreshError）原样透传、不被
+// DialError/HTTPError 包层吞掉。rotated=true 表示已换新凭据，调用方应重试一次。
+func rotateOn401(ctx context.Context, auth Auth) (rotated bool, err error) {
+	trigger, ok := auth.(refreshTrigger)
+	if !ok {
+		return false, nil
+	}
+	if err := trigger.refresh(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// notifyAuthFatal 透传账号级终止通知（authFatalTrigger 实现者；至多一次由
+// 实现保证；非实现者忽略）。
+func notifyAuthFatal(auth Auth, err error) {
+	if f, ok := auth.(authFatalTrigger); ok {
+		f.authFatal(err)
+	}
 }

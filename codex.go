@@ -22,7 +22,7 @@ var easternTime = func() *time.Location {
 	return loc
 }()
 
-// 伪装层：Codex 客户端形态对齐（真实源码对照见 IMPERSONATION.md）。
+// 伪装层：Codex 客户端形态对齐（逐点对齐真实 codex 客户端源码）。
 // UA / originator / beta 头、头常量、字段白名单、client_metadata 组装、
 // trace 与 turn_id 自动生成、会话标识与 turn-state 回传。
 // 机制进 SDK，业务值由调用方（网关）提供。
@@ -41,11 +41,6 @@ const DefaultCodexUserAgent = "codex-tui/0.154.0 (Ubuntu 24.4.0; x86_64) xterm-2
 // DefaultBetaWS 是现役唯一的 Responses WS beta 值（真实源码全仓库唯一常量；
 // 2026-02-04 为旧值、无真实来源），仅 WS 握手注入。
 const DefaultBetaWS = "2026-02-06"
-
-// HTTPBetaResponsesV1 是 Responses HTTP 的 OpenAI-Beta 参考值。
-// 真实客户端 HTTP /responses 路径不发 OpenAI-Beta——SDK 默认同样不发，
-// 需要时调用方以 WithHeader("OpenAI-Beta", ...) 显式注入。
-const HTTPBetaResponsesV1 = "responses=v1"
 
 // Codex 请求头名常量（对齐真实 codex 客户端头名，供调用方组装请求头）。
 const (
@@ -79,8 +74,8 @@ const (
 	codexMetaTurnKey         = "turn_id"
 	codexMetaWindowKey       = "x-codex-window-id"
 	codexMetaSubagentKey     = "x-openai-subagent"
-	codexMetaParentThreadKey = "x-codex-parent-thread-id" // 条件键（真实 client_metadata()：responses_metadata.rs:274-279）
-	codexMetaParentTurnKey   = "parent_turn_id"           // 条件键（真实 client_metadata()：responses_metadata.rs:280-282）
+	codexMetaParentThreadKey = "x-codex-parent-thread-id" // 条件键（真实 client_metadata()，responses_metadata.rs）
+	codexMetaParentTurnKey   = "parent_turn_id"           // 条件键（真实 client_metadata()，responses_metadata.rs）
 	codexMetaTurnMetadataKey = "x-codex-turn-metadata"
 	codexMetaTurnStateKey    = "x-codex-turn-state"
 	codexMetaTraceparentKey  = "ws_request_header_traceparent"
@@ -91,18 +86,20 @@ const (
 	MetaResponsesLiteKey = "ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
-// CodexWsPayloadFields 是 WS response.create 帧顶层 key 白名单（19 键，逐键对齐
-// 真实 ResponseCreateWsRequest，含 access_programs）。只读，勿改。
-var CodexWsPayloadFields = []string{
+// codexWsPayloadFields 是 WS response.create 帧顶层 key 白名单（19 键，逐键对齐
+// 真实 ResponseCreateWsRequest，含 access_programs）。包内私有（不导出，防外部
+// 改动污染过滤语义）；只读，勿改。
+var codexWsPayloadFields = []string{
 	"type", "model", "instructions", "previous_response_id", "input",
 	"tools", "tool_choice", "parallel_tool_calls", "reasoning",
 	"store", "stream", "stream_options", "include", "service_tier",
 	"prompt_cache_key", "text", "generate", "client_metadata", "access_programs",
 }
 
-// CodexHTTPPayloadFields 是 HTTP POST 体顶层 key 白名单（16 键，逐键对齐真实
-// ResponsesApiRequest；无 type/previous_response_id/generate）。只读，勿改。
-var CodexHTTPPayloadFields = []string{
+// codexHTTPPayloadFields 是 HTTP POST 体顶层 key 白名单（16 键，逐键对齐真实
+// ResponsesApiRequest；无 type/previous_response_id/generate）。包内私有（不导出，
+// 防外部改动污染过滤语义）；只读，勿改。
+var codexHTTPPayloadFields = []string{
 	"model", "instructions", "input", "tools", "tool_choice",
 	"parallel_tool_calls", "reasoning", "store", "stream", "stream_options",
 	"include", "service_tier", "prompt_cache_key", "text",
@@ -112,8 +109,8 @@ var CodexHTTPPayloadFields = []string{
 // codexWsPayloadFieldSet / codexHTTPPayloadFieldSet 是两张白名单的构建期查表集
 // （供过滤用；只读，勿改）。
 var (
-	codexWsPayloadFieldSet   = newCodexFieldSet(CodexWsPayloadFields)
-	codexHTTPPayloadFieldSet = newCodexFieldSet(CodexHTTPPayloadFields)
+	codexWsPayloadFieldSet   = newCodexFieldSet(codexWsPayloadFields)
+	codexHTTPPayloadFieldSet = newCodexFieldSet(codexHTTPPayloadFields)
 )
 
 func newCodexFieldSet(fields []string) map[string]struct{} {
@@ -193,7 +190,7 @@ func gjsonTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
 
 // skipJSONString 跳过 JSON 字符串（raw[i] 为开引号），返回闭引号之后的下标；
 // 未闭合返回 -1。'\' 转义分支跳 1 字节（+循环自增 = 跳过转义目标；\"、\\、
-// \uXXXX 的 4 hex 无引号/反斜杠）。语义对齐网关 strip_scan.go:526-539。
+// \uXXXX 的 4 hex 无引号/反斜杠）。语义对齐网关 strip_scan.go 的 skipJSONString。
 func skipJSONString(raw []byte, i int) int {
 	for i++; i < len(raw); i++ {
 		switch raw[i] {
@@ -209,7 +206,7 @@ func skipJSONString(raw []byte, i int) int {
 // skipJSONValue 从 raw[i] 起跳过完整 JSON 值，返回末字节后一位置；结构非法
 // 返回 -1。字符串走 skipJSONString；{}[] 深度计数（容器内字符串同样按
 // skipJSONString 跳过，值内含 "[{" 不误计）；true/false/null 校验字面量内容；
-// 数字跳过至空白 / ',' / '}' / ']'。语义对齐网关 strip_scan.go:462-562。
+// 数字跳过至空白 / ',' / '}' / ']'。语义对齐网关 strip_scan.go 的 skipValue / skipElement。
 func skipJSONValue(raw []byte, i int) int {
 	if i >= len(raw) {
 		return -1
@@ -293,6 +290,9 @@ func filterCodexPayload(raw []byte, ordered []string, set map[string]struct{}) (
 		if !v.Exists() {
 			continue
 		}
+		// sjson.SetRawBytes 错误可忽略：field 来自构建期静态白名单（合法 key）、
+		// v.Raw 来自 gjson 对已验证合法 JSON 的解析（合法值），向仅含 "{}" 的
+		// filtered 追加原始值不会失败；此处吞错维持现状（无需 debug 埋点）。
 		filtered, _ = sjson.SetRawBytes(filtered, field, []byte(v.Raw))
 	}
 	if len(filtered) == 2 { // "{}"
@@ -301,14 +301,14 @@ func filterCodexPayload(raw []byte, ordered []string, set map[string]struct{}) (
 	return filtered, nil
 }
 
-// FilterCodexWsPayload 用 WS 白名单（CodexWsPayloadFields）过滤帧顶层 key。
+// FilterCodexWsPayload 用 WS 白名单（codexWsPayloadFields）过滤帧顶层 key。
 func FilterCodexWsPayload(raw []byte) ([]byte, error) {
-	return filterCodexPayload(raw, CodexWsPayloadFields, codexWsPayloadFieldSet)
+	return filterCodexPayload(raw, codexWsPayloadFields, codexWsPayloadFieldSet)
 }
 
-// FilterCodexHTTPPayload 用 HTTP 白名单（CodexHTTPPayloadFields）过滤请求体顶层 key。
+// FilterCodexHTTPPayload 用 HTTP 白名单（codexHTTPPayloadFields）过滤请求体顶层 key。
 func FilterCodexHTTPPayload(raw []byte) ([]byte, error) {
-	return filterCodexPayload(raw, CodexHTTPPayloadFields, codexHTTPPayloadFieldSet)
+	return filterCodexPayload(raw, codexHTTPPayloadFields, codexHTTPPayloadFieldSet)
 }
 
 // forceCodexStoreFalse 强制顶层 store:false（真 codex 恒 false：client.rs:997）。
@@ -426,12 +426,6 @@ type CodexMeta struct {
 	TurnMetadata   string // metadata "x-codex-turn-metadata"
 	Traceparent    string // metadata "ws_request_header_traceparent"（为空时自动生成）
 	Tracestate     string // metadata "ws_request_header_tracestate"
-}
-
-func (m *CodexMeta) empty() bool {
-	return m == nil || (m.InstallationID == "" && m.SessionID == "" && m.ThreadID == "" &&
-		m.TurnID == "" && m.WindowID == "" && m.Subagent == "" && m.ParentThreadID == "" &&
-		m.ParentTurnID == "" && m.TurnMetadata == "" && m.Traceparent == "" && m.Tracestate == "")
 }
 
 // TraceContext 是 W3C trace context（仅注入 WS 帧内 client_metadata——

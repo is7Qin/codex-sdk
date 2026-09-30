@@ -89,7 +89,9 @@ func (e *DialError) Error() string {
 
 func (e *DialError) Unwrap() error { return e.Err }
 
-// options 是 Dial / NewHTTPClient 的共享配置（无关字段按形态忽略）。
+// options 是 Dial / NewHTTPClient 的共享配置（无关字段按形态忽略）：WS 形态
+// 字段与 HTTP 专用字段分组相邻，"伪装层" 字段两面共用。调用方统一经 Option
+// 配置；本结构为单结构而非按形态拆分（wsOptions / httpOptions）。
 type options struct {
 	compression  CompressionMode
 	readLimit    int64
@@ -107,9 +109,10 @@ type options struct {
 	turnProvider    func(turn uint64) string
 
 	// HTTP 专用。
-	timeout     time.Duration
-	maxLineSize int
-	transport   http.RoundTripper
+	timeout           time.Duration
+	maxLineSize       int
+	transport         http.RoundTripper
+	keepaliveInterval time.Duration // GenerateImageStream 等待期间 keepalive 事件间隔
 }
 
 func defaultOptions() options {
@@ -121,6 +124,8 @@ func defaultOptions() options {
 		traceAuto:    true,
 		turnAuto:     true,
 		maxLineSize:  defaultMaxLineSize,
+
+		keepaliveInterval: defaultKeepaliveInterval,
 	}
 }
 
@@ -230,6 +235,12 @@ func WithTransport(rt http.RoundTripper) Option {
 	return func(o *options) { o.transport = rt }
 }
 
+// withKeepaliveInterval 设置 GenerateImageStream 等待期间的 keepalive 事件
+// 间隔（默认 60s；仅对合成流式生图生效）。包内私有（测试 seam，不作为导出 API）。
+func withKeepaliveInterval(d time.Duration) Option {
+	return func(o *options) { o.keepaliveInterval = d }
+}
+
 // Client 是 Responses WebSocket 连接（Dial 创建）。
 //
 // 并发语义：至多一个 goroutine 同时执行 Recv；Send / Ping 内部串行化
@@ -294,8 +305,7 @@ func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 		}
 		hdr.Set("Authorization", token)
 		// 伪装层默认头（WithHeader 可覆盖）。
-		hdr.Set("User-Agent", DefaultCodexUserAgent)
-		hdr.Set("Originator", DefaultOriginator)
+		applyDefaultHeaders(hdr)
 		hdr.Set("OpenAI-Beta", "responses_websockets="+cfg.beta)
 		// 会话标识握手头（真实客户端恒带；trace 不进握手头，只进帧内 metadata）。
 		if s := cfg.session; s != nil {
@@ -319,12 +329,7 @@ func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 		// 账号标识头（ChatGPT 系 auth 恒发；空 = 不发，向后兼容）。
 		applyAccountID(hdr, auth)
 		// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
-		for k, vals := range cfg.headers {
-			hdr.Del(k)
-			for _, v := range vals {
-				hdr.Add(k, v)
-			}
-		}
+		applyHeaderOverrides(hdr, cfg.headers)
 		return hdr, nil
 	}
 
@@ -349,16 +354,16 @@ func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 		status := dialStatus(resp)
 		if status == http.StatusUnauthorized {
 			// WS 升级 401（无响应体不可判死）→ 可轮转：单飞 refresh → 自动重连一次。
-			if tr, ok := auth.(refreshTrigger); ok {
-				if rerr := tr.refresh(ctx); rerr != nil {
-					return nil, rerr // refresh 失败（fatal / RefreshError）透传
-				}
-				conn, resp, err = dialWS(ctx)
-				if err != nil {
-					return nil, &DialError{StatusCode: dialStatus(resp), Err: err, Refreshed: true}
-				}
-			} else {
+			rotated, rerr := rotateOn401(ctx, auth)
+			if rerr != nil {
+				return nil, rerr // refresh 失败（fatal / RefreshError）透传
+			}
+			if !rotated {
 				return nil, &DialError{StatusCode: status, Err: err} // PAT/oauthAuth：原样返回
+			}
+			conn, resp, err = dialWS(ctx)
+			if err != nil {
+				return nil, &DialError{StatusCode: dialStatus(resp), Err: err, Refreshed: true}
 			}
 		} else {
 			return nil, &DialError{StatusCode: status, Err: err}

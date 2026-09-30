@@ -69,13 +69,10 @@ func (a *patAuth) Fatal(err error) {
 	a.fatal.CompareAndSwap(nil, &fatalState{err: err})
 }
 
-// setFatal 置终止态并回调 OnAuthFatal（至多一次：CAS 胜者回调）。
+// setFatal 置终止态并回调 OnAuthFatal（至多一次：CAS 胜者回调）。委托通用
+// setFatalState。
 func (a *patAuth) setFatal(err error) {
-	if a.fatal.CompareAndSwap(nil, &fatalState{err: err}) {
-		if a.onAuthFatal != nil {
-			a.onAuthFatal(err)
-		}
-	}
+	setFatalState(&a.fatal, a.onAuthFatal, err)
 }
 
 // authFatal 是 AT 401 判死路径的终止入口（私有接口 authFatalTrigger）：

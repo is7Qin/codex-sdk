@@ -2,8 +2,6 @@ package codexsdk
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"net/http"
 )
 
@@ -28,12 +26,9 @@ func (c *HTTPClient) Search(ctx context.Context, payload []byte) (*HTTPResponse,
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp)
 	if err != nil {
-		return nil, fmt.Errorf("codexsdk: 读取响应失败: %w", err)
-	}
-	if resp.StatusCode >= 400 {
-		return nil, &HTTPError{StatusCode: resp.StatusCode, Raw: body}
+		return nil, err
 	}
 	return &HTTPResponse{StatusCode: resp.StatusCode, Raw: body}, nil
 }

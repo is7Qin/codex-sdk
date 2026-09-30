@@ -17,10 +17,8 @@ func ClassifyAuthFatalFrame(frame []byte) *AuthPermanentlyRevokedError {
 	if !strings.EqualFold(gjson.GetBytes(frame, "type").String(), "error") {
 		return nil
 	}
-	for _, p := range []string{"error.code", "error.type"} {
-		if code := gjson.GetBytes(frame, p).String(); isATFatalCode(code) {
-			return &AuthPermanentlyRevokedError{Code: strings.ToLower(code), Raw: frame}
-		}
+	if code, ok := scanATFatalCode(frame); ok {
+		return &AuthPermanentlyRevokedError{Code: strings.ToLower(code), Raw: frame}
 	}
 	return nil
 }

@@ -154,43 +154,43 @@ func TestFilterCodexHTTPPayload(t *testing.T) {
 
 // TestCodexWhitelists：两张白名单逐键对齐真实 codex 结构。
 func TestCodexWhitelists(t *testing.T) {
-	if len(CodexWsPayloadFields) != 19 {
-		t.Fatalf("CodexWsPayloadFields 键数 = %d, 期望 19", len(CodexWsPayloadFields))
+	if len(codexWsPayloadFields) != 19 {
+		t.Fatalf("codexWsPayloadFields 键数 = %d, 期望 19", len(codexWsPayloadFields))
 	}
 	wsSet := map[string]bool{}
-	for _, f := range CodexWsPayloadFields {
+	for _, f := range codexWsPayloadFields {
 		if wsSet[f] {
-			t.Fatalf("CodexWsPayloadFields 含重复键 %q", f)
+			t.Fatalf("codexWsPayloadFields 含重复键 %q", f)
 		}
 		wsSet[f] = true
 	}
 	if !wsSet["access_programs"] {
-		t.Fatal("CodexWsPayloadFields 应含 access_programs")
+		t.Fatal("codexWsPayloadFields 应含 access_programs")
 	}
 	if wsSet["max_output_tokens"] {
-		t.Fatal("CodexWsPayloadFields 不应含 max_output_tokens")
+		t.Fatal("codexWsPayloadFields 不应含 max_output_tokens")
 	}
 
-	if len(CodexHTTPPayloadFields) != 16 {
-		t.Fatalf("CodexHTTPPayloadFields 键数 = %d, 期望 16", len(CodexHTTPPayloadFields))
+	if len(codexHTTPPayloadFields) != 16 {
+		t.Fatalf("codexHTTPPayloadFields 键数 = %d, 期望 16", len(codexHTTPPayloadFields))
 	}
 	httpSet := map[string]bool{}
-	for _, f := range CodexHTTPPayloadFields {
+	for _, f := range codexHTTPPayloadFields {
 		if httpSet[f] {
-			t.Fatalf("CodexHTTPPayloadFields 含重复键 %q", f)
+			t.Fatalf("codexHTTPPayloadFields 含重复键 %q", f)
 		}
 		httpSet[f] = true
 	}
 	if !httpSet["access_programs"] {
-		t.Fatal("CodexHTTPPayloadFields 应含 access_programs")
+		t.Fatal("codexHTTPPayloadFields 应含 access_programs")
 	}
 	if httpSet["max_output_tokens"] {
-		t.Fatal("CodexHTTPPayloadFields 不应含 max_output_tokens")
+		t.Fatal("codexHTTPPayloadFields 不应含 max_output_tokens")
 	}
 
 	// HTTP == WS − {type, previous_response_id, generate}
 	wantHTTP := map[string]bool{}
-	for _, f := range CodexWsPayloadFields {
+	for _, f := range codexWsPayloadFields {
 		switch f {
 		case "type", "previous_response_id", "generate":
 			continue

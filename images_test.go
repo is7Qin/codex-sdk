@@ -591,10 +591,6 @@ func TestGenerateImageStreamCallbackError(t *testing.T) {
 // keepalive 事件（B64JSON/Usage 恒 nil）；响应返回后停 ticker → 每图一个
 // completed 事件 + usage 仅最后一个携带。
 func TestGenerateImageStreamKeepalive(t *testing.T) {
-	old := keepaliveInterval
-	keepaliveInterval = 50 * time.Millisecond
-	t.Cleanup(func() { keepaliveInterval = old })
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(150 * time.Millisecond) // 延迟响应：等待期 > 2 个 keepalive 周期
 		w.Header().Set("Content-Type", "application/json")
@@ -603,7 +599,7 @@ func TestGenerateImageStreamKeepalive(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
+	hc := NewHTTPClient(PAT("p"), withKeepaliveInterval(50*time.Millisecond), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	var keepalives int
 	var keepaliveNilViolations int
 	var events []ImageStreamEvent
@@ -639,10 +635,6 @@ func TestGenerateImageStreamKeepalive(t *testing.T) {
 // TestGenerateImageStreamKeepaliveCallbackError：keepalive 回调错误 → 取消
 // 在途请求 + 回调错误优先返回（completed 回调不调用）。
 func TestGenerateImageStreamKeepaliveCallbackError(t *testing.T) {
-	old := keepaliveInterval
-	keepaliveInterval = 30 * time.Millisecond
-	t.Cleanup(func() { keepaliveInterval = old })
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(300 * time.Millisecond) // 延迟足够长：keepalive 先触发
 		w.WriteHeader(http.StatusOK)
@@ -650,7 +642,7 @@ func TestGenerateImageStreamKeepaliveCallbackError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
+	hc := NewHTTPClient(PAT("p"), withKeepaliveInterval(30*time.Millisecond), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", srv.URL)))
 	sentinel := errors.New("stop")
 	var completedCalls int
 	err := hc.GenerateImageStream(context.Background(), &ImageGenParams{Model: "m", Prompt: "p"},

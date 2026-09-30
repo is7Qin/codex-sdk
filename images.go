@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 )
@@ -90,9 +89,9 @@ type ImageStreamEvent struct {
 	Usage   *ImageUsage // 仅最后一个 completed 事件携带；keepalive 恒 nil
 }
 
-// keepaliveInterval 是 GenerateImageStream 等待期间 keepalive 事件间隔
-// （默认 60s；测试可改小加速）。
-var keepaliveInterval = 60 * time.Second
+// defaultKeepaliveInterval 是 GenerateImageStream 等待期间 keepalive 事件间隔
+// 默认值（60s）。可用包内 withKeepaliveInterval 覆盖（测试可改小加速）。
+const defaultKeepaliveInterval = 60 * time.Second
 
 // GenerateImage 非流式生图（codex 凭据直连 images 端点）：POST
 // DefaultImagesURL 或 DefaultImagesEditsURL（JSON 非流式——上游无流式路径，
@@ -124,12 +123,9 @@ func (c *HTTPClient) GenerateImage(ctx context.Context, p *ImageGenParams) (*Ima
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp)
 	if err != nil {
-		return nil, fmt.Errorf("codexsdk: 读取响应失败: %w", err)
-	}
-	if resp.StatusCode >= 400 {
-		return nil, &HTTPError{StatusCode: resp.StatusCode, Raw: body}
+		return nil, err
 	}
 	img, err := parseImageResponse(body)
 	if err != nil {
@@ -157,11 +153,15 @@ func (c *HTTPClient) GenerateImageStream(ctx context.Context, p *ImageGenParams,
 
 	// 保活 goroutine：GenerateImage 等待期间每 keepaliveInterval 回调一次
 	// keepalive 事件；回调错误 → 取消在途请求并优先返回该错误。
+	interval := c.opts.keepaliveInterval
+	if interval <= 0 {
+		interval = defaultKeepaliveInterval
+	}
 	keepaliveErr := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		t := time.NewTicker(keepaliveInterval)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {

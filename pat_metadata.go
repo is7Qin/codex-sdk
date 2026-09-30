@@ -64,8 +64,7 @@ func FetchPATMetadata(ctx context.Context, token string) (*PATMetadata, error) {
 		return nil, fmt.Errorf("codexsdk: 构造 PAT whoami 请求失败: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", DefaultCodexUserAgent)
-	req.Header.Set("Originator", DefaultOriginator)
+	applyDefaultHeaders(req.Header)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

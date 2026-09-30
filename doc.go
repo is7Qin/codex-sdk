@@ -24,7 +24,7 @@
 //     token 端点 401 / 账号禁用类 → 账号级终止（导出错误类型 errors.As 区分，
 //     OnAuthFatal 通知），Invalidate() / Fatal(err) 显式入口（网关解析 WS 判死
 //     事件帧时调用）
-//   - 伪装层（真实 codex 客户端形态对齐，对照见 IMPERSONATION.md）：默认
+//   - 伪装层（逐点对齐真实 codex 客户端源码）：默认
 //     codex-tui UA/originator（0.154.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
 //     WS/HTTP 各自顶层白名单过滤（含 store:false 强制），无条件生效、client_metadata **整体替换**组装
 //     （WS 帧面 8 key 恒发：installation_id/session_id/thread_id/turn_id/

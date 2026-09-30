@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 )
 
@@ -26,12 +25,9 @@ func (c *HTTPClient) GetUsage(ctx context.Context) (*UsageStatus, error) {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp)
 	if err != nil {
-		return nil, fmt.Errorf("codexsdk: 读取响应失败: %w", err)
-	}
-	if resp.StatusCode >= 400 {
-		return nil, &HTTPError{StatusCode: resp.StatusCode, Raw: body}
+		return nil, err
 	}
 	var usage UsageStatus
 	if err := json.Unmarshal(body, &usage); err != nil {

@@ -97,12 +97,9 @@ func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, err
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp)
 	if err != nil {
-		return nil, fmt.Errorf("codexsdk: 读取响应失败: %w", err)
-	}
-	if resp.StatusCode >= 400 {
-		return nil, &HTTPError{StatusCode: resp.StatusCode, Raw: body}
+		return nil, err
 	}
 	c.captureTurnState(resp)
 	return &HTTPResponse{
@@ -275,17 +272,15 @@ func (c *HTTPClient) doURL(ctx context.Context, targetURL string, method string,
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if fatal := classifyAT401(body); fatal != nil {
-		if f, ok := c.auth.(authFatalTrigger); ok {
-			f.authFatal(fatal)
-		}
+		notifyAuthFatal(c.auth, fatal)
 		return nil, fatal
 	}
-	trigger, ok := c.auth.(refreshTrigger)
-	if !ok {
-		return respWithBody(resp, http.StatusUnauthorized, body), nil
+	rotated, rerr := rotateOn401(ctx, c.auth)
+	if rerr != nil {
+		return nil, rerr // refresh 失败（fatal / RefreshError）透传
 	}
-	if err := trigger.refresh(ctx); err != nil {
-		return nil, err // refresh 失败（fatal / RefreshError）透传
+	if !rotated {
+		return respWithBody(resp, http.StatusUnauthorized, body), nil
 	}
 	// 自动重试一次（新 at）。
 	resp2, err := c.sendRequest(ctx, targetURL, method, payload)
@@ -298,9 +293,7 @@ func (c *HTTPClient) doURL(ctx context.Context, targetURL string, method string,
 		// 二次 401：同样过判死分类（并发吊销不错过判死），非判死则原样返回
 		// （防重试风暴）。
 		if fatal := classifyAT401(body2); fatal != nil {
-			if f, ok := c.auth.(authFatalTrigger); ok {
-				f.authFatal(fatal)
-			}
+			notifyAuthFatal(c.auth, fatal)
 			return nil, fatal
 		}
 		return respWithBody(resp2, http.StatusUnauthorized, body2), nil
@@ -322,24 +315,33 @@ func (c *HTTPClient) sendRequest(ctx context.Context, targetURL string, method s
 	req.Header.Set("Content-Type", "application/json")
 	// 伪装层默认头（WithHeader 可覆盖）。HTTP 不发 OpenAI-Beta 与 trace 头
 	// （真实客户端行为）；需要 beta 时调用方以 WithHeader 显式注入。
-	req.Header.Set("User-Agent", DefaultCodexUserAgent)
-	req.Header.Set("Originator", DefaultOriginator)
+	applyDefaultHeaders(req.Header)
 	// 注意：HTTP 请求不携带 x-codex-turn-state 头（真实客户端行为——
 	// turn-state 仅响应侧，WS 路径才回传，见 Client）。
 	// 账号标识头（ChatGPT 系 auth 恒发；空 = 不发，向后兼容）。
 	applyAccountID(req.Header, c.auth)
 	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
-	for k, vals := range c.opts.headers {
-		req.Header.Del(k)
-		for _, v := range vals {
-			req.Header.Add(k, v)
-		}
-	}
+	applyHeaderOverrides(req.Header, c.opts.headers)
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 上游请求失败: %w", err)
 	}
 	return resp, nil
+}
+
+// readResponseBody 读取响应体（不关闭，调用方负责 defer Close），统一非流式
+// 响应信封：读取失败 → 包装错误（"读取响应失败"）；状态码 >= 400 →
+// *HTTPError{StatusCode, Raw}。Do / Search / GetUsage / GenerateImage 共用
+// （Stream 走流式路径，不适用）。
+func readResponseBody(resp *http.Response) ([]byte, error) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("codexsdk: 读取响应失败: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Raw: body}
+	}
+	return body, nil
 }
 
 // respWithBody 用已读出的 body 构造可重读响应（401 分类后 body 已消费，
