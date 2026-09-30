@@ -392,9 +392,9 @@ func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 		t.Fatalf("注入不应动其余字段: %s", gotBody)
 	}
 
-	// 预筛判据收紧回归（P2-2）：prompt 字符串值含裸词 "client_metadata"
+	// 预筛判据收紧回归（P2-2）：instructions 字符串值含裸词 "client_metadata"
 	// （无引号包裹）→ 不触发短路，仍注入 turn_id
-	if err := hc.Stream(context.Background(), []byte(`{"model":"m","prompt":"see client_metadata docs"}`), func(raw []byte) error { return nil }); err != nil {
+	if err := hc.Stream(context.Background(), []byte(`{"model":"m","instructions":"see client_metadata docs"}`), func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream #2: %v", err)
 	}
 	cm2 := gjson.GetBytes(gotBody, "client_metadata")
@@ -404,8 +404,8 @@ func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 	if turn := cm2.Get("turn_id").String(); !uuidv7Re.MatchString(turn) {
 		t.Fatalf("turn_id = %q, 期望 UUIDv7 格式", turn)
 	}
-	if got := gjson.GetBytes(gotBody, "prompt").String(); got != "see client_metadata docs" {
-		t.Fatalf("prompt 应原样保留: %s", gotBody)
+	if got := gjson.GetBytes(gotBody, "instructions").String(); got != "see client_metadata docs" {
+		t.Fatalf("instructions 应原样保留: %s", gotBody)
 	}
 }
 
@@ -516,8 +516,8 @@ func TestHTTPStreamClientMetadataOverride(t *testing.T) {
 }
 
 // TestHTTPStreamClientMetadataQuotedValueEdge：值恰为键名的字符串（如
-// prompt="client_metadata"）不再触发任何短路——注入照常执行（原对象级短路已
-// 移除）：prompt 值原样保留、client_metadata 正常注入。
+// instructions="client_metadata"）不再触发任何短路——注入照常执行（原对象级
+// 短路已移除）：instructions 值原样保留、client_metadata 正常注入。
 func TestHTTPStreamClientMetadataQuotedValueEdge(t *testing.T) {
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -530,12 +530,12 @@ func TestHTTPStreamClientMetadataQuotedValueEdge(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	payload := []byte(`{"model":"m","prompt":"client_metadata"}`)
+	payload := []byte(`{"model":"m","instructions":"client_metadata"}`)
 	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if got := gjson.GetBytes(gotBody, "prompt").String(); got != "client_metadata" {
-		t.Fatalf("prompt 值应原样保留, got %q: %s", got, gotBody)
+	if got := gjson.GetBytes(gotBody, "instructions").String(); got != "client_metadata" {
+		t.Fatalf("instructions 值应原样保留, got %q: %s", got, gotBody)
 	}
 	if v := gjson.GetBytes(gotBody, "client_metadata.turn_id").String(); !uuidv7Re.MatchString(v) {
 		t.Fatalf("注入应照常执行（自动 turn_id UUIDv7）, got client_metadata=%s", gjson.GetBytes(gotBody, "client_metadata").Raw)

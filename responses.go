@@ -37,9 +37,9 @@ const (
 func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPResponse, error) {
 	wire := payload
 	// 无条件覆盖 stream:true（含显式 stream:false）；非法 JSON 放弃注入保持原样
-	// （对齐 injectClientMetadataKeys 失败语义 + FilterCodexPayload 的
-	// gjson.ValidBytes 先例——sjson.SetBytes 对非法 JSON 不报错而是静默产出
-	// 损坏字节，须前置有效性校验）。
+	// （对齐 injectClientMetadataKeys 失败语义 + FilterCodexWsPayload/
+	// FilterCodexHTTPPayload 的 gjson.ValidBytes 先例——sjson.SetBytes 对非法 JSON
+	// 不报错而是静默产出损坏字节，须前置有效性校验）。
 	if gjson.ValidBytes(payload) {
 		if injected, err := sjson.SetBytes(payload, "stream", true); err == nil {
 			wire = injected

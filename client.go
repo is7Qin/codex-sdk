@@ -98,7 +98,6 @@ type options struct {
 	headers      http.Header
 
 	// 伪装层（Send 帧 / 升级与请求头）。
-	filtering       bool // Send 白名单过滤（默认开）
 	meta            *CodexMeta
 	metaPassthrough []metadataEntry // WithClientMetadata 注入项（WS client_metadata 任意键，只注入不解析）
 	session         *Session        // 会话标识（握手头 + 帧内 metadata）
@@ -119,7 +118,6 @@ func defaultOptions() options {
 		readLimit:    defaultReadLimit,
 		pingInterval: defaultPingInterval,
 		beta:         DefaultBetaWS,
-		filtering:    true,
 		traceAuto:    true,
 		turnAuto:     true,
 		maxLineSize:  defaultMaxLineSize,
@@ -161,12 +159,6 @@ func WithHeader(key, value string) Option {
 		}
 		o.headers.Add(key, value)
 	}
-}
-
-// WithPayloadFiltering 开关 Send 帧的顶层 key 白名单过滤（默认开；
-// 关闭后帧原样直写，零分配快速路径）。
-func WithPayloadFiltering(enabled bool) Option {
-	return func(o *options) { o.filtering = enabled }
 }
 
 // WithCodexMeta 设置 client_metadata 静态载体（值由调用方提供，
@@ -253,7 +245,6 @@ type Client struct {
 	pingInterval time.Duration
 
 	// 伪装层（Send 帧组装）。
-	filtering       bool
 	meta            *CodexMeta
 	metaPassthrough []metadataEntry // WithClientMetadata 注入项（只注入不解析）
 	session         *Session        // 会话标识（握手头 + 帧内 metadata）
@@ -379,7 +370,6 @@ func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 	c := &Client{
 		conn:            conn,
 		pingInterval:    cfg.pingInterval,
-		filtering:       cfg.filtering,
 		meta:            cfg.meta,
 		metaPassthrough: cfg.metaPassthrough,
 		session:         cfg.session,
@@ -414,11 +404,10 @@ func dialStatus(resp *http.Response) int {
 
 // Send 发送一帧字节（文本帧）。
 //
-// 伪装层默认生效（Options 可关）：白名单过滤（FilterCodexPayload，过滤后为空
-// 返回 ErrEmptyFrame 不入网）+ client_metadata 组装（CodexMeta 静态值 /
-// trace / turn_metadata；整体替换帧内 client_metadata——客户端自带的永不透传）。
-// 关闭过滤且无任何注入时为零拷贝零分配快速路径；Write 同步消费——
-// Send 返回前不得复用 frame。
+// WS 归一无条件生效：顶层白名单过滤（FilterCodexWsPayload，过滤后为空返回
+// ErrEmptyFrame 不入网）+ 强制 store:false；其后 client_metadata 组装照旧
+// （CodexMeta 静态值 / trace / turn_metadata；整体替换帧内 client_metadata——
+// 客户端自带的永不透传）。Write 同步消费——Send 返回前不得复用 frame。
 func (c *Client) Send(ctx context.Context, frame []byte) error {
 	frame, err := c.prepareFrame(frame)
 	if err != nil {
@@ -429,20 +418,18 @@ func (c *Client) Send(ctx context.Context, frame []byte) error {
 	return c.conn.Write(ctx, coderws.MessageText, frame)
 }
 
-// prepareFrame 应用伪装层：白名单过滤 + client_metadata 组装。
-// 优先级：CodexMeta 静态值 > WithSession > turn-state 回传 > WithClientMetadata
-// 透传 > 自动机制（turn_id / trace）> turn_metadata 回调；注入**恒覆盖**帧内已有
-// 同 key——codex 面客户端自带的 client_metadata 永不透传。全部禁用时零拷贝零
-// 分配原样返回。
+// prepareFrame 应用伪装层：WS 归一（无条件生效——FilterCodexWsPayload 顶层白名单
+// 过滤 + 强制 store:false）+ client_metadata 组装。优先级：CodexMeta 静态值 >
+// WithSession > turn-state 回传 > WithClientMetadata 透传 > 自动机制（turn_id /
+// trace）> turn_metadata 回调；注入**恒覆盖**帧内已有同 key——codex 面客户端自带
+// 的 client_metadata 永不透传。
 func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 	frame = RewriteEnvironmentContextTime(frame, time.Now())
-	if c.filtering {
-		var err error
-		frame, err = FilterCodexPayload(frame)
-		if err != nil {
-			return nil, err
-		}
+	frame, err := FilterCodexWsPayload(frame) // 始终过滤（不再有开关）
+	if err != nil {
+		return nil, err
 	}
+	frame = forceCodexStoreFalse(frame)
 	// 非法 JSON 放弃注入、帧原样返回（对齐 HTTP 面 injectResponsesClientMetadata
 	// 前置守卫——实测 sjson.SetRawBytes 对非法 JSON 静默产出损坏字节且 err=nil）。
 	if !gjson.ValidBytes(frame) {

@@ -91,41 +91,56 @@ const (
 	MetaResponsesLiteKey = "ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
-// CodexPayloadFields 是 response.create 顶层 key 白名单（18 字段 + type，
-// 对齐真实 ResponseCreateWsRequest——真实存在 stream_options）。
-// 只读，勿修改。
-var CodexPayloadFields = []string{
+// CodexWsPayloadFields 是 WS response.create 帧顶层 key 白名单（19 键，逐键对齐
+// 真实 ResponseCreateWsRequest，含 access_programs）。只读，勿改。
+var CodexWsPayloadFields = []string{
 	"type", "model", "instructions", "previous_response_id", "input",
 	"tools", "tool_choice", "parallel_tool_calls", "reasoning",
 	"store", "stream", "stream_options", "include", "service_tier",
-	"prompt_cache_key", "text", "generate", "client_metadata",
+	"prompt_cache_key", "text", "generate", "client_metadata", "access_programs",
 }
 
-var codexPayloadFieldSet = func() map[string]struct{} {
-	m := make(map[string]struct{}, len(CodexPayloadFields))
-	for _, f := range CodexPayloadFields {
+// CodexHTTPPayloadFields 是 HTTP POST 体顶层 key 白名单（16 键，逐键对齐真实
+// ResponsesApiRequest；无 type/previous_response_id/generate）。只读，勿改。
+var CodexHTTPPayloadFields = []string{
+	"model", "instructions", "input", "tools", "tool_choice",
+	"parallel_tool_calls", "reasoning", "store", "stream", "stream_options",
+	"include", "service_tier", "prompt_cache_key", "text",
+	"client_metadata", "access_programs",
+}
+
+// codexWsPayloadFieldSet / codexHTTPPayloadFieldSet 是两张白名单的构建期查表集
+// （供过滤用；只读，勿改）。
+var (
+	codexWsPayloadFieldSet   = newCodexFieldSet(CodexWsPayloadFields)
+	codexHTTPPayloadFieldSet = newCodexFieldSet(CodexHTTPPayloadFields)
+)
+
+func newCodexFieldSet(fields []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
 		m[f] = struct{}{}
 	}
 	return m
-}()
+}
 
 // ErrEmptyFrame 是帧经白名单过滤后无任何白名单字段时返回的错误
 // （空结果帧不入网）。
 var ErrEmptyFrame = errors.New("codexsdk: 帧经白名单过滤后为空")
 
-// FilterCodexPayload 顶层 key 白名单过滤（纯函数）：删除不在
-// CodexPayloadFields 中的顶层 key，白名单字段的值原样搬移（gjson raw，
-// 值内容零解析，只动顶层不深入嵌套）。
+// filterCodexPayload 顶层 key 白名单过滤（纯函数，WS/HTTP 两侧过滤器共用）：
+// 删除不在 ordered 中的顶层 key，白名单字段的值原样搬移（gjson raw，值内容
+// 零解析，只动顶层不深入嵌套）；set 为 ordered 的查表集。
 //
 // 空输入/非法 JSON 原样返回；无需删除时零拷贝返回原字节；
 // 过滤后无任何白名单字段时返回 ErrEmptyFrame。
-func FilterCodexPayload(raw []byte) ([]byte, error) {
+func filterCodexPayload(raw []byte, ordered []string, set map[string]struct{}) ([]byte, error) {
 	if len(raw) == 0 || !gjson.ValidBytes(raw) {
 		return raw, nil
 	}
 	needsFilter := false
 	gjson.ParseBytes(raw).ForEach(func(key, _ gjson.Result) bool {
-		if _, ok := codexPayloadFieldSet[key.String()]; !ok {
+		if _, ok := set[key.String()]; !ok {
 			needsFilter = true
 			return false
 		}
@@ -135,7 +150,7 @@ func FilterCodexPayload(raw []byte) ([]byte, error) {
 		return raw, nil
 	}
 	filtered := []byte(`{}`)
-	for _, field := range CodexPayloadFields {
+	for _, field := range ordered {
 		v := gjson.GetBytes(raw, field)
 		if !v.Exists() {
 			continue
@@ -146,6 +161,33 @@ func FilterCodexPayload(raw []byte) ([]byte, error) {
 		return nil, ErrEmptyFrame
 	}
 	return filtered, nil
+}
+
+// FilterCodexWsPayload 用 WS 白名单（CodexWsPayloadFields）过滤帧顶层 key。
+func FilterCodexWsPayload(raw []byte) ([]byte, error) {
+	return filterCodexPayload(raw, CodexWsPayloadFields, codexWsPayloadFieldSet)
+}
+
+// FilterCodexHTTPPayload 用 HTTP 白名单（CodexHTTPPayloadFields）过滤请求体顶层 key。
+func FilterCodexHTTPPayload(raw []byte) ([]byte, error) {
+	return filterCodexPayload(raw, CodexHTTPPayloadFields, codexHTTPPayloadFieldSet)
+}
+
+// forceCodexStoreFalse 强制顶层 store:false（真 codex 恒 false：client.rs:997）。
+// 非法 JSON 原样返回；store 已为 false 时**零拷贝**返回原字节（真 codex 帧恒带
+// store:false → 不重写，归一未改动时 Send 保有零拷贝快速路径）。
+func forceCodexStoreFalse(raw []byte) []byte {
+	if !gjson.ValidBytes(raw) {
+		return raw
+	}
+	if v := gjson.GetBytes(raw, "store"); v.Exists() && v.Type == gjson.False {
+		return raw // 已 false：零拷贝
+	}
+	out, err := sjson.SetBytes(raw, "store", false)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // RewriteEnvironmentContextTime 把 Codex 环境上下文中的本地时间改成美东时间。

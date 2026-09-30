@@ -129,12 +129,12 @@ func startReader(t *testing.T, c *Client) chan []byte {
 	return frames
 }
 
-// TestDialPATAuthAndRoundtrip：PAT 鉴权头注入 + 字节 roundtrip
-// （关闭伪装层，纯传输路径字节全等断言）。
+// TestDialPATAuthAndRoundtrip：PAT 鉴权头注入 + 帧 roundtrip（WS 归一无条件生效：
+// 白名单内字段保留 + 强制 store:false；无注入项时不动 client_metadata）。
 func TestDialPATAuthAndRoundtrip(t *testing.T) {
 	url, st := startEchoServer(t, "")
 	c, err := Dial(context.Background(), PAT("test-pat"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
-		WithPayloadFiltering(false), WithTraceAuto(false), WithTurnAuto(false))
+		WithTraceAuto(false), WithTurnAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -154,8 +154,16 @@ func TestDialPATAuthAndRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recv: %v", err)
 	}
-	if !bytes.Equal(data, event) {
-		t.Fatalf("echo 不一致: %s", data)
+	if gjson.GetBytes(data, "type").String() != "response.create" ||
+		gjson.GetBytes(data, "model").String() != "gpt-5" ||
+		gjson.GetBytes(data, "input").String() != "hi" {
+		t.Fatalf("白名单字段应保留: %s", data)
+	}
+	if gjson.GetBytes(data, "store").Type != gjson.False {
+		t.Fatalf("store 应被强制 false: %s", data)
+	}
+	if gjson.GetBytes(data, "client_metadata").Exists() {
+		t.Fatalf("无注入项时不应注入 client_metadata: %s", data)
 	}
 }
 
@@ -275,7 +283,7 @@ func TestBetaAndCustomHeaders(t *testing.T) {
 func TestPing(t *testing.T) {
 	url, _ := startEchoServer(t, "")
 	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
-		WithPayloadFiltering(false), WithTraceAuto(false), WithTurnAuto(false))
+		WithTraceAuto(false), WithTurnAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -292,8 +300,11 @@ func TestPing(t *testing.T) {
 	}
 	select {
 	case got := <-frames:
-		if string(got) != `{"type":"ping"}` {
+		if gjson.GetBytes(got, "type").String() != "ping" {
 			t.Fatalf("echo = %s", got)
+		}
+		if gjson.GetBytes(got, "store").Type != gjson.False {
+			t.Fatalf("store 应被强制 false: %s", got)
 		}
 	case <-ctx.Done():
 		t.Fatal("ping 后未收到 echo")
@@ -453,7 +464,7 @@ func TestBinaryFrameRecv(t *testing.T) {
 func TestRecvBufferOwnership(t *testing.T) {
 	url, _ := startEchoServer(t, "")
 	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
-		WithPayloadFiltering(false), WithTraceAuto(false), WithTurnAuto(false))
+		WithTraceAuto(false), WithTurnAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -475,10 +486,10 @@ func TestRecvBufferOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recv: %v", err)
 	}
-	if !bytes.Equal(buf1, first) {
+	if gjson.GetBytes(buf1, "input").String() != "a" {
 		t.Fatalf("第一次 Recv 缓冲被后续 Recv 污染: %s", buf1)
 	}
-	if !bytes.Equal(buf2, second) {
+	if gjson.GetBytes(buf2, "input").String() != "b" {
 		t.Fatalf("第二次 Recv 内容不符: %s", buf2)
 	}
 }

@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"sync"
@@ -54,36 +57,41 @@ func TestRewriteEnvironmentContextTime(t *testing.T) {
 	}
 }
 
-// TestFilterCodexPayload：顶层 key 白名单过滤（纯函数）。
-func TestFilterCodexPayload(t *testing.T) {
-	in := []byte(`{"type":"response.create","model":"gpt-5","input":"hi","stream_options":{"reasoning_summary_delivery":"sequential_cutoff"},"evil":"x","foo":{"bar":1}}`)
-	out, err := FilterCodexPayload(in)
+// TestFilterCodexWsPayload：WS 顶层 key 白名单过滤（纯函数）。
+func TestFilterCodexWsPayload(t *testing.T) {
+	in := []byte(`{"type":"response.create","model":"gpt-5","input":"hi","access_programs":["org-a"],"stream_options":{"reasoning_summary_delivery":"sequential_cutoff"},"max_output_tokens":4096,"evil":"x","foo":{"bar":1}}`)
+	out, err := FilterCodexWsPayload(in)
 	if err != nil {
-		t.Fatalf("FilterCodexPayload: %v", err)
+		t.Fatalf("FilterCodexWsPayload: %v", err)
 	}
-	if gjson.GetBytes(out, "evil").Exists() || gjson.GetBytes(out, "foo").Exists() {
-		t.Fatalf("非白名单 key 应被删除: %s", out)
+	for _, k := range []string{"max_output_tokens", "evil", "foo"} {
+		if gjson.GetBytes(out, k).Exists() {
+			t.Fatalf("非白名单 key %q 应被删除: %s", k, out)
+		}
 	}
 	if gjson.GetBytes(out, "type").String() != "response.create" ||
 		gjson.GetBytes(out, "model").String() != "gpt-5" ||
 		gjson.GetBytes(out, "input").String() != "hi" {
 		t.Fatalf("白名单字段应保留: %s", out)
 	}
-	// stream_options 属真实 response.create 字段，应保留
+	// access_programs 属真实 WS 字段（新补），应保留且值原样
+	if v := gjson.GetBytes(out, "access_programs"); !v.Exists() || v.Raw != `["org-a"]` {
+		t.Fatalf("access_programs 应保留且值原样: %s", out)
+	}
 	if v := gjson.GetBytes(out, "stream_options.reasoning_summary_delivery").String(); v != "sequential_cutoff" {
 		t.Fatalf("stream_options 应保留: %s", out)
 	}
 
 	// 过滤后为空 → ErrEmptyFrame（空结果帧不入网）
-	if _, err := FilterCodexPayload([]byte(`{"evil":1,"foo":2}`)); !errors.Is(err, ErrEmptyFrame) {
+	if _, err := FilterCodexWsPayload([]byte(`{"evil":1,"foo":2,"max_output_tokens":9}`)); !errors.Is(err, ErrEmptyFrame) {
 		t.Fatalf("过滤后为空应返回 ErrEmptyFrame, got %v", err)
 	}
 
 	// 无需过滤时零拷贝原样返回
 	clean := []byte(`{"type":"response.create"}`)
-	got, err := FilterCodexPayload(clean)
+	got, err := FilterCodexWsPayload(clean)
 	if err != nil {
-		t.Fatalf("FilterCodexPayload: %v", err)
+		t.Fatalf("FilterCodexWsPayload: %v", err)
 	}
 	if len(got) == 0 || &got[0] != &clean[0] {
 		t.Fatal("干净输入应零拷贝原样返回")
@@ -91,18 +99,237 @@ func TestFilterCodexPayload(t *testing.T) {
 
 	// 非法 JSON / 空输入原样返回
 	bad := []byte("not json")
-	got, err = FilterCodexPayload(bad)
-	if err != nil || !bytes.Equal(got, bad) {
+	if got, err := FilterCodexWsPayload(bad); err != nil || !bytes.Equal(got, bad) {
 		t.Fatalf("非法 JSON 应原样返回: %v %s", err, got)
 	}
-	got, err = FilterCodexPayload(nil)
-	if err != nil || got != nil {
+	if got, err := FilterCodexWsPayload(nil); err != nil || got != nil {
 		t.Fatalf("空输入应原样返回: %v", err)
 	}
 }
 
-// TestSendDefaultFiltering：Send 默认应用白名单过滤，Options 可关。
-func TestSendDefaultFiltering(t *testing.T) {
+// TestFilterCodexHTTPPayload：HTTP 顶层 key 白名单过滤（纯函数）——
+// type/previous_response_id/generate 被剥（HTTP 无此三键），access_programs 保留。
+func TestFilterCodexHTTPPayload(t *testing.T) {
+	in := []byte(`{"model":"gpt-5","input":"hi","access_programs":["org-a"],"type":"response.create","previous_response_id":"resp_1","generate":true,"max_output_tokens":4096,"evil":1}`)
+	out, err := FilterCodexHTTPPayload(in)
+	if err != nil {
+		t.Fatalf("FilterCodexHTTPPayload: %v", err)
+	}
+	for _, k := range []string{"type", "previous_response_id", "generate", "max_output_tokens", "evil"} {
+		if gjson.GetBytes(out, k).Exists() {
+			t.Fatalf("HTTP 白名单外 key %q 应被删除: %s", k, out)
+		}
+	}
+	if gjson.GetBytes(out, "model").String() != "gpt-5" || gjson.GetBytes(out, "input").String() != "hi" {
+		t.Fatalf("白名单字段应保留: %s", out)
+	}
+	if v := gjson.GetBytes(out, "access_programs"); !v.Exists() || v.Raw != `["org-a"]` {
+		t.Fatalf("access_programs 应保留且值原样: %s", out)
+	}
+
+	// 过滤后为空 → ErrEmptyFrame
+	if _, err := FilterCodexHTTPPayload([]byte(`{"type":"response.create","generate":true}`)); !errors.Is(err, ErrEmptyFrame) {
+		t.Fatalf("过滤后为空应返回 ErrEmptyFrame, got %v", err)
+	}
+
+	// 无需过滤时零拷贝原样返回
+	clean := []byte(`{"model":"gpt-5"}`)
+	got, err := FilterCodexHTTPPayload(clean)
+	if err != nil {
+		t.Fatalf("FilterCodexHTTPPayload: %v", err)
+	}
+	if len(got) == 0 || &got[0] != &clean[0] {
+		t.Fatal("干净输入应零拷贝原样返回")
+	}
+
+	// 非法 JSON / 空输入原样返回
+	bad := []byte("not json")
+	if got, err := FilterCodexHTTPPayload(bad); err != nil || !bytes.Equal(got, bad) {
+		t.Fatalf("非法 JSON 应原样返回: %v %s", err, got)
+	}
+	if got, err := FilterCodexHTTPPayload(nil); err != nil || got != nil {
+		t.Fatalf("空输入应原样返回: %v", err)
+	}
+}
+
+// TestCodexWhitelists：两张白名单逐键对齐真实 codex 结构。
+func TestCodexWhitelists(t *testing.T) {
+	if len(CodexWsPayloadFields) != 19 {
+		t.Fatalf("CodexWsPayloadFields 键数 = %d, 期望 19", len(CodexWsPayloadFields))
+	}
+	wsSet := map[string]bool{}
+	for _, f := range CodexWsPayloadFields {
+		if wsSet[f] {
+			t.Fatalf("CodexWsPayloadFields 含重复键 %q", f)
+		}
+		wsSet[f] = true
+	}
+	if !wsSet["access_programs"] {
+		t.Fatal("CodexWsPayloadFields 应含 access_programs")
+	}
+	if wsSet["max_output_tokens"] {
+		t.Fatal("CodexWsPayloadFields 不应含 max_output_tokens")
+	}
+
+	if len(CodexHTTPPayloadFields) != 16 {
+		t.Fatalf("CodexHTTPPayloadFields 键数 = %d, 期望 16", len(CodexHTTPPayloadFields))
+	}
+	httpSet := map[string]bool{}
+	for _, f := range CodexHTTPPayloadFields {
+		if httpSet[f] {
+			t.Fatalf("CodexHTTPPayloadFields 含重复键 %q", f)
+		}
+		httpSet[f] = true
+	}
+	if !httpSet["access_programs"] {
+		t.Fatal("CodexHTTPPayloadFields 应含 access_programs")
+	}
+	if httpSet["max_output_tokens"] {
+		t.Fatal("CodexHTTPPayloadFields 不应含 max_output_tokens")
+	}
+
+	// HTTP == WS − {type, previous_response_id, generate}
+	wantHTTP := map[string]bool{}
+	for _, f := range CodexWsPayloadFields {
+		switch f {
+		case "type", "previous_response_id", "generate":
+			continue
+		}
+		wantHTTP[f] = true
+	}
+	if len(wantHTTP) != len(httpSet) {
+		t.Fatalf("HTTP 键集大小 = %d, 期望 WS−3 = %d", len(httpSet), len(wantHTTP))
+	}
+	for f := range wantHTTP {
+		if !httpSet[f] {
+			t.Fatalf("HTTP 白名单缺 WS 键 %q", f)
+		}
+	}
+	for f := range httpSet {
+		if !wantHTTP[f] {
+			t.Fatalf("HTTP 白名单含非 WS−3 键 %q", f)
+		}
+	}
+}
+
+// TestForceCodexStoreFalse：强制顶层 store:false。
+func TestForceCodexStoreFalse(t *testing.T) {
+	// store:true → false
+	out := forceCodexStoreFalse([]byte(`{"model":"m","store":true}`))
+	if gjson.GetBytes(out, "store").Bool() {
+		t.Fatalf("store:true 应被强制为 false: %s", out)
+	}
+	if gjson.GetBytes(out, "model").String() != "m" {
+		t.Fatalf("不应动其余字段: %s", out)
+	}
+	// 缺 store → 补 false
+	out = forceCodexStoreFalse([]byte(`{"model":"m"}`))
+	if sv := gjson.GetBytes(out, "store"); !sv.Exists() || sv.Type != gjson.False {
+		t.Fatalf("缺 store 应补 false: %s", out)
+	}
+	// store 已 false → 零拷贝短路（真 codex 帧恒带 store:false，不重写）
+	falseFrame := []byte(`{"type":"response.create","store":false}`)
+	if got := forceCodexStoreFalse(falseFrame); len(got) == 0 || &got[0] != &falseFrame[0] {
+		t.Fatal("store 已 false 应零拷贝返回原字节")
+	}
+	// 非法 JSON 原样
+	bad := []byte("not json")
+	if got := forceCodexStoreFalse(bad); !bytes.Equal(got, bad) {
+		t.Fatalf("非法 JSON 应原样返回: %s", got)
+	}
+}
+
+// TestPrepareFrameZeroCopyWhenNormalized：已归一帧（顶层键全在白名单内且已含
+// store:false）+ 无任何注入 → prepareFrame 零拷贝原样返回（感知不到归一的
+// 老路径——真 codex 帧在有身份注入时另经 client_metadata 组装）。
+func TestPrepareFrameZeroCopyWhenNormalized(t *testing.T) {
+	c := &Client{} // 无 meta/session/trace/turnAuto，注入项为空
+	in := []byte(`{"type":"response.create","model":"gpt-5","store":false}`)
+	got, err := c.prepareFrame(in)
+	if err != nil {
+		t.Fatalf("prepareFrame: %v", err)
+	}
+	if len(got) == 0 || &got[0] != &in[0] {
+		t.Fatal("已归一且无注入时 prepareFrame 应零拷贝原样返回")
+	}
+	if gjson.GetBytes(got, "store").Bool() || gjson.GetBytes(got, "model").String() != "gpt-5" {
+		t.Fatalf("归一后帧内容应保持: %s", got)
+	}
+}
+
+// TestSendNormalizesWsFrame：Send 无条件归一（WS 白名单过滤 + 强制 store:false），
+// 白名单内 access_programs 保留，client_metadata 仍按既有机制注入。
+func TestSendNormalizesWsFrame(t *testing.T) {
+	url, st := startEchoServer(t, "")
+	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
+		WithCodexMeta(CodexMeta{InstallationID: "inst-1"}))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close(StatusGoingAway, "")
+
+	frame := []byte(`{"type":"response.create","model":"gpt-5","store":true,"max_output_tokens":4096,"access_programs":["org-a"],"evil":1}`)
+	if err := c.Send(context.Background(), frame); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitFor(t, func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return len(st.texts) >= 1
+	})
+	got := func() string { st.mu.Lock(); defer st.mu.Unlock(); return string(st.texts[0]) }()
+	if gjson.Get(got, "max_output_tokens").Exists() || gjson.Get(got, "evil").Exists() {
+		t.Fatalf("非 WS 白名单键应被剥: %s", got)
+	}
+	if gjson.Get(got, "store").Bool() {
+		t.Fatalf("store 应被强制 false: %s", got)
+	}
+	if v := gjson.Get(got, "access_programs"); !v.Exists() || v.Raw != `["org-a"]` {
+		t.Fatalf("access_programs 应保留: %s", got)
+	}
+	if v := gjson.Get(got, "client_metadata.x-codex-installation-id").String(); v != "inst-1" {
+		t.Fatalf("client_metadata 注入应仍生效: %s", got)
+	}
+}
+
+// TestHTTPStreamNormalizesPayload：HTTP Stream 发出的体经 codex 形状归一
+// （HTTP 白名单过滤 + 强制 store:false），client_metadata 注入仍生效。
+func TestHTTPStreamNormalizesPayload(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
+		WithCodexMeta(CodexMeta{InstallationID: "inst-1"}))
+	payload := []byte(`{"model":"m","input":"hi","store":true,"max_output_tokens":4096,"type":"response.create","previous_response_id":"resp_1","generate":true,"access_programs":["org-a"]}`)
+	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	for _, k := range []string{"max_output_tokens", "type", "previous_response_id", "generate"} {
+		if gjson.GetBytes(gotBody, k).Exists() {
+			t.Fatalf("HTTP 白名单外键 %q 应被剥: %s", k, gotBody)
+		}
+	}
+	if gjson.GetBytes(gotBody, "store").Bool() {
+		t.Fatalf("store 应被强制 false: %s", gotBody)
+	}
+	if v := gjson.GetBytes(gotBody, "access_programs"); !v.Exists() || v.Raw != `["org-a"]` {
+		t.Fatalf("access_programs 应保留: %s", gotBody)
+	}
+	if v := gjson.GetBytes(gotBody, "client_metadata.x-codex-installation-id").String(); v != "inst-1" {
+		t.Fatalf("client_metadata 注入应生效: %s", gotBody)
+	}
+}
+
+// TestSendNormalizesUnconditionally：Send 恒做 WS 归一（无开关）——
+// 过滤白名单外键 + 强制 store:false；过滤后为空帧不入网。
+func TestSendNormalizesUnconditionally(t *testing.T) {
 	url, st := startEchoServer(t, "")
 	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
@@ -110,7 +337,7 @@ func TestSendDefaultFiltering(t *testing.T) {
 	}
 	defer c.Close(StatusGoingAway, "")
 
-	frame := []byte(`{"type":"response.create","model":"gpt-5","evil":"drop-me"}`)
+	frame := []byte(`{"type":"response.create","model":"gpt-5","evil":"drop-me","store":true}`)
 	if err := c.Send(context.Background(), frame); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -121,30 +348,13 @@ func TestSendDefaultFiltering(t *testing.T) {
 	})
 	got1 := func() string { st.mu.Lock(); defer st.mu.Unlock(); return string(st.texts[0]) }()
 	if gjson.Get(got1, "evil").Exists() {
-		t.Fatalf("默认应过滤 evil: %s", got1)
+		t.Fatalf("应过滤 evil: %s", got1)
 	}
 	if gjson.Get(got1, "model").String() != "gpt-5" {
 		t.Fatalf("model 应保留: %s", got1)
 	}
-
-	// 关闭过滤
-	url2, st2 := startEchoServer(t, "")
-	c2, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)), WithPayloadFiltering(false))
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer c2.Close(StatusGoingAway, "")
-	if err := c2.Send(context.Background(), frame); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	waitFor(t, func() bool {
-		st2.mu.Lock()
-		defer st2.mu.Unlock()
-		return len(st2.texts) >= 1
-	})
-	got2 := func() string { st2.mu.Lock(); defer st2.mu.Unlock(); return string(st2.texts[0]) }()
-	if !gjson.Get(got2, "evil").Exists() {
-		t.Fatalf("关闭过滤后 evil 应保留: %s", got2)
+	if gjson.Get(got1, "store").Bool() {
+		t.Fatalf("store 应被强制 false: %s", got1)
 	}
 
 	// 过滤后为空：Send 返回 ErrEmptyFrame 且不入网

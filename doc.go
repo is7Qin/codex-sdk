@@ -26,7 +26,7 @@
 //     事件帧时调用）
 //   - 伪装层（真实 codex 客户端形态对齐，对照见 IMPERSONATION.md）：默认
 //     codex-tui UA/originator（0.154.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
-//     Send 帧顶层 key 白名单过滤（18 字段）、client_metadata **整体替换**组装
+//     WS/HTTP 各自顶层白名单过滤（含 store:false 强制），无条件生效、client_metadata **整体替换**组装
 //     （WS 帧面 8 key 恒发：installation_id/session_id/thread_id/turn_id/
 //     window_id/turn-metadata/traceparent/tracestate；HTTP 体面恒 4 key +
 //     turn_id + 条件键，不含 trace/turn-state，见 injectResponsesClientMetadata；
@@ -65,12 +65,14 @@
 // # 性能语义（性能优先：懒构建 + 热路径低分配）
 //
 //   - 无全局可变状态：连接/客户端均按需构建，心跳 goroutine 仅连接存活期间存在
-//   - WS 帧收发零额外分配：Send 直传帧字节（零拷贝）；Recv 返回 coder/websocket
-//     每次 Read 独立分配的读缓冲（跨次调用有效，无需拷贝即可保留）
-//   - 伪装层默认开启（白名单过滤 + client_metadata 注入 + 每帧 trace/turn_id），
-//     Send 的 JSON 组装开销仅在开启时发生；WithPayloadFiltering(false) /
-//     WithTraceAuto(false) / WithTurnAuto(false) 且无任何注入时回到
-//     零拷贝零分配快速路径
+//   - WS 帧收发零额外分配：Send 直传帧字节（帧未被归一改写时零拷贝）；Recv 返回
+//     coder/websocket 每次 Read 独立分配的读缓冲（跨次调用有效，无需拷贝即可保留）
+//   - 伪装层恒开（WS/HTTP 各自顶层白名单过滤 + 强制 store:false + client_metadata
+//     注入 + 每帧 trace/turn_id；归一不可关）；WithTraceAuto(false) /
+//     WithTurnAuto(false) 且无任何注入时，帧已含 store:false 且无白名单外顶层键
+//     则归一不重写、Send 回到零拷贝低分配快速路径（帧原样；仅余 gjson 扫描的
+//     常量级分配。forceCodexStoreFalse 对已 false 的 store 短路——真 codex 帧
+//     恒带 store:false）
 //   - 常驻读循环是硬性要求：Ping 与心跳依赖 Recv 处理 pong 控制帧
 //     （coder/websocket：Ping 必须与 Reader 并发，否则等不到 pong）；
 //     网关透传编排天然常驻 Recv 循环，满足该前提
@@ -104,7 +106,7 @@
 // （WithClientMetadata 注入），SDK 只注入不解析。
 // 传输常量对齐参考实现：16MiB ReadLimit（coder 默认 32KB 过小）、
 // CompressionContextTakeover 压缩、WS 层 ping 心跳（30s 间隔 + 2s 超时）、
-// data: SSE 行提取与 [DONE] 终止、response.create 18 字段白名单、
+// data: SSE 行提取与 [DONE] 终止、response.create 19 字段白名单、
 // client_metadata 恒发 8 key 集合（session_id/thread_id/turn_id 为 snake_case，
 // trace 的 metadata key 名与头名不同）。HTTP /responses 面注入（Stream
 // 发送前统一执行）恒 4 key（x-codex-installation-id/session_id/thread_id/

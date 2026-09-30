@@ -116,14 +116,19 @@ func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, err
 // 行切片——回调内的字节引用 scanner 复用缓冲，仅在回调执行期间有效；
 // 跨回调保留需自行拷贝），[DONE] 标记流正常终止。
 //
-// 发送前统一注入 client_metadata（对齐真实 codex client_metadata()——
+// 发送前无条件归一（HTTP 白名单过滤 FilterCodexHTTPPayload + 强制 store:false），
+// 再统一注入 client_metadata（对齐真实 codex client_metadata()——
 // responses_metadata.rs:255-288；见 injectResponsesClientMetadata）。
-// Responses 内部调 Stream 走同一注入点，避免两路径重复；Do 是通用非流式
-// POST 不注入（GenerateImage/Search 各自端点不受影响）。
+// Responses 内部调 Stream 走同一归一+注入点，避免两路径重复；Do 是通用非流式
+// POST 不归一也不注入（GenerateImage/Search 各自端点不受影响）。
 //
 // fn 返回错误立即终止读取并透传该错误。非 2xx 返回 *HTTPError；
 // 401 自动轮转语义同 Do。
 func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []byte) error) error {
+	payload, err := normalizeCodexHTTPPayload(payload)
+	if err != nil {
+		return err
+	}
 	payload = c.injectResponsesClientMetadata(payload)
 	resp, err := c.do(ctx, payload)
 	if err != nil {
@@ -173,6 +178,17 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 		return fmt.Errorf("codexsdk: 读取 SSE 流失败: %w", err)
 	}
 	return nil // EOF 结束（是否截断由网关按终态事件判定）
+}
+
+// normalizeCodexHTTPPayload 对 HTTP /responses 请求体做 codex 形状归一：
+// HTTP 白名单过滤（FilterCodexHTTPPayload）后强制 store:false。空/非法 JSON
+// 原样返回；过滤后无任何白名单字段 → ErrEmptyFrame（空结果体不入网）。
+func normalizeCodexHTTPPayload(raw []byte) ([]byte, error) {
+	filtered, err := FilterCodexHTTPPayload(raw)
+	if err != nil {
+		return nil, err
+	}
+	return forceCodexStoreFalse(filtered), nil
 }
 
 // injectResponsesClientMetadata 在发送前注入 HTTP /responses 面的
