@@ -70,9 +70,11 @@
 //   - 伪装层恒开（WS/HTTP 各自顶层白名单过滤 + 强制 store:false + client_metadata
 //     注入 + 每帧 trace/turn_id；归一不可关）；WithTraceAuto(false) /
 //     WithTurnAuto(false) 且无任何注入时，帧已含 store:false 且无白名单外顶层键
-//     则归一不重写、Send 回到零拷贝低分配快速路径（帧原样；仅余 gjson 扫描的
-//     常量级分配。forceCodexStoreFalse 对已 false 的 store 短路——真 codex 帧
-//     恒带 store:false）
+//     则归一不重写、Send 零拷贝返回原字节；顶层键扫描零拷贝零分配（仅
+//     forceCodexStoreFalse 的 store 探测有常量级小分配）。含
+//     <environment_context> 的帧另经 RewriteEnvironmentContextTime 重写
+//     （该步有 payload 级分配，非本路径。forceCodexStoreFalse 对已 false 的
+//     store 短路——真 codex 帧恒带 store:false）
 //   - 常驻读循环是硬性要求：Ping 与心跳依赖 Recv 处理 pong 控制帧
 //     （coder/websocket：Ping 必须与 Reader 并发，否则等不到 pong）；
 //     网关透传编排天然常驻 Recv 循环，满足该前提
@@ -100,6 +102,7 @@
 //     ResponseCreateWsRequest.client_metadata（:1702-1711 帧体携带）；SDK 帧注入
 //     （client.go prepareFrame）逐点一致：升级响应头签发 → 帧内回传
 //     （Client.TurnState 缓存 + 网关 SetTurnState("") 清除，跨轮不得回传）。
+//
 // responses-lite 非独立端点：与 /responses 同端点同事件集，
 // 仅 internal 标记区分——HTTP 头 x-openai-internal-codex-responses-lite（WithHeader
 // 透传）与 WS client_metadata 键 ws_request_header_x_openai_internal_codex_responses_lite

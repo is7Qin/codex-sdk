@@ -743,3 +743,184 @@ func TestTurnIDOverride(t *testing.T) {
 		t.Fatalf("无值帧应自动生成 UUIDv7 turn_id, got %q", v)
 	}
 }
+
+// refNeedsFilter 是等价性参考实现（**旧路径**：gjson.ParseBytes(...).ForEach +
+// key.String() 查表），与优化前 filterCodexPayload 的判定逐一等价。
+func refNeedsFilter(raw []byte, set map[string]struct{}) bool {
+	needs := false
+	gjson.ParseBytes(raw).ForEach(func(key, _ gjson.Result) bool {
+		if _, ok := set[key.String()]; !ok {
+			needs = true
+			return false
+		}
+		return true
+	})
+	return needs
+}
+
+// codexTopLevelNeedsFilterCorpus 是与参考实现逐一对照的语料：覆盖干净对象、
+// 非白名单顶层键、嵌套（只看顶层）、值内含 {}[]"\\:,\uXXXX/"tools" 字样、
+// 空白变体、转义顶层键、空对象、非对象根、重复键等形态。
+var codexTopLevelNeedsFilterCorpus = []string{
+	// — 干净对象（顶层键全在白名单内）→ false —
+	`{"type":"response.create","model":"gpt-5","store":false}`,
+	`{"model":"gpt-5.5","instructions":"be helpful","input":[],"tools":[],"tool_choice":"auto","parallel_tool_calls":true,"reasoning":{"effort":"low"},"store":false,"stream":true,"stream_options":{},"include":[],"service_tier":"auto","prompt_cache_key":"k","text":{},"client_metadata":{},"access_programs":[]}`,
+	// 空对象 → false
+	`{}`,
+	// — 非白名单顶层键 → true —
+	`{"model":"gpt-5","max_output_tokens":4096}`,
+	`{"evil":1}`,
+	`{"model":"m","evil":1,"store":false}`,
+	`{"max_output_tokens":1}`,
+	// — 嵌套：判定只看顶层键（嵌套内的非白名单键不触发）—
+	`{"client_metadata":{"evil":1}}`,                            // 顶层键白名单，嵌套 evil 忽略 → false
+	`{"reasoning":{"evil":1,"nested":{"max_output_tokens":2}}}`, // 同上 → false
+	`{"input":[{"role":"user","evil":1}]}`,                      // 数组元素内的 evil 忽略 → false
+	`{"text":{"format":{"type":"text"},"s":"}{[]"}}`,            // 嵌套值含括号字符 → false
+	`{"a":{"evil":1}}`,                                          // 顶层键 a 非白名单 → true（决定权在顶层键）
+	`{"a":[{"evil":1}]}`,                                        // 同上 → true
+	// — 值内含 { } [ ] " \ : \uXXXX , 等字符/字面量（依顶层键判定）—
+	`{"model":"a}b,c","instructions":"x\"y"}`,
+	`{"model":"a[b]c{d}e","input":[{"content":"p,q"}]}`,
+	`{"model":"a:b","store":false}`,
+	`{"model":"\\u0041","store":false}`,
+	`{"model":"\u0041","store":false}`,
+	`{"model":"the tools list","instructions":"use \"tools\" here"}`,
+	`{"model":"[{\"nested\":\"fake\"}]","store":false}`,
+	`{"model":"x","text":{"v":"a\"b\\c"}}`,
+	// — 值类型变体（null / true / false / 数字 / 嵌套数组）—
+	`{"model":null,"store":false}`,
+	`{"model":"m","parallel_tool_calls":true,"stream":false,"store":false,"include":[1,2,3]}`,
+	`{"model":"m","reasoning":{"effort":"low"},"input":[{"a":1},{"b":[true,false,null]}]}`,
+	// — 空白变体（键/冒号/值之间、前后、内部换行制表）—
+	`{"tools" : []}`,
+	`{ "model" : "m" , "input" : [ 1 , 2 ] }`,
+	"{\n\t\"model\"\n:\n\"m\"\n}",
+	`  {"model":"m"}  `,
+	// — 转义顶层键：回退 gjson（精确 unescape 语义）—
+	`{"mo\u0064el":1}`,           // 解码 model → false
+	`{"ev\u0069l":1}`,            // 解码 evil → true
+	"{\"store\\\\\":1}",          // 键解码为 store\ → 非白名单 → true
+	`{"model":1,"mo\u0064el":2}`, // 混合（解码后均为 model）→ false
+	// — 重复顶层键 —
+	`{"model":1,"model":2}`,
+	// — 非对象根：回退 gjson（与参考实现完全一致）—
+	`[]`,      // → false（空数组无回调）
+	`[ ]`,     // → false
+	`[1]`,     // → true
+	`  [1]  `, // → true
+	`123`,     // → true
+	`null`,    // → true
+	`true`,    // → true
+	`"x"`,     // → true
+	`"model"`, // → true
+}
+
+// TestCodexTopLevelNeedsFilterEquivalence：零拷贝顶层键扫描 codexTopLevelNeedsFilter
+// 与旧 gjson ForEach 参考实现 refNeedsFilter 对语料逐一等价（WS / HTTP 两张白名单集）。
+func TestCodexTopLevelNeedsFilterEquivalence(t *testing.T) {
+	sets := map[string]map[string]struct{}{
+		"ws":   codexWsPayloadFieldSet,
+		"http": codexHTTPPayloadFieldSet,
+	}
+	for name, set := range sets {
+		for _, raw := range codexTopLevelNeedsFilterCorpus {
+			got := codexTopLevelNeedsFilter([]byte(raw), set)
+			want := refNeedsFilter([]byte(raw), set)
+			if got != want {
+				t.Errorf("[%s] codexTopLevelNeedsFilter(%q) = %v, 参考实现 = %v", name, raw, got, want)
+			}
+		}
+	}
+}
+
+// TestCodexTopLevelNeedsFilterExplicit 钉住关键形态的**显式期望值**（独立于
+// gjson，防上游库语义漂移时静默改写契约），并与参考实现交叉校验（等价 = 无行为变化）。
+func TestCodexTopLevelNeedsFilterExplicit(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{`{"type":"response.create","model":"gpt-5","store":false}`, false}, // 顶层键全在白名单
+		{`{"model":"m","max_output_tokens":4096}`, true},                    // 白名单外顶层键
+		{`{"client_metadata":{"evil":1}}`, false},                           // 嵌套非白名单：只看顶层（外层白名单）
+		{`{"input":[{"evil":1}]}`, false},                                   // 嵌套数组同上
+		{`{"a":{"evil":1}}`, true},                                          // 顶层键 a 本身非白名单
+		{`{"a":[{"evil":1}]}`, true},
+		{`{}`, false},
+		{`[]`, false}, // 非对象根回退 gjson：空数组根旧行为 = false
+		{`[1]`, true},
+		{`123`, true},
+		{`null`, true},
+		{`"x"`, true},
+		{`{"mo\u0064el":1}`, false},                        // 转义顶层键解码 = model（白名单）
+		{`{"ev\u0069l":1}`, true},                          // 转义顶层键解码 = evil（非白名单）
+		{`{"model":"a}b,c","instructions":"x\"y"}`, false}, // 值内含分隔符/转义，顶层键白名单
+		{`{"tools" : []}`, false},                          // 键与冒号间空白
+	}
+	for _, c := range cases {
+		got := codexTopLevelNeedsFilter([]byte(c.raw), codexWsPayloadFieldSet)
+		if got != c.want {
+			t.Errorf("codexTopLevelNeedsFilter(%q) = %v, 期望 %v", c.raw, got, c.want)
+		}
+		if ref := refNeedsFilter([]byte(c.raw), codexWsPayloadFieldSet); ref != c.want {
+			t.Errorf("refNeedsFilter(%q) = %v, 期望 %v（参考实现与显式期望不符）", c.raw, ref, c.want)
+		}
+	}
+}
+
+// 故对 WS / HTTP 两集均 clean），含 store:false，大 input 模拟长会话。
+func cleanCodexFrame() []byte {
+	var b strings.Builder
+	b.WriteString(`{"model":"gpt-5.5","input":[`)
+	for i := 0; i < 512; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":"`)
+		b.WriteString(strings.Repeat("x", 480))
+		b.WriteString(`"}]}`)
+	}
+	b.WriteString(`],"instructions":"be helpful","tools":[],"tool_choice":"auto",`)
+	b.WriteString(`"parallel_tool_calls":true,"reasoning":{"effort":"low"},`)
+	b.WriteString(`"store":false,"stream":true,"stream_options":{},"include":[],`)
+	b.WriteString(`"service_tier":"auto","prompt_cache_key":"k","text":{},"client_metadata":{},"access_programs":[]}`)
+	return []byte(b.String())
+}
+
+// dirtyCodexFrame 在干净帧首键前插入白名单外键 max_output_tokens（触发重建路径）。
+func dirtyCodexFrame() []byte {
+	clean := cleanCodexFrame()
+	out := make([]byte, 0, len(clean)+24)
+	out = append(out, '{')
+	out = append(out, `"max_output_tokens":4096,`...)
+	out = append(out, clean[1:]...)
+	return out
+}
+
+// TestCodexPayloadScanZeroAlloc：clean 帧（顶层全白名单键、含 store:false）走
+// 零拷贝顶层键扫描 → FilterCodexWsPayload / FilterCodexHTTPPayload 零分配。
+func TestCodexPayloadScanZeroAlloc(t *testing.T) {
+	clean := cleanCodexFrame()
+	if len(clean) < 200*1024 {
+		t.Fatalf("clean 帧体量过小（%d 字节），需真实覆盖热路径", len(clean))
+	}
+	if got, err := FilterCodexWsPayload(clean); err != nil || len(got) == 0 || &got[0] != &clean[0] {
+		t.Fatalf("clean WS 帧应零拷贝原样返回: %v", err)
+	}
+	if got, err := FilterCodexHTTPPayload(clean); err != nil || len(got) == 0 || &got[0] != &clean[0] {
+		t.Fatalf("clean HTTP 帧应零拷贝原样返回: %v", err)
+	}
+	wsAllocs := testing.AllocsPerRun(200, func() {
+		_, _ = FilterCodexWsPayload(clean)
+	})
+	if wsAllocs != 0 {
+		t.Fatalf("FilterCodexWsPayload(clean) allocs/op = %v, 期望 0", wsAllocs)
+	}
+	httpAllocs := testing.AllocsPerRun(200, func() {
+		_, _ = FilterCodexHTTPPayload(clean)
+	})
+	if httpAllocs != 0 {
+		t.Fatalf("FilterCodexHTTPPayload(clean) allocs/op = %v, 期望 0", httpAllocs)
+	}
+}

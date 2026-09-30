@@ -128,6 +128,152 @@ func newCodexFieldSet(fields []string) map[string]struct{} {
 // （空结果帧不入网）。
 var ErrEmptyFrame = errors.New("codexsdk: 帧经白名单过滤后为空")
 
+// codexTopLevelNeedsFilter 报告 raw（经 gjson.ValidBytes 校验的 JSON）是否含
+// 非白名单顶层 key。零拷贝零分配（对象根且顶层 key 无转义的快路径）。
+// 非对象根 / 顶层 key 含转义（\）→ 回退 gjsonTopLevelNeedsFilter（精确
+// gjson unescape 语义，罕见、可分配）。判定只看顶层，不深入嵌套。
+func codexTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
+	// 跳过前导空白；非对象根（数组 / 标量 / null）回退 gjson（精确语义）。
+	i := 0
+	for i < len(raw) && isJSONSpace(raw[i]) {
+		i++
+	}
+	if i >= len(raw) || raw[i] != '{' {
+		return gjsonTopLevelNeedsFilter(raw, set)
+	}
+	i++ // 越过 '{'
+	for {
+		// 跳过空白与 ','；遇 '}' / 输入末即扫描完毕（无白名单外键）。
+		for i < len(raw) && (isJSONSpace(raw[i]) || raw[i] == ',') {
+			i++
+		}
+		if i >= len(raw) || raw[i] == '}' {
+			return false
+		}
+		if raw[i] != '"' {
+			return true // 防御：合法 JSON 不可达
+		}
+		keyStart := i + 1 // 开引号之后
+		i = skipJSONString(raw, i)
+		if i < 0 { // 未闭合：结构异常 → 回退
+			return gjsonTopLevelNeedsFilter(raw, set)
+		}
+		key := raw[keyStart : i-1]
+		if bytes.IndexByte(key, '\\') >= 0 { // 键含转义：回退 gjson（解码语义）
+			return gjsonTopLevelNeedsFilter(raw, set)
+		}
+		// set[string(key)] 为 Go 编译器特化的无分配 map 查找。
+		if _, ok := set[string(key)]; !ok {
+			return true
+		}
+		// 跳过空白与 ':' 后跳过整个值。
+		for i < len(raw) && (isJSONSpace(raw[i]) || raw[i] == ':') {
+			i++
+		}
+		i = skipJSONValue(raw, i)
+		if i < 0 { // 值结构异常 → 回退
+			return gjsonTopLevelNeedsFilter(raw, set)
+		}
+	}
+}
+
+// gjsonTopLevelNeedsFilter 旧路径（gjson ForEach + key.String()，精确 unescape
+// 语义）；仅非对象根或顶层 key 含转义（罕见）时使用。
+func gjsonTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
+	needs := false
+	gjson.ParseBytes(raw).ForEach(func(key, _ gjson.Result) bool {
+		if _, ok := set[key.String()]; !ok {
+			needs = true
+			return false
+		}
+		return true
+	})
+	return needs
+}
+
+// skipJSONString 跳过 JSON 字符串（raw[i] 为开引号），返回闭引号之后的下标；
+// 未闭合返回 -1。'\' 转义分支跳 1 字节（+循环自增 = 跳过转义目标；\"、\\、
+// \uXXXX 的 4 hex 无引号/反斜杠）。语义对齐网关 strip_scan.go:526-539。
+func skipJSONString(raw []byte, i int) int {
+	for i++; i < len(raw); i++ {
+		switch raw[i] {
+		case '\\':
+			i++ // 跳过转义目标
+		case '"':
+			return i + 1
+		}
+	}
+	return -1
+}
+
+// skipJSONValue 从 raw[i] 起跳过完整 JSON 值，返回末字节后一位置；结构非法
+// 返回 -1。字符串走 skipJSONString；{}[] 深度计数（容器内字符串同样按
+// skipJSONString 跳过，值内含 "[{" 不误计）；true/false/null 校验字面量内容；
+// 数字跳过至空白 / ',' / '}' / ']'。语义对齐网关 strip_scan.go:462-562。
+func skipJSONValue(raw []byte, i int) int {
+	if i >= len(raw) {
+		return -1
+	}
+	switch raw[i] {
+	case '"':
+		return skipJSONString(raw, i)
+	case '{', '[':
+		depth := 1
+		for i++; i < len(raw); i++ {
+			switch raw[i] {
+			case '"':
+				end := skipJSONString(raw, i)
+				if end < 0 {
+					return -1
+				}
+				i = end - 1 // 循环 i++ 抵消
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return i + 1
+				}
+			}
+		}
+		return -1
+	case 't':
+		if i+4 <= len(raw) && bytes.Equal(raw[i:i+4], jsonTrueBytes) {
+			return i + 4
+		}
+		return -1
+	case 'f':
+		if i+5 <= len(raw) && bytes.Equal(raw[i:i+5], jsonFalseBytes) {
+			return i + 5
+		}
+		return -1
+	case 'n':
+		if i+4 <= len(raw) && bytes.Equal(raw[i:i+4], jsonNullBytes) {
+			return i + 4
+		}
+		return -1
+	default:
+		// 数字：跳过至空白 / ',' / '}' / ']'（gjson.ValidBytes 前置保证合法终止）。
+		for i < len(raw) && !isJSONSpace(raw[i]) && raw[i] != ',' && raw[i] != '}' && raw[i] != ']' {
+			i++
+		}
+		return i
+	}
+}
+
+// isJSONSpace 判定 JSON 空白字符。
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// jsonTrueBytes/jsonFalseBytes/jsonNullBytes 是不可变字节常量（编译期静态引用，
+// 零分配），供 skipJSONValue 校验字面量内容。
+var (
+	jsonTrueBytes  = []byte("true")
+	jsonFalseBytes = []byte("false")
+	jsonNullBytes  = []byte("null")
+)
+
 // filterCodexPayload 顶层 key 白名单过滤（纯函数，WS/HTTP 两侧过滤器共用）：
 // 删除不在 ordered 中的顶层 key，白名单字段的值原样搬移（gjson raw，值内容
 // 零解析，只动顶层不深入嵌套）；set 为 ordered 的查表集。
@@ -138,15 +284,7 @@ func filterCodexPayload(raw []byte, ordered []string, set map[string]struct{}) (
 	if len(raw) == 0 || !gjson.ValidBytes(raw) {
 		return raw, nil
 	}
-	needsFilter := false
-	gjson.ParseBytes(raw).ForEach(func(key, _ gjson.Result) bool {
-		if _, ok := set[key.String()]; !ok {
-			needsFilter = true
-			return false
-		}
-		return true
-	})
-	if !needsFilter {
+	if !codexTopLevelNeedsFilter(raw, set) {
 		return raw, nil
 	}
 	filtered := []byte(`{}`)
