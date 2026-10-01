@@ -101,6 +101,8 @@ func Step(s IdentityState, p RotatePolicy) IdentityState {
 }
 
 // drawWMax 按策略抽本线程的窗口数上限；WMaxHi == 0 → 不退休（返回 0）。
+// crypto/rand 失败 → panic（导出构造器无 error 通道，理由见包级文档
+// 「crypto/rand 失败」）。
 func drawWMax(p RotatePolicy) uint64 {
 	lo, hi := p.WMaxLo, p.WMaxHi
 	if hi == 0 {

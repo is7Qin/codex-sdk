@@ -62,6 +62,17 @@
 // refresh 请求走 http.DefaultClient（env override 换端点），不受 WithTransport /
 // WithTimeout 影响。
 //
+// # crypto/rand 失败
+//
+// 身份 / 会话 id（NewUUIDv7）与轮换窗口上限抽样（NewIdentityState → drawWMax）
+// 依赖 crypto/rand。这些构造器处于请求相关路径，但导出签名无 error 通道
+// （NewUUIDv7() string / NewIdentityState(...) IdentityState）；若改为返回 error，
+// 将波及全部调用链（含网关）且收益不抵 churn。故 crypto/rand 读取失败一律
+// panic——失败属系统级异常（OS / 内核 RNG 不可用），正常环境不可达；而静默复用
+// 或退化为可预测值会破坏伪装身份的唯一性与不可区分性（相邻请求共享 thread_id /
+// 可预测 window_id），比进程级 panic 危险得多。调用方可在外层 recover 决定
+// fail-fast 或降级。
+//
 // # 性能语义（性能优先：懒构建 + 热路径低分配）
 //
 //   - 无全局可变状态：连接/客户端均按需构建，心跳 goroutine 仅连接存活期间存在

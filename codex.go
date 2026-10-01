@@ -479,7 +479,7 @@ func randomHex(n int) string {
 func randomBytes(n int) []byte {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		// crypto/rand 失败属系统级异常：panic 比静默复用链路 id 安全。
+		// crypto/rand 失败 → panic（理由见包级文档「crypto/rand 失败」）。
 		panic(fmt.Sprintf("codexsdk: crypto/rand 失败: %v", err))
 	}
 	return b
