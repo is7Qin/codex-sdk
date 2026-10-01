@@ -112,7 +112,7 @@ func TestUsageDecode(t *testing.T) {
 		t.Fatalf("RateLimitReachedType = %+v", usage.RateLimitReachedType)
 	}
 
-	// 可空字段 null 形态（实测两样本：balance/individual_limit 恒 null、
+	// 可空字段 null 形态（真实响应样本：balance/individual_limit 恒 null、
 	// rate_limit_reached_type team=null）→ 指针为 nil 不报错。
 	t.Run("null 形态指针容忍", func(t *testing.T) {
 		nullJSON := `{"plan_type":"free","rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":3600,"reset_after_seconds":0,"reset_at":1750000000}},"credits":{"has_credits":false,"unlimited":false,"overage_limit_reached":false,"balance":null,"approx_local_messages":null,"approx_cloud_messages":null},"spend_control":{"reached":false,"individual_limit":null},"rate_limit_reached_type":null}`

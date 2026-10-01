@@ -25,7 +25,7 @@
 //     OnAuthFatal 通知），Invalidate() / Fatal(err) 显式入口（网关解析 WS 判死
 //     事件帧时调用）
 //   - 伪装层（逐点对齐真实 codex 客户端源码）：默认
-//     codex-tui UA/originator（0.154.0 + Ubuntu 指纹，用户拍板默认）、beta 头（现役唯一 2026-02-06）、头常量导出、
+//     codex-tui UA/originator（0.154.0 + Ubuntu 指纹）、beta 头（现役唯一 2026-02-06）、头常量导出、
 //     WS/HTTP 各自顶层白名单过滤（含 store:false 强制），无条件生效、client_metadata **整体替换**组装
 //     （WS 帧面 8 key 恒发：installation_id/session_id/thread_id/turn_id/
 //     window_id/turn-metadata/traceparent/tracestate；HTTP 体面恒 4 key +

@@ -64,8 +64,8 @@ func (e *RefreshError) Error() string {
 
 func (e *RefreshError) Unwrap() error { return e.Err }
 
-// CallbackDeliveryError 是 OnTokenRotated 回调连续失败达阈值（D4，
-// WithTokenRotatedRetry 可配，默认 3）触发的账号级终止错误——网关无法持久化
+// CallbackDeliveryError 是 OnTokenRotated 回调连续失败达阈值（由
+// WithTokenRotatedRetry 配置，默认 3）触发的账号级终止错误——网关无法持久化
 // 新令牌（at/rt 落库中断）。errors.As 可与协议级判死类型（RefreshOAuthError /
 // AccountDisabledError / AuthPermanentlyRevokedError）区分。
 type CallbackDeliveryError struct {

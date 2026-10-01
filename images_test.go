@@ -500,7 +500,7 @@ func TestGenerateImageStreamSuccess(t *testing.T) {
 }
 
 // TestGenerateImageStreamSingleEvent：单图 + usage → 恰好一个 completed 事件
-// （usage 即携带于该事件）——spec 验收：流式合成单事件。
+// （usage 即携带于该事件）——流式合成恰一个 completed 事件。
 func TestGenerateImageStreamSingleEvent(t *testing.T) {
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/images/generations", startImageMock(t, imageResponseBody))))
 	var calls int

@@ -365,7 +365,7 @@ func TestHTTPStreamDoneDrainsBodyForReuse(t *testing.T) {
 // TestHTTPStreamClientMetadataMinimal：未配置 meta/session → 请求体仅注入
 // client_metadata.turn_id（UUIDv7 格式，真实恒发），无其他键。
 // （兼证预筛判据：payload 无 "client_metadata" 键 → 仍注入 turn_id——
-// 字符串值里的裸词 "client_metadata" 不误判为已含 metadata，评审 P2-2。）
+// 字符串值里的裸词 "client_metadata" 不误判为已含 metadata。）
 func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -392,7 +392,7 @@ func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 		t.Fatalf("注入不应动其余字段: %s", gotBody)
 	}
 
-	// 预筛判据收紧回归（P2-2）：instructions 字符串值含裸词 "client_metadata"
+	// 预筛判据收紧回归：instructions 字符串值含裸词 "client_metadata"
 	// （无引号包裹）→ 不触发短路，仍注入 turn_id
 	if err := hc.Stream(context.Background(), []byte(`{"model":"m","instructions":"see client_metadata docs"}`), func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream #2: %v", err)

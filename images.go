@@ -79,8 +79,8 @@ const (
 	ImageStreamEventKeepalive = "keepalive"
 )
 
-// ImageStreamEvent 是 GenerateImageStream 的合成流式事件（用户裁决：codex
-// 专属合成归 SDK，网关统一透传）。completed：每张图一个（带 b64_json；
+// ImageStreamEvent 是 GenerateImageStream 的合成流式事件（codex 专属合成归
+// SDK，网关统一透传）。completed：每张图一个（带 b64_json；
 // usage 仅最后一个事件携带——对齐上游 completed 事件语义）；keepalive：
 // 等待期间保活（B64JSON/Usage 恒 nil）。partial_image 不合成——无 wire 来源。
 type ImageStreamEvent struct {

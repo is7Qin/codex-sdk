@@ -27,19 +27,19 @@ var easternTime = func() *time.Location {
 // trace 与 turn_id 自动生成、会话标识与 turn-state 回传。
 // 机制进 SDK，业务值由调用方（网关）提供。
 
-// DefaultOriginator 默认 originator 头值（用户拍板：codex-tui；
+// DefaultOriginator 默认 originator 头值（codex-tui；
 // 首方值集合：codex_cli_rs / codex-tui / codex_vscode / codex_exec）。
 // WithHeader("Originator", ...) 可覆盖。
 const DefaultOriginator = "codex-tui"
 
-// DefaultCodexUserAgent 默认 codex UA（用户拍板：codex-tui/0.154.0 +
+// DefaultCodexUserAgent 默认 codex UA（codex-tui/0.154.0 +
 // Ubuntu 指纹；真实形态 "{originator}/{version} ({os} {os_version}; {arch})
 // {terminal} ({originator}; {version})"——UA 前缀与 originator 保持一致）。
 // WithHeader("User-Agent", ...) 可覆盖。
 const DefaultCodexUserAgent = "codex-tui/0.154.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tui; 0.154.0)"
 
-// DefaultBetaWS 是现役唯一的 Responses WS beta 值（真实源码全仓库唯一常量；
-// 2026-02-04 为旧值、无真实来源），仅 WS 握手注入。
+// DefaultBetaWS 是现役唯一的 Responses WS beta 值（真实源码全仓库唯一常量），
+// 仅 WS 握手注入。
 const DefaultBetaWS = "2026-02-06"
 
 // Codex 请求头名常量（对齐真实 codex 客户端头名，供调用方组装请求头）。

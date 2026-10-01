@@ -890,7 +890,7 @@ func TestRotationCtxCancel(t *testing.T) {
 	}
 }
 
-// TestRotationCallbackRetry：OnTokenRotated 失败重试（D4）——失败未达阈值
+// TestRotationCallbackRetry：OnTokenRotated 失败重试——失败未达阈值
 // 本次 at 放行、下次 refresh 前重试；连续失败达阈值 → OnAuthFatal。
 func TestRotationCallbackRetry(t *testing.T) {
 	t.Run("连续失败达阈值 OnAuthFatal", func(t *testing.T) {
@@ -902,7 +902,7 @@ func TestRotationCallbackRetry(t *testing.T) {
 		auth := OAuthWithRotation("rt-0",
 			WithOnTokenRotated(func(at, rt string) {
 				cbCalls.Add(1)
-				panic("db down") // 回调失败：SDK 恢复 panic 按 D4 处理
+				panic("db down") // 回调失败：SDK 恢复 panic，记 pending 下次 refresh 前重试
 			}),
 			WithOnAuthFatal(func(err error) { fatalCalls.Add(1) }),
 			WithTokenRotatedRetry(3))

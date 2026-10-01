@@ -113,7 +113,7 @@ func OAuthWithRotation(refreshToken string, opts ...OAuthOption) Auth {
 //
 // 状态：at 缓存完整头值 "Bearer <at>"（atomic 指针，Authorization 仅 Load——
 // 热路径零分配零锁）；fatal 终止态（atomic）；refreshMu 保护单飞与 rt 轮换
-// （refresh_token 仅单飞 leader 读写）；D4 回调重试状态（pending 未交付的
+// （refresh_token 仅单飞 leader 读写）；轮转回调重试状态（pending 未交付的
 // 轮转结果 + 连续失败计数）。
 type rotationAuth struct {
 	// at 缓存完整头值；nil 表示需刷新（首请求 / Invalidate / 轮转中）。
@@ -130,7 +130,7 @@ type rotationAuth struct {
 	// 派生点唯一在消费方落库处，结果经 WithOAuthAccountID 显式注入。
 	accountID string
 
-	// D4 回调重试状态（仅单飞 leader 在锁内读写）。
+	// 轮转回调重试状态（仅单飞 leader 在锁内读写）。
 	pendingAt, pendingRt string
 	pendingSet           bool
 	callbackFails        int
@@ -218,8 +218,8 @@ func (r *rotationAuth) setFatal(err error) {
 
 // authFatal 是 AT 401 判死路径的终止入口（私有接口 authFatalTrigger）：与
 // 公开 Fatal(err)（网关显式终止，不触发回调）的区别是走 setFatal——
-// 触发 OnAuthFatal 至多一次 + Fatal 态。spec 2b：AT 判死码命中同样要
-// 一次性回调通知网关（与 RT 判死路径对称）。
+// 触发 OnAuthFatal 至多一次 + Fatal 态。AT 判死码命中同样要一次性回调
+// 通知网关（与 RT 判死路径对称）。
 func (r *rotationAuth) authFatal(err error) {
 	r.setFatal(err)
 }
@@ -256,9 +256,9 @@ func (r *rotationAuth) refresh(ctx context.Context) error {
 }
 
 // doRefresh 执行一轮完整刷新（单飞 leader 专用）：
-// D4 回调重试 → refresh 网络流程（退避）→ 缓存新 at / rt 轮换 → OnTokenRotated。
+// 轮转回调重试 → refresh 网络流程（退避）→ 缓存新 at / rt 轮换 → OnTokenRotated。
 func (r *rotationAuth) doRefresh(ctx context.Context) error {
-	// D4：上次轮转回调未交付时先重试（幂等 upsert 语义——同一 (at, rt) 可重复投递）。
+	// 上次轮转回调未交付时先重试（幂等 upsert 语义——同一 (at, rt) 可重复投递）。
 	if err := r.deliverPendingRotate(); err != nil {
 		return err
 	}
@@ -277,7 +277,7 @@ func (r *rotationAuth) doRefresh(ctx context.Context) error {
 		// 回调传保留后的有效值（r.rt 内存值——SDK 下次 refresh 将使用的 rt）：
 		// 响应缺 refresh_token 时回调收到旧 rt，网关盲写 upsert 也不会落空。
 		if err := r.callRotate(at, r.rt); err != nil {
-			// D4：回调失败不阻塞请求——本次 at 放行，记 pending 下次 refresh 前重试。
+			// 回调失败不阻塞请求——本次 at 放行，记 pending 下次 refresh 前重试。
 			r.pendingAt, r.pendingRt = at, r.rt
 			r.pendingSet = true
 			r.callbackFails++
@@ -291,7 +291,7 @@ func (r *rotationAuth) doRefresh(ctx context.Context) error {
 	return nil
 }
 
-// deliverPendingRotate 重试未交付的轮转回调（D4）。返回 nil 表示已交付或
+// deliverPendingRotate 重试未交付的轮转回调。返回 nil 表示已交付或
 // 无待交付或未达阈值（refresh 继续）；连续失败达阈值时置 Fatal 态并返回错误。
 func (r *rotationAuth) deliverPendingRotate() error {
 	if !r.pendingSet {
@@ -316,8 +316,9 @@ func (r *rotationAuth) deliverPendingRotate() error {
 	return nil // 未达阈值：本次 refresh 继续
 }
 
-// callRotate 调用 OnTokenRotated 回调并恢复 panic——回调失败（panic）按 D4
-// 语义处理。回调在单飞内执行（阻塞并发等待者——网关回调应快，本地 upsert
+// callRotate 调用 OnTokenRotated 回调并恢复 panic——回调失败（panic）按
+// 「不阻塞请求、记 pending 下次 refresh 前重试」语义处理。回调在单飞内执行
+// （阻塞并发等待者——网关回调应快，本地 upsert
 // 毫秒级）；幂等 upsert 由调用方保证。
 func (r *rotationAuth) callRotate(at, rt string) (err error) {
 	defer func() {
@@ -440,7 +441,7 @@ func isRefreshFatalCode(code string) bool {
 //   - token 端点 401 → 无条件判死（对齐 codex manager.rs:1537-1538，无论错误码）
 //   - RT 判死码（10 码，大小写不敏感）→ RefreshOAuthError
 //   - 账号禁用类（402 泛化 / 400 org disabled / KYC 文案）→ AccountDisabledError
-//   - 其余（429/529/5xx/403/未知码）→ 可重试（两权威源默认，评审 R1）
+//   - 其余（429/529/5xx/403/未知码）→ 可重试（两个参考实现默认）
 func classifyRefreshError(status int, body []byte) error {
 	if status == http.StatusUnauthorized {
 		return &RefreshOAuthError{Code: strings.ToLower(firstNonEmpty(extractErrorCode(body), "unauthorized")), Raw: body}
@@ -449,7 +450,7 @@ func classifyRefreshError(status int, body []byte) error {
 		return &RefreshOAuthError{Code: strings.ToLower(code), Raw: body}
 	}
 	if status == http.StatusPaymentRequired {
-		// 402 泛化判死（sub2api B7：余额不足/计费问题）；detail.code/error.code 取作依据。
+		// 402 泛化判死（余额不足/计费问题）；detail.code/error.code 取作依据。
 		return &AccountDisabledError{StatusCode: status, Detail: firstNonEmpty(extractNestedCode(body), "payment required"), Raw: body}
 	}
 	if status == http.StatusBadRequest {
@@ -586,7 +587,7 @@ type oauthConfig struct {
 
 // defaultOAuthConfig 返回 OAuthWithRotation 默认配置：
 // refresh 超时 10s；退避 base 200ms / cap 30s / 上限 3 次（总尝试数，含首次）；
-// 轮转回调失败重试阈值 3 次（评审 D2/D8 定值）。
+// 轮转回调失败重试阈值 3 次。
 func defaultOAuthConfig() oauthConfig {
 	return oauthConfig{
 		refreshTimeout:    10 * time.Second,
