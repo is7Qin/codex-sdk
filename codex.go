@@ -348,9 +348,13 @@ func RewriteEnvironmentContextTime(raw []byte, now time.Time) []byte {
 				if err == nil {
 					value := gjson.GetBytes(encoded, "v").Raw
 					start := v.Index
+					end := start + len(v.Raw)
+					if !envContextSpliceOK(cursor, start, end, len(raw)) {
+						return // 游标异常：保守跳过该次改写（不越界 panic）
+					}
 					out = append(out, raw[cursor:start]...)
 					out = append(out, value...)
-					cursor = start + len(v.Raw)
+					cursor = end
 					changed = true
 					return
 				}
@@ -368,6 +372,15 @@ func RewriteEnvironmentContextTime(raw []byte, now time.Time) []byte {
 		return raw
 	}
 	return append(out, raw[cursor:]...)
+}
+
+// envContextSpliceOK 报告在已消费游标 cursor 与待改写字符串原文区间
+// [start, end) 上做字节拼接是否安全。gjson 正常输入恒给出单调且正确的 Index，
+// 但嵌套 / 构造结果可能给出 0 或回退的 Index（start < cursor）——此时
+// raw[cursor:start] 会越界 panic；end 越过原文字节数同理。任一不满足即返回
+// false，调用方保守跳过该次改写（输出保持原样，不 panic）。
+func envContextSpliceOK(cursor, start, end, rawLen int) bool {
+	return start >= cursor && end <= rawLen
 }
 
 func replaceEnvironmentTime(value, date string) string {

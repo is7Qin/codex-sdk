@@ -57,6 +57,29 @@ func TestRewriteEnvironmentContextTime(t *testing.T) {
 	}
 }
 
+// TestRewriteEnvironmentContextCursorGuard 覆盖游标越界护栏：gjson 正常输入恒给
+// 单调且正确的 Index，但嵌套 / 构造结果可能给出 0 或回退的 Index（start <
+// cursor），此时 raw[cursor:start] 会越界 panic——护栏必须拦下并保守跳过。
+func TestRewriteEnvironmentContextCursorGuard(t *testing.T) {
+	cases := []struct {
+		name                  string
+		cursor, start, end, n int
+		ok                    bool
+	}{
+		{"正常区间", 0, 5, 9, 100, true},
+		{"start==cursor", 5, 5, 9, 100, true},
+		{"Index 回退（非单调）", 10, 5, 9, 100, false},
+		{"Index==0 且游标已前进", 10, 0, 4, 100, false},
+		{"end 越过原文末尾", 0, 5, 101, 100, false},
+	}
+	for _, c := range cases {
+		if got := envContextSpliceOK(c.cursor, c.start, c.end, c.n); got != c.ok {
+			t.Fatalf("%s: envContextSpliceOK(%d,%d,%d,%d)=%v, 期望 %v",
+				c.name, c.cursor, c.start, c.end, c.n, got, c.ok)
+		}
+	}
+}
+
 // TestFilterCodexWsPayload：WS 顶层 key 白名单过滤（纯函数）。
 func TestFilterCodexWsPayload(t *testing.T) {
 	in := []byte(`{"type":"response.create","model":"gpt-5","input":"hi","access_programs":["org-a"],"stream_options":{"reasoning_summary_delivery":"sequential_cutoff"},"max_output_tokens":4096,"evil":"x","foo":{"bar":1}}`)
