@@ -37,8 +37,8 @@ type HTTPClient struct {
 
 	mu               sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
 	client           *http.Client
-	noRedirectClient *http.Client     // 仅 StreamBody：禁跟随重定向（3xx 原样返回）
-	turnState        atomic.Value     // string；x-codex-turn-state 响应侧捕获值
+	noRedirectClient *http.Client // 仅 StreamBody：禁跟随重定向（3xx 原样返回）
+	turnState        atomic.Value // string；x-codex-turn-state 响应侧捕获值
 }
 
 // NewHTTPClient 创建 Responses HTTP 客户端（端点方法族客户端，所有数据面 URL 由 SDK 固定维护，不可覆盖）。
@@ -54,11 +54,16 @@ func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 // 与首个请求并发调用安全——内部加锁）。
 func (c *HTTPClient) CloseIdleConnections() {
 	c.mu.Lock()
-	client := c.client
+	clients := [...]*http.Client{c.client, c.noRedirectClient}
 	c.mu.Unlock()
-	if client != nil && client.Transport != nil {
-		if tc, ok := client.Transport.(*http.Transport); ok {
-			tc.CloseIdleConnections()
+	// 两个 client 共用同一 Transport（或均为 nil→DefaultTransport）：逐个清理，
+	// 对共享 Transport 的重复清理幂等无害；仅初始化了 noRedirectClient（只调
+	// StreamBody）时也不遗漏。
+	for _, client := range clients {
+		if client != nil && client.Transport != nil {
+			if tc, ok := client.Transport.(*http.Transport); ok {
+				tc.CloseIdleConnections()
+			}
 		}
 	}
 }
