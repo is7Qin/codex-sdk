@@ -177,6 +177,37 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 	return nil // EOF 结束（是否截断由网关按终态事件判定）
 }
 
+// StreamBody 发送 POST <responses 端点> 请求并返回**未读**的原始流式响应体，
+// 与 Stream 同源：发送前无条件归一（normalizeCodexHTTPPayload）+ client_metadata
+// 注入（injectResponsesClientMetadata），再走 do（含 401 判死/单飞 refresh/自动
+// 重试一次）。
+//
+// 接受状态 = **仅 200**（比 Stream 的 `>= 400` 判据更严，此为有意声明的行为）：
+//   - 200 → captureTurnState(resp)（turn-state 取自**本次响应头**，无响应体变换）
+//     后返回**未关闭**的 *http.Response，body 归调用方、须**恰好关闭一次**；
+//   - 非 200（含 201/204/3xx/4xx/5xx）→ 在 SDK 内读尽并 Close body 后返回
+//     *HTTPError{StatusCode, Raw}（不泄漏未关闭的连接）。
+//
+// 读取沿用调用方 ctx（http 传输层）：调用方取消能终止后续对返回 body 的读取。
+func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte) (*http.Response, error) {
+	wire, err := normalizeCodexHTTPPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	wire = c.injectResponsesClientMetadata(wire)
+	resp, err := c.do(ctx, wire)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Raw: body}
+	}
+	c.captureTurnState(resp)
+	return resp, nil
+}
+
 // normalizeCodexHTTPPayload 对 HTTP /responses 请求体做 codex 形状归一：
 // HTTP 白名单过滤（FilterCodexHTTPPayload）后强制 store:false。空/非法 JSON
 // 原样返回；过滤后无任何白名单字段 → ErrEmptyFrame（空结果体不入网）。

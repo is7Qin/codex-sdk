@@ -1,6 +1,7 @@
 package codexsdk
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -9,8 +10,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/tidwall/gjson"
 )
@@ -609,6 +613,263 @@ func TestHTTPStreamClientMetadataInvalidJSON(t *testing.T) {
 	}
 	if string(gotBody) != `{"broken` {
 		t.Fatalf("非法 payload 应原样上送（放弃注入）, got %s", gotBody)
+	}
+}
+
+// ---- StreamBody：返回未关闭的 raw body（仅 200 接受） ----
+
+// TestHTTPStreamBodyReturnsOnHeadersBeforeBodyEnds：收到响应头即返回（body
+// 尚未结束）——handler 在首事件后阻塞，StreamBody 仍须先返回，且返回的 body
+// 可被继续读取。
+func TestHTTPStreamBodyReturnsOnHeadersBeforeBodyEnds(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.created\"}\n\n")
+		f.Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	got := make(chan result, 1)
+	go func() {
+		resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+		got <- result{resp, err}
+	}()
+
+	var resp *http.Response
+	select {
+	case r := <-got:
+		if r.err != nil {
+			t.Fatalf("StreamBody: %v", r.err)
+		}
+		resp = r.resp
+	case <-time.After(3 * time.Second):
+		t.Fatal("StreamBody 未在收到响应头后返回（body 尚在阻塞）")
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	// body 未结束即可读首事件（handler 仍阻塞在 release 上）。
+	lineCh := make(chan string, 1)
+	go func() {
+		line, _ := bufio.NewReader(resp.Body).ReadString('\n')
+		lineCh <- line
+	}()
+	select {
+	case line := <-lineCh:
+		if !strings.Contains(line, "response.created") {
+			t.Fatalf("首事件读取 = %q", line)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("返回的 body 不可读首事件")
+	}
+}
+
+// TestHTTPStreamBodySuccessDoesNotCloseBodyEarly：200 返回的 body 完整可读
+// （未被 SDK 提前关闭/读尽）——调用方读到全部事件与末尾 [DONE]。
+func TestHTTPStreamBodySuccessDoesNotCloseBodyEarly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.created\"}\n\n")
+		f.Flush()
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+		f.Flush()
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("StreamBody: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, 期望 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取 body：%v", err)
+	}
+	_ = resp.Body.Close()
+	if !bytes.Contains(body, []byte("response.created")) || !bytes.Contains(body, []byte("response.completed")) {
+		t.Fatalf("body 不完整: %s", body)
+	}
+	if !bytes.Contains(body, []byte("data: [DONE]")) {
+		t.Fatalf("body 应原样含 [DONE]: %s", body)
+	}
+}
+
+// TestHTTPStreamBodyRejectsNon200AndDrains：非 200（429）→ SDK 内读尽并关闭
+// body 后返回 *HTTPError（含原始错误体）；连接可复用（排空+关闭完成，第二轮
+// 复用同一 TCP 连接）。
+func TestHTTPStreamBodyRejectsNon200AndDrains(t *testing.T) {
+	var accepts atomic.Int32
+	var reqs atomic.Int32
+	errorBody := `{"error":{"type":"rate_limit_exceeded","message":"slow down"}}`
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, errorBody)
+	}))
+	srv.Listener = &countingListener{Listener: base, accepts: &accepts}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	for i := 0; i < 2; i++ {
+		resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+		if resp != nil {
+			_ = resp.Body.Close()
+			t.Fatalf("#%d 非 200 不应返回 resp", i+1)
+		}
+		var he *HTTPError
+		if !errors.As(err, &he) {
+			t.Fatalf("#%d 期望 *HTTPError, got %T: %v", i+1, err, err)
+		}
+		if he.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("#%d StatusCode = %d, 期望 429", i+1, he.StatusCode)
+		}
+		if string(he.Raw) != errorBody {
+			t.Fatalf("#%d Raw 应原样交付错误体: %s", i+1, he.Raw)
+		}
+	}
+	if reqs.Load() != 2 {
+		t.Fatalf("服务端请求数 = %d, 期望 2", reqs.Load())
+	}
+	if n := accepts.Load(); n != 1 {
+		t.Fatalf("TCP 连接数 = %d, 期望 1（非 200 读尽+关闭 → 连接回池复用）", n)
+	}
+}
+
+// TestHTTPStreamBody401Rotation：401 非判死 → 单飞 refresh → 自动重试一次成功；
+// StreamBody 返回 200 的未关闭 body（新 at 序列）。
+func TestHTTPStreamBody401Rotation(t *testing.T) {
+	var mu sync.Mutex
+	var auths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a := r.Header.Get("Authorization")
+		mu.Lock()
+		auths = append(auths, a)
+		mu.Unlock()
+		if a == "Bearer at-10" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+	m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
+
+	hc := NewHTTPClient(OAuthWithRotation("rt-0", WithInitialAccessToken("at-10")),
+		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("StreamBody: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, 期望 200", resp.StatusCode)
+	}
+	if m.callCount() != 1 {
+		t.Fatalf("refresh 次数 = %d, 期望 1（单飞）", m.callCount())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(auths) != 2 || auths[0] != "Bearer at-10" || auths[1] != "Bearer at-new" {
+		t.Fatalf("请求序列 = %v, 期望 [旧 at 401 → 新 at 重试]", auths)
+	}
+}
+
+// TestHTTPStreamBodyCapturesTurnState：turn-state 取自**本次响应头**。
+func TestHTTPStreamBodyCapturesTurnState(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HeaderTurnState, "st-body")
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("StreamBody: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get(HeaderTurnState); got != "st-body" {
+		t.Fatalf("本次响应头 turn-state = %q, 期望 st-body", got)
+	}
+	if hc.TurnState() != "st-body" {
+		t.Fatalf("TurnState = %q, 期望 st-body（本次响应头捕获）", hc.TurnState())
+	}
+}
+
+// TestHTTPStreamBodyCancelTerminatesRead：调用方 ctx 取消能终止对返回 body 的
+// 读取（读取沿用调用方 ctx）。
+func TestHTTPStreamBodyCancelTerminatesRead(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.created\"}\n\n")
+		f.Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	resp, err := hc.StreamBody(ctx, []byte(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("StreamBody: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// 先读到首事件（确认 body 在读），再取消——后续读取须以错误返回。
+	if _, err := bufio.NewReader(resp.Body).ReadString('\n'); err != nil {
+		t.Fatalf("读首事件: %v", err)
+	}
+
+	readErr := make(chan error, 1)
+	go func() { _, err := io.ReadAll(resp.Body); readErr <- err }()
+	cancel()
+	select {
+	case err := <-readErr:
+		if err == nil {
+			t.Fatal("取消后读取应返回错误")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("取消未终止 body 读取")
 	}
 }
 
