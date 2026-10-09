@@ -21,7 +21,7 @@ const DefaultSearchURL = "https://chatgpt.com/backend-api/codex/alpha/search"
 // turn-state 不捕获（对齐 GenerateImage——doURL 路径不捕获，
 // HTTPResponse.TurnState 恒空，网关不消费）。
 func (c *HTTPClient) Search(ctx context.Context, payload []byte) (*HTTPResponse, error) {
-	resp, err := c.doURL(ctx, DefaultSearchURL, http.MethodPost, payload)
+	resp, err := c.doURL(ctx, c.httpClient(), DefaultSearchURL, http.MethodPost, payload)
 	if err != nil {
 		return nil, err
 	}

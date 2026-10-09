@@ -20,7 +20,7 @@ const DefaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 // sendRequest 内空 reader，不特判；GET 语义由 method 参数决定）。turn-state
 // 不捕获（对齐 GenerateImage/Search——doURL 路径不捕获，网关不消费）。
 func (c *HTTPClient) GetUsage(ctx context.Context) (*UsageStatus, error) {
-	resp, err := c.doURL(ctx, DefaultUsageURL, http.MethodGet, nil)
+	resp, err := c.doURL(ctx, c.httpClient(), DefaultUsageURL, http.MethodGet, nil)
 	if err != nil {
 		return nil, err
 	}

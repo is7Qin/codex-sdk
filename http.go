@@ -35,9 +35,10 @@ type HTTPClient struct {
 	auth Auth
 	opts options
 
-	mu        sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
-	client    *http.Client
-	turnState atomic.Value // string；x-codex-turn-state 响应侧捕获值
+	mu               sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
+	client           *http.Client
+	noRedirectClient *http.Client     // 仅 StreamBody：禁跟随重定向（3xx 原样返回）
+	turnState        atomic.Value     // string；x-codex-turn-state 响应侧捕获值
 }
 
 // NewHTTPClient 创建 Responses HTTP 客户端（端点方法族客户端，所有数据面 URL 由 SDK 固定维护，不可覆盖）。
@@ -195,7 +196,9 @@ func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte) (*http.Resp
 		return nil, err
 	}
 	wire = c.injectResponsesClientMetadata(wire)
-	resp, err := c.do(ctx, wire)
+	// 仅本方法禁跟随重定向：3xx 原样返回 → 归为非 200 → *HTTPError（避免
+	// 自动跟随到 Location 目标后按 200 当成功）。
+	resp, err := c.doURL(ctx, c.clientNoRedirect(), DefaultResponsesURL, http.MethodPost, wire)
 	if err != nil {
 		return nil, err
 	}
@@ -279,17 +282,19 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	return c.doURL(ctx, DefaultResponsesURL, http.MethodPost, payload)
+	return c.doURL(ctx, c.httpClient(), DefaultResponsesURL, http.MethodPost, payload)
 }
 
 // doURL 发送指定 method 请求到指定完整端点并应用 401 自动轮转（do 的 URL
 // 已构建形态；GenerateImage / Search / GetUsage 等非 responses 端点复用
 // 同一传输层：判死分类 + 单飞 refresh + 自动重试一次，语义与 do 完全一致）。
-func (c *HTTPClient) doURL(ctx context.Context, targetURL string, method string, payload []byte) (*http.Response, error) {
+// hc 为本次使用的 http.Client——默认 httpClient()；StreamBody 传 no-redirect
+// client（仅影响重定向跟随，401 轮转语义不变）。
+func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte) (*http.Response, error) {
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	resp, err := c.sendRequest(ctx, targetURL, method, payload)
+	resp, err := c.sendRequest(ctx, hc, targetURL, method, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +319,7 @@ func (c *HTTPClient) doURL(ctx context.Context, targetURL string, method string,
 		return respWithBody(resp, http.StatusUnauthorized, body), nil
 	}
 	// 自动重试一次（新 at）。
-	resp2, err := c.sendRequest(ctx, targetURL, method, payload)
+	resp2, err := c.sendRequest(ctx, hc, targetURL, method, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +338,8 @@ func (c *HTTPClient) doURL(ctx context.Context, targetURL string, method string,
 }
 
 // sendRequest 构造指定 method 请求并执行（伪装层默认头 + 调用方 WithHeader 覆盖）。
-func (c *HTTPClient) sendRequest(ctx context.Context, targetURL string, method string, payload []byte) (*http.Response, error) {
+// hc 由调用方选定（默认/禁跟随重定向）。
+func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 构造请求失败: %w", err)
@@ -353,7 +359,7 @@ func (c *HTTPClient) sendRequest(ctx context.Context, targetURL string, method s
 	applyAccountID(req.Header, c.auth)
 	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
 	applyHeaderOverrides(req.Header, c.opts.headers)
-	resp, err := c.httpClient().Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 上游请求失败: %w", err)
 	}
@@ -408,15 +414,36 @@ func (c *HTTPClient) httpClient() *http.Client {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.client == nil {
-		c.client = &http.Client{}
-		if c.opts.timeout > 0 {
-			c.client.Timeout = c.opts.timeout
-		}
-		if c.opts.transport != nil {
-			c.client.Transport = c.opts.transport
-		}
+		c.client = c.newClient(nil)
 	}
 	return c.client
+}
+
+// clientNoRedirect 懒构建**禁跟随重定向**的 client（仅 StreamBody 使用）：与
+// httpClient 同 timeout/transport，额外 CheckRedirect 返回 http.ErrUseLastResponse
+// ——3xx 原样作为最终响应返回（不访问 Location 目标），由 StreamBody 归为非 200 →
+// *HTTPError。Do/Stream/其它方法仍用 httpClient（既有跟随行为不变）。
+func (c *HTTPClient) clientNoRedirect() *http.Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.noRedirectClient == nil {
+		c.noRedirectClient = c.newClient(func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		})
+	}
+	return c.noRedirectClient
+}
+
+// newClient 构造 http.Client（同 timeout/transport；checkRedirect 可选）。须持 mu。
+func (c *HTTPClient) newClient(checkRedirect func(*http.Request, []*http.Request) error) *http.Client {
+	hc := &http.Client{CheckRedirect: checkRedirect}
+	if c.opts.timeout > 0 {
+		hc.Timeout = c.opts.timeout
+	}
+	if c.opts.transport != nil {
+		hc.Transport = c.opts.transport
+	}
+	return hc
 }
 
 // SSE 帧提取（传输层 framing，非协议解析）。

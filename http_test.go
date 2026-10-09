@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -870,6 +871,71 @@ func TestHTTPStreamBodyCancelTerminatesRead(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("取消未终止 body 读取")
+	}
+}
+
+// redirectRewriteTransport 只把官方 responses URL 重写到 mock；其余 URL（如
+// 重定向 Location 目标）按原样交给默认 transport——用于验证禁跟随（目标不被访问）。
+type redirectRewriteTransport struct {
+	official string
+	srvBase  *url.URL
+}
+
+func (t *redirectRewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	if req.URL.String() == t.official {
+		u := *req.URL
+		u.Scheme = t.srvBase.Scheme
+		u.Host = t.srvBase.Host
+		clone.URL = &u
+	}
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+// TestHTTPStreamBodyNoRedirect3xx StreamBody 禁跟随重定向：302/307 带有效
+// Location → *HTTPError{302/307} 且不访问重定向目标（第二上游计数恒 0）。
+// 仅 StreamBody 生效（do/Stream/其它方法既有跟随行为不变）。
+func TestHTTPStreamBodyNoRedirect3xx(t *testing.T) {
+	for _, code := range []int{http.StatusFound, http.StatusTemporaryRedirect} {
+		code := code
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			var target2Hits atomic.Int32
+			target2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				target2Hits.Add(1)
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "should-not-be-reached")
+			}))
+			t.Cleanup(target2.Close)
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", target2.URL+"/next")
+				w.WriteHeader(code)
+			}))
+			t.Cleanup(srv.Close)
+
+			base, err := url.Parse(srv.URL)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			tr := &redirectRewriteTransport{official: "https://chatgpt.com/backend-api/codex/responses", srvBase: base}
+			hc := NewHTTPClient(PAT("t"), WithTransport(tr))
+
+			resp, err := hc.StreamBody(context.Background(), []byte(`{"model":"m"}`))
+			if resp != nil {
+				_ = resp.Body.Close()
+				t.Fatalf("3xx 不应返回未关闭 resp")
+			}
+			var he *HTTPError
+			if !errors.As(err, &he) {
+				t.Fatalf("期望 *HTTPError, got %T: %v", err, err)
+			}
+			if he.StatusCode != code {
+				t.Fatalf("StatusCode = %d, 期望 %d（3xx 原样归非 200）", he.StatusCode, code)
+			}
+			if n := target2Hits.Load(); n != 0 {
+				t.Fatalf("重定向目标被访问 %d 次（期望 0——StreamBody 禁跟随）", n)
+			}
+		})
 	}
 }
 

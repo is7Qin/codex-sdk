@@ -118,7 +118,7 @@ func (c *HTTPClient) GenerateImage(ctx context.Context, p *ImageGenParams) (*Ima
 	if len(p.Images) > 0 {
 		targetURL = DefaultImagesEditsURL
 	}
-	resp, err := c.doURL(ctx, targetURL, http.MethodPost, payload)
+	resp, err := c.doURL(ctx, c.httpClient(), targetURL, http.MethodPost, payload)
 	if err != nil {
 		return nil, err
 	}
