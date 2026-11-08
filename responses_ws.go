@@ -90,7 +90,7 @@ func (c *HTTPClient) streamBodyWS(ctx context.Context, payload []byte, readLimit
 	// "下一次请求头"，本轮握手刚签发的值不会出现在本轮请求里（首轮更是完全没有）。
 	// 不显式清空的话，Dial 的既有语义会让首帧带上刚签发的值——两臂的上游请求
 	// 立刻不同。跨轮清除的责任仍在调用方（HTTPClient 的 TurnState 缓存按其生命周期）。
-	_ = ws.SetTurnState(effective)
+	ws.SetTurnState(effective)
 	if err := ws.Send(ctx, frame); err != nil {
 		_ = ws.CloseNow()
 		return nil, err

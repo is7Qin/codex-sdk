@@ -46,16 +46,6 @@ const (
 // ErrMessageTooBig 单帧超过 ReadLimit（透传 coder/websocket）。
 var ErrMessageTooBig = coderws.ErrMessageTooBig
 
-// ErrNotOwner 连接已被连接池 claim，外部调用方不再持有所有权（A4）。
-//
-// 触发点：Pool 收下 DialFunc 返回的 *Client 之后，Send / Recv / Ping /
-// Close / CloseNow 一律返回本错误——否则外部可以杀掉别人的在途租约，
-// 或与池的唯一读者（pump）抢读。池内部走 *Owned 变体（带 token）。
-var ErrNotOwner = errors.New("codexsdk: 连接已归连接池所有（外部不得直接使用 *Client）")
-
-// ownerToken 是连接所有权的不可伪造凭证（零大小，指针身份即凭证）。
-type ownerToken struct{ _ byte }
-
 // CompressionMode 是消息压缩模式（默认不压缩：性能优先，LLM 流式小消息
 // 压缩收益低、耗 CPU）。
 type CompressionMode int
@@ -314,40 +304,12 @@ type Client struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	// 所有权（A4）：owned 置位后只有持 token 的内部变体能动 socket。
-	owned atomic.Bool
-	owner atomic.Pointer[ownerToken]
-	// closed 标记本地已发起关闭（Close/CloseNow/池判死）。对端关闭由常驻读者观测。
+	// closed 标记本地已发起关闭（Close/CloseNow）。对端关闭由常驻读者观测。
 	closed atomic.Bool
 }
 
-// claim 把连接交给连接池：其后外部 Send/Recv/Ping/Close/CloseNow 一律 ErrNotOwner。
-// 返回的 token 是池内部变体的唯一凭证。
-func (c *Client) claim() *ownerToken {
-	tok := &ownerToken{}
-	c.owner.Store(tok)
-	c.owned.Store(true)
-	return tok
-}
-
-// checkOwner 校验调用方是否持有所有权凭证。tok==nil 表示外部调用。
-func (c *Client) checkOwner(tok *ownerToken) error {
-	if !c.owned.Load() {
-		return nil
-	}
-	want := c.owner.Load()
-	if want == nil || tok != want {
-		return ErrNotOwner
-	}
-	return nil
-}
-
-// PingInterval 返回本连接的心跳间隔（0 = 无 SDK 心跳）。
-// 池用它在 DialFunc 返回后校验心跳所有权（必须 0，否则 ErrHeartbeatConflict）。
-func (c *Client) PingInterval() time.Duration { return c.pingInterval }
-
-// Closed 报告连接是否已被本地关闭（Close / CloseNow / 池判死都会置位）。
-// 对端关闭由常驻读者（Recv / 池 pump）观测，不在此标志内。
+// Closed 报告连接是否已被本地关闭（Close / CloseNow 置位）。
+// 对端关闭由常驻读者（Recv）观测，不在此标志内。
 func (c *Client) Closed() bool { return c.closed.Load() }
 
 // Dial 建立到内置上游的 Responses WebSocket 连接：URL 由 SDK 固定维护——
@@ -492,14 +454,6 @@ func dialStatus(resp *http.Response) int {
 // （CodexMeta 静态值 / trace / turn_metadata；整体替换帧内 client_metadata——
 // 客户端自带的永不透传）。Write 同步消费——Send 返回前不得复用 frame。
 func (c *Client) Send(ctx context.Context, frame []byte) error {
-	return c.sendOwned(nil, ctx, frame)
-}
-
-// sendOwned 是 Send 的所有权内变体：tok 由池持有（nil = 外部调用，走 A4 校验）。
-func (c *Client) sendOwned(tok *ownerToken, ctx context.Context, frame []byte) error {
-	if err := c.checkOwner(tok); err != nil {
-		return err
-	}
 	frame, err := c.prepareFrame(frame)
 	if err != nil {
 		return err
@@ -576,24 +530,10 @@ func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
 // SetTurnState 设置 x-codex-turn-state 回传值（服务端签发 → 后续 Send 帧
 // client_metadata 自动回传）。轮结束时传空串清除——跨轮不得回传。
 // 网关也可在别处观测到该值时显式设置。
-//
-// 连接被连接池 claim 之后返回 ErrNotOwner（A4）：外部不得篡改别人租约的帧
-// metadata；池内按请求注入走 Lease.SetTurnState。
-func (c *Client) SetTurnState(state string) error {
-	return c.setTurnStateOwned(nil, state)
-}
+func (c *Client) SetTurnState(state string) { c.setTurnState(state) }
 
-// setTurnState 是无所有权守卫的写入点（Dial 捕获握手响应头用）。
+// setTurnState 是写入点（Dial 捕获握手响应头 + SetTurnState 共用）。
 func (c *Client) setTurnState(state string) { c.turnState.Store(state) }
-
-// setTurnStateOwned 是池内变体：tok 必须匹配（nil = 外部调用，走 A4 校验）。
-func (c *Client) setTurnStateOwned(tok *ownerToken, state string) error {
-	if err := c.checkOwner(tok); err != nil {
-		return err
-	}
-	c.setTurnState(state)
-	return nil
-}
 
 // TurnState 返回当前缓存的 x-codex-turn-state（Dial 时自动捕获握手响应头）。
 func (c *Client) TurnState() string {
@@ -607,14 +547,6 @@ func (c *Client) TurnState() string {
 // 对端关闭/网络断开/超 ReadLimit 时返回错误（如 coder/websocket.CloseError、
 // ErrMessageTooBig，网关自行分类处置）。
 func (c *Client) Recv(ctx context.Context) ([]byte, error) {
-	return c.recvOwned(nil, ctx)
-}
-
-// recvOwned 是 Recv 的所有权内变体（池的 pump 是唯一读者，F1/F2）。
-func (c *Client) recvOwned(tok *ownerToken, ctx context.Context) ([]byte, error) {
-	if err := c.checkOwner(tok); err != nil {
-		return nil, err
-	}
 	_, data, err := c.conn.Read(ctx)
 	return data, err
 }
@@ -622,14 +554,6 @@ func (c *Client) recvOwned(tok *ownerToken, ctx context.Context) ([]byte, error)
 // Ping 发送 WS 层 ping 并等待 pong（对端库自动回 pong；ctx 控制等待上限）。
 // 注意：pong 由常驻 Recv 循环处理——Ping 必须在调用方同时执行 Recv 时使用。
 func (c *Client) Ping(ctx context.Context) error {
-	return c.pingOwned(nil, ctx)
-}
-
-// pingOwned 是 Ping 的所有权内变体（池内唯一 ping 所有者）。
-func (c *Client) pingOwned(tok *ownerToken, ctx context.Context) error {
-	if err := c.checkOwner(tok); err != nil {
-		return err
-	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.conn.Ping(ctx)
@@ -640,14 +564,6 @@ func (c *Client) pingOwned(tok *ownerToken, ctx context.Context) error {
 // 等不起时用 CloseNow。停用心跳。重复调用返回首次结果（幂等；
 // 对端已断开时返回 nil）。
 func (c *Client) Close(status StatusCode, reason string) error {
-	return c.closeOwned(nil, status, reason)
-}
-
-// closeOwned 是 Close 的所有权内变体。
-func (c *Client) closeOwned(tok *ownerToken, status StatusCode, reason string) error {
-	if err := c.checkOwner(tok); err != nil {
-		return err
-	}
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
 		c.cancel()
@@ -659,14 +575,6 @@ func (c *Client) closeOwned(tok *ownerToken, status StatusCode, reason string) e
 // CloseNow 立即断开连接（跳过关闭握手，不等待对端），用于等不起 Close 阻塞的
 // 场景——如网关快速 failover、心跳死亡兜底。幂等；与 Close 互斥，先调用者生效。
 func (c *Client) CloseNow() error {
-	return c.closeNowOwned(nil)
-}
-
-// closeNowOwned 是 CloseNow 的所有权内变体（池判死/回收走这里）。
-func (c *Client) closeNowOwned(tok *ownerToken) error {
-	if err := c.checkOwner(tok); err != nil {
-		return err
-	}
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
 		c.cancel()
