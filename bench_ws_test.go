@@ -1,6 +1,7 @@
 package codexsdk
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -192,24 +193,59 @@ func BenchmarkFrameCodecPrepare3KB(b *testing.B) {
 
 // BenchmarkSSEViewRender1KB：spec §7 P2 —— 帧 → SSE 渲染（1KB 帧）。
 //
-// T2 的测量对象是 renderFrameBlock（一帧 → 一个 SSE 块；sseView 的渲染步）；
-// T3 会换成零拷贝分段视图，名字与本输入不变。结果必须被 benchSink 消费：
-// 渲染出 []byte 但不落地的话，分配会被整个抹掉。
+// T3 的测量对象是**零拷贝分段视图**：一帧被切成 prefix / raw / suffix 三段后
+// 逐段读尽（帧体不进任何中间块）。名字、输入（wsBenchFrame 1KB）、每轮口径
+// （一帧 → 一次完整渲染 + 读尽）与 T0/T2 不变，故数字可直接纵向比。
+// 结果必须被 benchSink 消费：读出的字节数不落地的话，整条链会被优化掉。
 func BenchmarkSSEViewRender1KB(b *testing.B) {
 	if n := len(wsBenchFrame); n < 900 || n > 1100 {
 		b.Fatalf("wsBenchFrame 长度 %d 越界（要求 1KB 级）", n)
 	}
+	st := &benchStaticStream{frames: [][]byte{wsBenchFrame}}
+	ctx := context.Background()
+	buf := make([]byte, 4096)
+	// 视图对象是**每请求一次**的东西（生产路径在 streamBodyWS 里 newSSEView 一次，
+	// 288B 计入每请求成本而不是每帧成本）。P2 的口径是「一帧 → 三段渲染 + 读尽」
+	// 这一步：循环内重置视图状态、不重新分配视图，否则测到的是对象创建本身。
+	view := newSSEView(ctx, st, wsResponsesReadLimit)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(wsBenchFrame)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		block, _, err := renderFrameBlock(wsBenchFrame, wsResponsesReadLimit)
-		if err != nil {
-			b.Fatalf("renderFrameBlock: %v", err)
+		st.i = 0
+		*view = sseView{ctx: ctx, stream: st, limit: wsResponsesReadLimit, seg: sseSegCount}
+		written := 0
+		for {
+			n, err := view.Read(buf)
+			written += n
+			if err != nil {
+				if err != io.EOF {
+					b.Fatalf("sseView.Read: %v", err)
+				}
+				break
+			}
 		}
-		benchSink = len(block)
+		benchSink = written
 	}
 }
+
+// benchStaticStream 是 P2 的帧流桩：按序吐固定帧（**不复制**帧切片，与
+// wsExchange 的交付语义同形），吐完返回 io.EOF。
+type benchStaticStream struct {
+	frames [][]byte
+	i      int
+}
+
+func (s *benchStaticStream) Next(context.Context) ([]byte, error) {
+	if s.i >= len(s.frames) {
+		return nil, io.EOF
+	}
+	f := s.frames[s.i]
+	s.i++
+	return f, nil
+}
+
+func (s *benchStaticStream) Close() error { return nil }
 
 // BenchmarkWSStreamBodyPerRequest：spec §7 P3 —— WS 每请求分配（整链路含握手）。
 //
