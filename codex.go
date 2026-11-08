@@ -3,7 +3,6 @@ package codexsdk
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -449,14 +448,30 @@ type TraceContext struct {
 }
 
 // NewTraceContext 生成新的 W3C trace context（每次调用新链路 id，crypto/rand）。
+//
+// 逐字节等价于 "00-"+hex(16B)+"-"+hex(8B)+"-01"，但直接在栈上拼定长缓冲
+// （55B）后一次转 string：每次编码只付 1 次分配（原实现 hex.EncodeToString ×2
+// + 三段拼接 = 5 次，占 P1 每帧分配预算的大头）。
 func NewTraceContext() TraceContext {
-	return TraceContext{
-		Traceparent: "00-" + randomHex(16) + "-" + randomHex(8) + "-01",
-	}
+	var buf [55]byte
+	copy(buf[:3], "00-")
+	var traceID [16]byte
+	randFill(traceID[:])
+	hexEncode(buf[3:35], traceID[:])
+	buf[35] = '-'
+	var spanID [8]byte
+	randFill(spanID[:])
+	hexEncode(buf[36:52], spanID[:])
+	copy(buf[52:], "-01") // 尾部 3 字节：'-','0','1'
+	return TraceContext{Traceparent: string(buf[:])}
 }
 
 // NewUUIDv7 生成 UUIDv7（RFC 9562：48bit 毫秒时间戳 + 版本 7 + 变体 10 +
 // 随机数），对齐真实 codex 客户端的 session_id / thread_id / turn_id 取值。
+//
+// 逐字节等价于 fmt.Sprintf("%x-%x-%x-%x-%x", ...)（36B 小写 hex），但栈上拼装
+// 后一次转 string：每次 1 次分配（原实现经 fmt 反射路径付 8 次，占 P1 每帧分配
+// 预算的大头）。
 func NewUUIDv7() string {
 	var b [16]byte
 	now := time.Now().UnixMilli()
@@ -466,23 +481,37 @@ func NewUUIDv7() string {
 	b[3] = byte(now >> 16)
 	b[4] = byte(now >> 8)
 	b[5] = byte(now)
-	copy(b[6:], randomBytes(10))
+	randFill(b[6:])
 	b[6] = b[6]&0x0f | 0x70 // 版本 7
 	b[8] = b[8]&0x3f | 0x80 // 变体 10
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	var s [36]byte
+	hexEncode(s[0:8], b[0:4])
+	s[8] = '-'
+	hexEncode(s[9:13], b[4:6])
+	s[13] = '-'
+	hexEncode(s[14:18], b[6:8])
+	s[18] = '-'
+	hexEncode(s[19:23], b[8:10])
+	s[23] = '-'
+	hexEncode(s[24:36], b[10:16])
+	return string(s[:])
 }
 
-func randomHex(n int) string {
-	return hex.EncodeToString(randomBytes(n))
+// hexEncode 把小写 hex 写进 dst（dst 长度须为 len(src)*2）。手写而非
+// hex.EncodeToString：后者每次调用分配一份中间 []byte。
+func hexEncode(dst, src []byte) {
+	const digits = "0123456789abcdef"
+	for i, c := range src {
+		dst[i*2] = digits[c>>4]
+		dst[i*2+1] = digits[c&0x0f]
+	}
 }
 
-func randomBytes(n int) []byte {
-	b := make([]byte, n)
+// randFill 用 crypto/rand 填满 b；失败 panic（理由见包级文档「crypto/rand 失败」）。
+func randFill(b []byte) {
 	if _, err := rand.Read(b); err != nil {
-		// crypto/rand 失败 → panic（理由见包级文档「crypto/rand 失败」）。
 		panic(fmt.Sprintf("codexsdk: crypto/rand 失败: %v", err))
 	}
-	return b
 }
 
 // metadataEntry 是 client_metadata 注入项（key 值均由调用方/机制提供）。
@@ -660,8 +689,15 @@ func hexDigit(b byte) byte {
 // entries 无有效项 → 帧
 // 零改动返回。
 func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {
-	obj := clientMetadataObject(entries)
-	if obj == nil {
+	return injectClientMetadataObject(frame, clientMetadataObject(entries))
+}
+
+// injectClientMetadataObject 用**已组装好**的 client_metadata 对象字节整体替换
+// 顶层 client_metadata（sjson.SetRawBytes 一次改写真，语义同
+// injectClientMetadataKeys）。拆出来给 WS 单遍编码器复用：那边对象只组装一次、
+// 直接写进输出缓冲，不再对整帧做第二次改写。obj 为空 → 帧零改动返回。
+func injectClientMetadataObject(frame, obj []byte) []byte {
+	if len(obj) == 0 {
 		return frame
 	}
 	out, err := sjson.SetRawBytes(frame, "client_metadata", obj)
