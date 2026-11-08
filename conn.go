@@ -105,8 +105,7 @@ type conn struct {
 	mu    sync.Mutex
 	state connState
 
-	cause    atomic.Pointer[error]
-	readDone chan struct{} // pumped：pump 退出信号
+	cause atomic.Pointer[error]
 }
 
 // newConn 构造连接内核并按模式启动常驻 goroutine（心跳 / pump）。
@@ -136,7 +135,6 @@ func newConn(ws *coderws.Conn, cfg connConfig, ctx context.Context, stop context
 	}
 	if cfg.mode == modePumped {
 		c.inbox = newFrameInbox(cfg.queueFrames, cfg.queueBytes)
-		c.readDone = make(chan struct{})
 		go c.readLoop()
 	}
 	if cfg.pingInterval > 0 {
@@ -344,7 +342,6 @@ func (c *conn) keepalive() {
 // 对端 ping 都被服务（没有"消费者慢 ⇒ 心跳误判"的截断源）。没有 closing 分支
 // ——pumped 从不优雅关闭。
 func (c *conn) readLoop() {
-	defer close(c.readDone)
 	for {
 		data, err := c.readFrame(c.ctx)
 		if err != nil {

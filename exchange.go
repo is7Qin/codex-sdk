@@ -17,12 +17,15 @@ type frameStream interface {
 	Close() error
 }
 
-// wsExchange 是一次 Responses WS 请求的生命周期：一条连接 + 一份 turn-state
-// 快照 + 取帧入口。conn 不知道"请求"，exchange 不知道"socket"。
+// wsExchange 是一次 Responses WS 请求的生命周期：一条连接 + 取帧入口 + 本次
+// 握手签发值（合成响应的 x-codex-turn-state 头靠它对外可见）。conn 不知道
+// "请求"，exchange 不知道"socket"。
+//
+// 生效 turn-state 不入结构体：它只服务编码（编码发生在 exchange 存在之前），
+// 事后没有任何读者——留在字段里只会让人以为它还有用处。
 type wsExchange struct {
-	cn        *conn
-	turnState string // 生效值（拨号前的快照）
-	issued    string // 本次握手签发值
+	cn     *conn
+	issued string // 本次握手签发值（空 = 上游未签发）
 }
 
 // openWSExchange 建立一次请求级 WS exchange。
@@ -57,7 +60,7 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, readLimit 
 	// 本次握手签发值回写（HTTP 臂在这里读 resp.Header；WS 面只有这一个观测点）。
 	// 顺序不能反：帧已按 effective 编码，回写不会污染本轮帧。
 	c.captureTurnStateValue(hs.turnState)
-	e := &wsExchange{cn: cn, turnState: effective, issued: hs.turnState}
+	e := &wsExchange{cn: cn, issued: hs.turnState}
 	if err := cn.write(ctx, frame); err != nil {
 		cn.terminate(err)
 		return nil, err

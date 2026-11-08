@@ -3,6 +3,8 @@ package codexsdk
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 )
 
@@ -61,22 +63,50 @@ func (c *HTTPClient) streamBodyWS(ctx context.Context, payload []byte, readLimit
 	}, nil
 }
 
-// responsesStreamWS 是 Responses 的 ws 臂取数：把 StreamBody（ws）交付的 SSE
-// 字节喂给**同一个** responsesAggregator（HTTP 臂走 Stream，同样只做
-// scanner + feed）。合成体因此与 HTTP 臂逐字段同构——这不是巧合，而是同一份
-// feed/composite 代码的结果。
+// responsesStreamWS 是 Responses 的 ws 臂取数：**直接从 exchange 取帧**喂给
+// responsesAggregator（HTTP 臂走 Stream，同样只做 scanner + feed）。合成体因此
+// 与 HTTP 臂逐字段同构——这不是巧合，而是同一份 feed/composite 代码的结果。
 //
-// 终态提交：终态帧由 SSE 视图交付后视图即停止取帧（[DONE] 或 EOF 收尾），
-// 因此扫描循环不会在终态之后再 Next——已完成的请求不会被消费侧超时改写。
+// 为什么不走 StreamBody：SSE 编码只为"以 SSE 字节流对外"存在（StreamBody 的
+// 契约）。Responses 只要事件帧，经 sseView 渲染成字节再逐行扫回来是纯回路——
+// 每帧多一次帧体复制 + 每行一次 scanner 分配，且中间没有消费者受益。直取帧后
+// 帧体在本次回调里只被引用，feed 里的解析（gjson 零拷贝路径）原样适用。
+//
+// 终态即提交：终态帧 feed 完即返回（completed / failed / incomplete），不再
+// Next——已完成的请求不会被消费侧随后的取消/超时改写。帧自身的事件语义不变：
+// failed 的 error、incomplete 的截断判定仍归聚合器与调用方。
 func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, feed func(raw []byte) error) error {
-	resp, err := c.streamBodyWS(ctx, payload, wsResponsesReadLimit)
+	ex, err := c.openWSExchange(ctx, payload, wsResponsesReadLimit)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
-	// 扫描上限 = WS 单帧上限 + SSE 包装余量（见 sseBlockOverhead）。
-	_, err = scanSSE(resp.Body, wsResponsesReadLimit+sseBlockOverhead, feed)
-	return err
+	defer func() { _ = ex.Close() }()
+	for {
+		raw, nextErr := ex.Next(ctx)
+		if nextErr == io.EOF { // close frame / 正常收尾：截断与否由调用方按终态判定
+			return nil
+		}
+		if nextErr != nil {
+			return fmt.Errorf("codexsdk: 读取响应流失败: %w", nextErr)
+		}
+		if ferr := feed(raw); ferr != nil {
+			return ferr
+		}
+		if isTerminalEvent(raw) { // 终态帧已 feed ⇒ 本次取数完成
+			return nil
+		}
+	}
+}
+
+// isTerminalEvent 报告 raw 是否为本次请求的终态事件（completed / failed /
+// incomplete）。与 sseView 的渲染判定共用同一套零分配 type 扫描与同一组常量，
+// 两条路径不会对"什么算终结"产生分歧；协议解析仍只在这里与 sseView，conn /
+// exchange 的取帧路径不认识事件类型。
+func isTerminalEvent(raw []byte) bool {
+	typ := frameEventType(raw)
+	return bytesAre(typ, responseEventCompleted) ||
+		bytesAre(typ, responseEventFailed) ||
+		bytesAre(typ, responseEventIncomplete)
 }
 
 // effectiveTurnState 解析本次调用的生效 turn-state：WithHeader(HeaderTurnState, ...)
