@@ -34,6 +34,9 @@ const (
 // c.TurnState()——Stream 内部已捕获（http.go captureTurnState），非 2xx 路径
 // 本就为空）。
 // 错误透传同 Stream（HTTPError 信封 / fatal 五类 / 401 判死轮转）。
+//
+// TransportWS 时取数改走上游 Responses WS（StreamBody 的 ws 臂 + 同一个
+// responsesAggregator），合成体与 HTTP 臂逐字段同构；错误语义见 TRANSPORT.md。
 func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPResponse, error) {
 	wire := payload
 	// 无条件覆盖 stream:true（含显式 stream:false）；非法 JSON 放弃注入保持原样
@@ -46,8 +49,12 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 		}
 	}
 	agg := &responsesAggregator{}
-	err := c.Stream(ctx, wire, agg.feed)
-	if err != nil {
+	if c.opts.responsesTransport == TransportWS {
+		// ws 臂：StreamBody（ws）的 SSE 字节 → 同一个响应聚合器。
+		if err := c.responsesStreamWS(ctx, wire, agg.feed); err != nil {
+			return nil, err // 上游/传输错误透传（response.failed 事件级 HTTPError 同样原样）
+		}
+	} else if err := c.Stream(ctx, wire, agg.feed); err != nil {
 		return nil, err // 上游错误（HTTPError/fatal 五类/401 轮转）/ response.failed 事件级错误透传
 	}
 	if !agg.completed {

@@ -144,11 +144,38 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 	}
 	c.captureTurnState(resp)
 
-	maxLine := c.opts.maxLineSize
+	done, err := scanSSE(resp.Body, c.opts.maxLineSize, fn)
+	if err != nil {
+		return err
+	}
+	if done {
+		// [DONE]：流正常终止。排空残余 body——http.Transport 对未读完的
+		// body 连接不回池（残余未读使连接不可复用），读尽后连接回池，
+		// 下一轮请求复用同连接（消除重拨风暴）。排空失败（网络中断）
+		// 不影响语义：连接本就不复用，行为与现状等价（defer Close 兜底）。
+		// 病态上游边界：[DONE] 后不关闭 body 的病态上游——本读阻塞至
+		// ctx 取消兜底（连接随 ctx 取消释放，与现状等价）。
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}
+	return nil // EOF 结束（是否截断由网关按终态事件判定）
+}
+
+// scanSSE 逐 `data:` 行扫描 SSE 字节流并交付事件帧（原 Stream 内联循环的抽出，
+// HTTP 与 WS 两条路径共用同一份 framing 语义）。
+//
+// 返回 done=true 表示遇到 [DONE] 终止标记（[DONE] 不进 feed）；done=false 且
+// err=nil 表示读到 EOF——是否截断由调用方按终态事件判定（本函数不解释事件）。
+// feed 返回错误立即终止扫描并原样透传。
+//
+// ctx 不入本函数：取消语义由 body 承担——HTTP body 绑定请求 ctx，WS reader 每次
+// Recv 用调用方 ctx。此处再插一个取消检查点会改变 HTTP 臂"ctx 已取消但 body
+// 仍有缓冲数据"时的错误链与文案（现状是 scanner 读到传输层错误、包成
+// "读取 SSE 流失败"），违反"HTTP 路径零变化"。
+func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, error) {
 	if maxLine <= 0 {
 		maxLine = defaultMaxLineSize
 	}
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(body)
 	initSize := 64 * 1024
 	if maxLine < initSize {
 		initSize = maxLine
@@ -164,23 +191,16 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 			continue
 		}
 		if bytes.Equal(trimmed, sseDone) {
-			// [DONE]：流正常终止。排空残余 body——http.Transport 对未读完的
-			// body 连接不回池（残余未读使连接不可复用），读尽后连接回池，
-			// 下一轮请求复用同连接（消除重拨风暴）。排空失败（网络中断）
-			// 不影响语义：连接本就不复用，行为与现状等价（defer Close 兜底）。
-			// 病态上游边界：[DONE] 后不关闭 body 的病态上游——本读阻塞至
-			// ctx 取消兜底（连接随 ctx 取消释放，与现状等价）。
-			_, _ = io.Copy(io.Discard, resp.Body)
-			return nil
+			return true, nil
 		}
-		if err := fn(trimmed); err != nil {
-			return err
+		if err := feed(trimmed); err != nil {
+			return false, err
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("codexsdk: 读取 SSE 流失败: %w", err)
+		return false, fmt.Errorf("codexsdk: 读取 SSE 流失败: %w", err)
 	}
-	return nil // EOF 结束（是否截断由网关按终态事件判定）
+	return false, nil
 }
 
 // StreamBody 发送 POST <responses 端点> 请求并返回**未读**的原始流式响应体，
@@ -195,7 +215,14 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 //     *HTTPError{StatusCode, Raw}（不泄漏未关闭的连接）。
 //
 // 读取沿用调用方 ctx（http 传输层）：调用方取消能终止后续对返回 body 的读取。
+//
+// TransportWS 时改走上游 Responses WS（见 streamBodyWS）：对外形状完全一致
+// （StatusCode=200 / Body=SSE 字节流 / Header 含 x-codex-turn-state），错误语义
+// 见 TRANSPORT.md。
 func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte) (*http.Response, error) {
+	if c.opts.responsesTransport == TransportWS {
+		return c.streamBodyWS(ctx, payload, wsStreamReadLimit)
+	}
 	wire, err := normalizeCodexHTTPPayload(payload)
 	if err != nil {
 		return nil, err
@@ -407,9 +434,15 @@ func (c *HTTPClient) TurnState() string {
 // captureTurnState 从响应头捕获 x-codex-turn-state（非空才覆盖）。
 func (c *HTTPClient) captureTurnState(resp *http.Response) {
 	if resp != nil {
-		if v := resp.Header.Get(HeaderTurnState); v != "" {
-			c.turnState.Store(v)
-		}
+		c.captureTurnStateValue(resp.Header.Get(HeaderTurnState))
+	}
+}
+
+// captureTurnStateValue 直接捕获 turn-state 字面值（非空才覆盖）。WS 臂用它
+// 回写握手响应头签发值（Client.TurnState()）——与 HTTP 臂读 resp.Header 同义。
+func (c *HTTPClient) captureTurnStateValue(v string) {
+	if v != "" {
+		c.turnState.Store(v)
 	}
 }
 

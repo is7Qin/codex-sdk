@@ -240,7 +240,6 @@ func TestHTTPCallbackErrorAbortsStream(t *testing.T) {
 	}
 }
 
-
 // TestHTTPNilAuth：auth 为 nil 直接报错。
 func TestHTTPNilAuth(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -467,7 +466,7 @@ func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
 	}
 	// 条件键：配置了才带
 	for key, want := range map[string]string{
-		"x-openai-subagent":       "sub-agent-1",
+		"x-openai-subagent":        "sub-agent-1",
 		"x-codex-parent-thread-id": "parent-thread-1",
 		"parent_turn_id":           "parent-turn-1",
 		"x-codex-turn-metadata":    `{"request_kind":"turn"}`,
@@ -571,9 +570,9 @@ func TestHTTPStreamClientMetadataSessionFallback(t *testing.T) {
 		t.Fatalf("client_metadata = %s（期望 session 3 键 + turn_id）", cm.Raw)
 	}
 	for key, want := range map[string]string{
-		"session_id":         "sess-s",
-		"thread_id":          "thread-s",
-		"x-codex-window-id":  "win-s:1",
+		"session_id":        "sess-s",
+		"thread_id":         "thread-s",
+		"x-codex-window-id": "win-s:1",
 	} {
 		if got := cm.Get(key).String(); got != want {
 			t.Fatalf("%s = %q, 期望 %q", key, got, want)

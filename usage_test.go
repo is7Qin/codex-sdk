@@ -18,7 +18,6 @@ func TestUsageDefaultURLConst(t *testing.T) {
 	}
 }
 
-
 // TestUsageGetMethodAndAuth：GetUsage 请求形态断言——method=GET + 无请求体 +
 // 鉴权头注入（固定官方端点路径 /backend-api/wham/usage 一并断言）。
 func TestUsageGetMethodAndAuth(t *testing.T) {
