@@ -37,6 +37,11 @@ const (
 //
 // TransportWS 时取数改走上游 Responses WS（StreamBody 的 ws 臂 + 同一个
 // responsesAggregator），合成体与 HTTP 臂逐字段同构；错误语义见 TRANSPORT.md。
+//
+// 终态提交（WS 臂）：终态帧一旦交给聚合器，本次 exchange 即视为完成——此后
+// 消费侧的取消/超时不得把已完成的请求改写成失败（帧自身的事件语义不变：
+// failed / incomplete 仍按聚合器与截断规则报错）。这也覆盖"终态帧已入队、
+// deadline 随即到点"的次序：已拿到的帧先被交付。
 func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPResponse, error) {
 	wire := payload
 	// 无条件覆盖 stream:true（含显式 stream:false）；非法 JSON 放弃注入保持原样
@@ -50,9 +55,13 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 	}
 	agg := &responsesAggregator{}
 	if c.opts.responsesTransport == TransportWS {
-		// ws 臂：StreamBody（ws）的 SSE 字节 → 同一个响应聚合器。
+		// ws 臂：StreamBody（ws）的 SSE 字节 → 同一个响应聚合器。终态帧喂进
+		// 聚合器后不再取帧（SSE 视图在终态处收尾），所以只有"终态之后才到"
+		// 的取消/超时可以豁免，其余错误原样透传。
 		if err := c.responsesStreamWS(ctx, wire, agg.feed); err != nil {
-			return nil, err // 上游/传输错误透传（response.failed 事件级 HTTPError 同样原样）
+			if !agg.completed || !isContextError(err) {
+				return nil, err // 上游/传输错误透传（response.failed 事件级 HTTPError 同样原样）
+			}
 		}
 	} else if err := c.Stream(ctx, wire, agg.feed); err != nil {
 		return nil, err // 上游错误（HTTPError/fatal 五类/401 轮转）/ response.failed 事件级错误透传

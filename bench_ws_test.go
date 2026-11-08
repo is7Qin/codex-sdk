@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -88,7 +89,7 @@ type benchWSUpstream struct {
 }
 
 // newBenchWSUpstream 起服务并固定脚本：created → 4×delta → completed
-// （completed 之后由客户端补 [DONE]，见 renderWSBlock 的终态规则）。
+// （completed 之后由客户端补 [DONE]，见 sseView 的终态规则）。
 func newBenchWSUpstream(b *testing.B) *benchWSUpstream {
 	b.Helper()
 	u := &benchWSUpstream{reps: []string{
@@ -157,15 +158,16 @@ func benchWSClient(b *testing.B, up *benchWSUpstream) *HTTPClient {
 
 // BenchmarkFrameCodecPrepare3KB：spec §7 P1 —— 帧构造 + 归一（3.7KB 体）。
 //
-// 测量体是生产 Send 的等价链：buildResponsesCreateFrame（HTTP→WS 协议形状）→
-// prepareFrame（白名单 / store 归零 / client_metadata 组装）。Client 在循环外
-// 构造：Send 对它的字段只读，循环内构造等于把配置成本摊进被测链。
-// traceAuto/turnAuto 保持 true —— 每帧生成 traceparent 与 turn_id 是真实路径。
+// 测量体是生产发送的等价链：frameCodec.encode(encodeWSResponses) = HTTP→WS 协议
+// 形状（buildResponsesCreateFrame）+ 伪装层归一（白名单 / store 归零 /
+// client_metadata 组装）。codec 在循环外构造（无状态），循环内构造等于把配置
+// 成本摊进被测链。traceAuto/turnAuto 保持 true —— 每帧生成 traceparent 与
+// turn_id 是真实路径。
 func BenchmarkFrameCodecPrepare3KB(b *testing.B) {
 	if n := len(wsBenchPayload); n < 3600 || n > 3800 {
 		b.Fatalf("wsBenchPayload 长度 %d 越界（要求 3600–3800）", n)
 	}
-	c := &Client{
+	fc := newFrameCodec(&options{
 		meta: &CodexMeta{
 			InstallationID: "bench-installation",
 			SessionID:      "bench-session",
@@ -175,18 +177,14 @@ func BenchmarkFrameCodecPrepare3KB(b *testing.B) {
 		session:   &Session{SessionID: "bench-session", ThreadID: "bench-thread", WindowID: "bench-thread:0"},
 		traceAuto: true,
 		turnAuto:  true,
-	}
+	})
 	b.ReportAllocs()
 	b.SetBytes(int64(len(wsBenchPayload)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		frame, err := buildResponsesCreateFrame(wsBenchPayload)
+		out, err := fc.encode(wsBenchPayload, encodeWSResponses, frameInput{Now: time.Now()})
 		if err != nil {
-			b.Fatalf("buildResponsesCreateFrame: %v", err)
-		}
-		out, err := c.prepareFrame(frame)
-		if err != nil {
-			b.Fatalf("prepareFrame: %v", err)
+			b.Fatalf("frameCodec.encode: %v", err)
 		}
 		benchSink = len(out)
 	}
@@ -194,8 +192,9 @@ func BenchmarkFrameCodecPrepare3KB(b *testing.B) {
 
 // BenchmarkSSEViewRender1KB：spec §7 P2 —— 帧 → SSE 渲染（1KB 帧）。
 //
-// T0 的测量对象是 renderWSBlock；T3 会把它换成零拷贝 sseView，名字与本输入不变。
-// 结果必须被 benchSink 消费：渲染出 []byte 但不落地的话，分配会被整个抹掉。
+// T2 的测量对象是 renderFrameBlock（一帧 → 一个 SSE 块；sseView 的渲染步）；
+// T3 会换成零拷贝分段视图，名字与本输入不变。结果必须被 benchSink 消费：
+// 渲染出 []byte 但不落地的话，分配会被整个抹掉。
 func BenchmarkSSEViewRender1KB(b *testing.B) {
 	if n := len(wsBenchFrame); n < 900 || n > 1100 {
 		b.Fatalf("wsBenchFrame 长度 %d 越界（要求 1KB 级）", n)
@@ -204,9 +203,9 @@ func BenchmarkSSEViewRender1KB(b *testing.B) {
 	b.SetBytes(int64(len(wsBenchFrame)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		block, _, err := renderWSBlock(wsBenchFrame, wsResponsesReadLimit)
+		block, _, err := renderFrameBlock(wsBenchFrame, wsResponsesReadLimit)
 		if err != nil {
-			b.Fatalf("renderWSBlock: %v", err)
+			b.Fatalf("renderFrameBlock: %v", err)
 		}
 		benchSink = len(block)
 	}

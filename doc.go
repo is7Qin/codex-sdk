@@ -88,9 +88,18 @@
 //     <environment_context> 的帧另经 RewriteEnvironmentContextTime 重写
 //     （该步有 payload 级分配，非本路径。forceCodexStoreFalse 对已 false 的
 //     store 短路——真 codex 帧恒带 store:false）
-//   - 常驻读循环是硬性要求：Ping 与心跳依赖 Recv 处理 pong 控制帧
-//     （coder/websocket：Ping 必须与 Reader 并发，否则等不到 pong）；
-//     网关透传编排天然常驻 Recv 循环，满足该前提
+//   - 连接读模型分两种模式（构造期固定、互斥；同一条连接只有一个 socket 读点
+//   - 一个写闸 + 一个终止入口）。公开 Dial → Client 是**纯拉**：Recv 直读、
+//     无常驻读者、无队列，因此 pong 由调用方的常驻 Recv 循环服务
+//     （coder/websocket：Ping 必须与 Reader 并发，否则等不到 pong）——网关透传
+//     编排天然满足该前提，这是既有契约；Close 走 coder 关闭握手。传输臂
+//     （WithResponsesTransport(TransportWS) 的 StreamBody / Responses）是
+//     **常驻读者 + 有界队列**：读者除入队临界区外恒在 Read，所以下游再慢也不会
+//     让心跳误判成连接死亡；队列饱和（256 帧 / 8MiB，空队列允许单帧超预算）报
+//     ErrWSBackpressure（可归因，非静默截断、非无限缓冲），心跳探测未在 2s 预算内
+//     完成报 ErrKeepaliveTimeout；收尾一律强断（不做关闭握手），由 Body.Close 触发。
+//     注意：WithPingInterval(0) 关闭心跳后，传输臂仍有常驻读者服务 pong，但不再
+//     探测"对端是否还活着"（半开连接只能靠读写错误或调用方 ctx 兜底）。
 //   - HTTP 流式解析零拷贝：bufio.Scanner 复用缓冲 + 行切片提取 data: 帧内容，
 //     回调内的原始字节引用 scanner 缓冲（仅在回调执行期间有效）
 //   - HTTP 客户端懒构建：NewHTTPClient 零开销，首次 Do/Stream 才创建 http.Client
@@ -113,7 +122,7 @@
 //     （:779-792，辅助函数本身无 turn-state）之后显式追加
 //     client_metadata.insert(X_CODEX_TURN_STATE_HEADER, ...)，流入
 //     ResponseCreateWsRequest.client_metadata（:1702-1711 帧体携带）；SDK 帧注入
-//     （client.go prepareFrame）逐点一致：升级响应头签发 → 帧内回传
+//     （frameCodec.normalize）逐点一致：升级响应头签发 → 帧内回传
 //     （Client.TurnState 缓存 + 网关 SetTurnState("") 清除，跨轮不得回传）。
 //
 // responses-lite 非独立端点：与 /responses 同端点同事件集，

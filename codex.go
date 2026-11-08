@@ -493,7 +493,7 @@ type metadataEntry struct {
 
 // metaEntries 是 client_metadata 注入项序列，惰性累积：出现首个非空值才分配
 // 底层数组（全空 / 未注入路径零分配）。同名键取**首次出现**
-// （clientMetadataObject 去重，后写不覆盖）——WS prepareFrame 与 HTTP
+// （clientMetadataObject 去重，后写不覆盖）——WS 帧编码器与 HTTP
 // injectResponsesClientMetadata 共用同一累积器与键序。
 //
 // 方法按值收发（如 append 的惯用法，返回新切片）——指针接收会让调用方的
