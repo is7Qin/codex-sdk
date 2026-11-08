@@ -262,18 +262,18 @@ func TestForceCodexStoreFalse(t *testing.T) {
 	}
 }
 
-// TestPrepareFrameZeroCopyWhenNormalized：已归一帧（顶层键全在白名单内且已含
-// store:false）+ 无任何注入 → prepareFrame 零拷贝原样返回（感知不到归一的
+// TestFrameCodecZeroCopyWhenNormalized：已归一帧（顶层键全在白名单内且已含
+// store:false）+ 无任何注入 → frameCodec 零拷贝原样返回（感知不到归一的
 // 老路径——真 codex 帧在有身份注入时另经 client_metadata 组装）。
-func TestPrepareFrameZeroCopyWhenNormalized(t *testing.T) {
-	c := &Client{} // 无 meta/session/trace/turnAuto，注入项为空
+func TestFrameCodecZeroCopyWhenNormalized(t *testing.T) {
+	fc := &frameCodec{} // 无 meta/session/trace/turnAuto，注入项为空
 	in := []byte(`{"type":"response.create","model":"gpt-5","store":false}`)
-	got, err := c.prepareFrame(in)
+	got, err := fc.encode(in, encodeNativeWS, frameInput{Now: time.Now()})
 	if err != nil {
-		t.Fatalf("prepareFrame: %v", err)
+		t.Fatalf("encode: %v", err)
 	}
 	if len(got) == 0 || &got[0] != &in[0] {
-		t.Fatal("已归一且无注入时 prepareFrame 应零拷贝原样返回")
+		t.Fatal("已归一且无注入时 encode 应零拷贝原样返回")
 	}
 	if gjson.GetBytes(got, "store").Bool() || gjson.GetBytes(got, "model").String() != "gpt-5" {
 		t.Fatalf("归一后帧内容应保持: %s", got)

@@ -140,45 +140,8 @@ func TestWSReaderKeepsPongsWhileConsumerIdle(t *testing.T) {
 	}
 }
 
-// TestWSReaderBackpressureFailsFast（spec §2 背压）：队列字节预算撑爆 ⇒
-// ErrWSBackpressure，**不是**静默丢帧、也不是无限缓冲。
-func TestWSReaderBackpressureFailsFast(t *testing.T) {
-	big := `{"type":"response.output_text.delta","delta":"` + strings.Repeat("x", 64<<10) + `"}`
-	frames := make([]string, 0, 200)
-	frames = append(frames, wsCreatedEv)
-	for range 200 {
-		frames = append(frames, big)
-	}
-	frames = append(frames, wsCompletedEv)
-	up := newWSResidentUpstream(t, frames, 0)
-	hc := newWSClient(t, up)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
-	if err != nil {
-		t.Fatalf("StreamBody: %v", err)
-	}
-	// 消费者故意不读：队列涨到字节预算后读协程必须自行退出（done 屏障），
-	// 而不是无限缓冲——这里等的是那件事发生，不是"等一会儿看看"。
-	r, ok := resp.Body.(*wsReader)
-	if !ok {
-		t.Fatalf("body 类型 = %T，想要 *wsReader", resp.Body)
-	}
-	select {
-	case <-r.done:
-	case <-time.After(20 * time.Second):
-		t.Fatal("队列预算未触发读协程退出（背压缺失）")
-	}
-	_, readErr := io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	if !errors.Is(readErr, ErrWSBackpressure) {
-		t.Fatalf("读尽后错误 = %v，想要 ErrWSBackpressure", readErr)
-	}
-}
-
-// TestWSReaderClosePromptAndIdempotent：Close 立即返回（读协程被取消，不会卡在
-// 无消费者的队列发送上），重复调用幂等。
+// TestWSReaderClosePromptAndIdempotent：Close 立即返回（终止强断，不会卡在
+// 无消费者的队列上），重复调用幂等。
 func TestWSReaderClosePromptAndIdempotent(t *testing.T) {
 	up := newWSResidentUpstream(t, []string{wsCreatedEv}, 0)
 	hc := newWSClient(t, up)

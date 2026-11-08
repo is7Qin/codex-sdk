@@ -35,6 +35,11 @@ type HTTPClient struct {
 	auth Auth
 	opts options
 
+	// codec 是帧编码器（无可变状态，可并发使用）；wsHeaders 是升级头的
+	// 调用方覆盖集（构造期算好，已按 WS 面规则去掉 x-codex-turn-state）。
+	codec     *frameCodec
+	wsHeaders http.Header
+
 	mu               sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
 	client           *http.Client
 	noRedirectClient *http.Client // 仅 StreamBody：禁跟随重定向（3xx 原样返回）
@@ -47,7 +52,12 @@ func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	return &HTTPClient{auth: auth, opts: cfg}
+	return &HTTPClient{
+		auth:      auth,
+		opts:      cfg,
+		codec:     newFrameCodec(&cfg),
+		wsHeaders: wsUpgradeHeaders(cfg.headers),
+	}
 }
 
 // CloseIdleConnections 关闭底层空闲连接（懒构建未使用时为零开销调用；
@@ -77,14 +87,23 @@ type HTTPResponse struct {
 }
 
 // HTTPError 是上游非 2xx 响应（状态码 + 错误体原样交付，error 信封由网关解析）。
+//
+// WS 臂的升级失败也归为同一形状（StatusCode + ≤1KiB 的截断 body），底层原因
+// 挂在未导出的 cause 上：errors.As 可回溯到 *DialError，errors.Is 可回溯到
+// context.Canceled 等（网关的判死/重试分类不必区分两臂）。
 type HTTPError struct {
 	StatusCode int
 	Raw        []byte
+
+	cause error // 底层原因（可空）；仅供 errors.Is/As 回溯，不参与文案
 }
 
 func (e *HTTPError) Error() string {
 	return fmt.Sprintf("codexsdk: upstream HTTP %d", e.StatusCode)
 }
+
+// Unwrap 暴露底层原因（有则回溯，无则 nil）。
+func (e *HTTPError) Unwrap() error { return e.cause }
 
 // Do 发送 POST <responses 端点> 请求（端点方法族成员——固定官方端点
 // DefaultResponsesURL；payload 为完整 JSON 请求体，调用方决定 stream 等字段），
@@ -167,10 +186,10 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 // err=nil 表示读到 EOF——是否截断由调用方按终态事件判定（本函数不解释事件）。
 // feed 返回错误立即终止扫描并原样透传。
 //
-// ctx 不入本函数：取消语义由 body 承担——HTTP body 绑定请求 ctx，WS reader 每次
-// Recv 用调用方 ctx。此处再插一个取消检查点会改变 HTTP 臂"ctx 已取消但 body
-// 仍有缓冲数据"时的错误链与文案（现状是 scanner 读到传输层错误、包成
-// "读取 SSE 流失败"），违反"HTTP 路径零变化"。
+// ctx 不入本函数：取消语义由 body 承担——HTTP body 绑定请求 ctx，WS 侧 body
+// （sseView）每次取帧用 exchange 的 ctx。此处再插一个取消检查点会改变 HTTP 臂
+// "ctx 已取消但 body 仍有缓冲数据"时的错误链与文案（现状是 scanner 读到传输层
+// 错误、包成"读取响应流失败"），违反"HTTP 路径零变化"。
 func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, error) {
 	if maxLine <= 0 {
 		maxLine = defaultMaxLineSize
@@ -198,7 +217,7 @@ func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, er
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return false, fmt.Errorf("codexsdk: 读取 SSE 流失败: %w", err)
+		return false, fmt.Errorf("codexsdk: 读取响应流失败: %w", err)
 	}
 	return false, nil
 }
@@ -260,7 +279,7 @@ func normalizeCodexHTTPPayload(raw []byte) ([]byte, error) {
 // turn_id 恒带）：
 //   - 恒 4 key：x-codex-installation-id / session_id / thread_id /
 //     x-codex-window-id（CodexMeta 与 WithSession 同 key 时 CodexMeta 优先
-//     ——对齐 WS 组装优先级（client.go prepareFrame；空值跳过）；
+//     ——对齐 WS 组装优先级（frameCodec.normalize；空值跳过）；
 //   - 恒带 turn_id：CodexMeta.TurnID 静态值优先；否则每请求自动 UUIDv7
 //     （网关每请求即一轮，对齐真实"每轮新 sub_id"语义）；客户端自带 turn_id
 //     不参与透传；
@@ -288,7 +307,7 @@ func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
 	if !gjson.ValidBytes(payload) {
 		return payload
 	}
-	// 惰性组装 entries（与 WS prepareFrame 共用 metaEntries 累积器与键序，
+	// 惰性组装 entries（与 WS 帧编码器共用 metaEntries 累积器与键序，
 	// 面特有键各自补充）；先在栈上预留 8 项，超出才转堆；零配置时仍带
 	// turn_id（真实恒发）。
 	var entryBuf [8]metadataEntry

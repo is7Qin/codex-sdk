@@ -22,9 +22,11 @@ channel API.
   fatal-account detection, and 401 auto-rotation).
 - **Fingerprint alignment**: headers, send-frame top-level key whitelist, and
   `client_metadata` assembly aligned with the real Codex client.
-- **Zero protocol parsing**: the SDK delivers complete raw bytes; type/usage/
-  event semantics and business logic live in the gateway
-  ([go-proxy-mini](https://github.com/is7Qin/go-proxy-mini)).
+- **Protocol-aware transport**: the SDK owns framing, keepalive and the SSE
+  representation, and reports attributable transport errors
+  (`ErrWSBackpressure` / `ErrKeepaliveTimeout` / `*HTTPError` with an
+  `Unwrap`-able cause). Business semantics (types / usage / events) still live
+  in the gateway ([go-proxy-mini](https://github.com/is7Qin/go-proxy-mini)).
 
 ## Installation
 

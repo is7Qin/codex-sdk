@@ -4,14 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	coderws "github.com/coder/websocket"
-	"github.com/tidwall/gjson"
 )
 
 // 传输常量（对齐参考实现 sub2api openai_ws_*）。
@@ -23,8 +20,6 @@ const (
 	// 需要 keepalive：上游客户端同时发送 type:"ping" 应用事件，本库选择
 	// WS 层 ping 以不进入业务事件流。
 	defaultPingInterval = 30 * time.Second
-	// defaultPingTimeout 心跳 ping 超时（对齐 sub2api 连接健康检查超时）。
-	defaultPingTimeout = 2 * time.Second
 	// defaultCompressionThreshold 压缩开启时仅压缩超过该大小的消息。
 	defaultCompressionThreshold = 512
 )
@@ -86,26 +81,6 @@ type DialError struct {
 	// 与 SDK 各自轮转造成双份刷新。仅 401 路径可置 true；PAT/oauthAuth
 	// 不轮转，恒为 false。
 	Refreshed bool
-}
-
-// dialErrBodyLimit 升级失败响应体的保留上限。与 HTTP 臂的错误体截断量级一致：
-// 网关只从里面取 error.message / error_code，不需要整篇 body。
-const dialErrBodyLimit = 1024
-
-// dialErrBody 读出并关闭升级失败响应的截断响应体（nil/空 → nil）。
-//
-// 调用点只在上游拒绝升级（非 101）时：此时 coder/websocket 已把 resp 交回，
-// 但**没有**读过 body——不读就是永久丢弃（两臂错误分类面不对称）。
-func dialErrBody(resp *http.Response) []byte {
-	if resp == nil || resp.Body == nil {
-		return nil
-	}
-	defer func() { _ = resp.Body.Close() }()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, dialErrBodyLimit))
-	if err != nil || len(b) == 0 {
-		return nil
-	}
-	return b
 }
 
 func (e *DialError) Error() string {
@@ -274,35 +249,27 @@ func withKeepaliveInterval(d time.Duration) Option {
 	return func(o *options) { o.keepaliveInterval = d }
 }
 
-// Client 是 Responses WebSocket 连接（Dial 创建）。
+// Client 是 Responses WebSocket 连接（Dial 创建），是连接内核的 pull 模式门面。
 //
-// 并发语义：至多一个 goroutine 同时执行 Recv；Send / Ping 内部串行化
-// （coder/websocket 禁止并发写）。连接建立后的帧收发路径零额外分配。
+// 读模型：**纯拉**——Recv 直读 socket（无常驻读协程、无队列）。因此
 //
-// 常驻读循环是硬性要求：Ping 与心跳依赖 Recv 处理 pong 控制帧
-// （coder/websocket：Ping 必须与 Reader 并发，否则等不到 pong）——
-// 网关透传编排天然常驻 Recv 循环，满足该前提。
+//   - pong 由调用方的常驻 Recv 循环处理（coder/websocket：Ping 必须与 Reader
+//     并发，否则等不到 pong）。网关透传编排天然常驻 Recv 循环，满足该前提；
+//   - Recv 的 ctx 不是"可取消的一次取帧"：按 coder 语义，取消会**关闭连接**
+//     并返回 ctx 错误。
+//
+// 心跳（默认 30s ping / 2s 探测预算）依赖上述常驻 Recv；心跳失败视为连接已死，
+// 立即强断以解除阻塞中的 Recv（返回错误），网关据此触发重连。
+//
+// 并发语义：至多一个 goroutine 同时执行 Recv；Send / Ping 由连接内核的写闸
+// 串行化（coder/websocket 禁止并发写）。关闭握手时延上界约 10s（coder 写关闭帧
+// 5s + 等对端关闭帧 5s），等不起用 CloseNow（立即返回）。
 type Client struct {
-	conn    *coderws.Conn
-	writeMu sync.Mutex // 串行化写路径（Send / Ping / 心跳共用）
+	cn    *conn
+	codec *frameCodec
 
-	pingInterval time.Duration
-
-	// 伪装层（Send 帧组装）。
-	meta            *CodexMeta
-	metaPassthrough []metadataEntry // WithClientMetadata 注入项（只注入不解析）
-	session         *Session        // 会话标识（握手头 + 帧内 metadata）
-	trace           *TraceContext   // 外部注入（每帧静态，优先于自动生成）
-	traceAuto       bool            // 每帧自动生成 trace
-	turnAuto        bool            // 每帧自动生成 turn_id
-	turnProvider    func(turn uint64) string
-	turn            atomic.Uint64
-	turnState       atomic.Value // string；x-codex-turn-state 回传值
-
-	ctx       context.Context
-	cancel    context.CancelFunc
-	closeOnce sync.Once
-	closeErr  error
+	turn      atomic.Uint64 // turn_metadata 计数（仅 WithTurnMetadata 时自增）
+	turnState atomic.Value  // string；x-codex-turn-state 回传值
 
 	// closed 标记本地已发起关闭（Close/CloseNow）。对端关闭由常驻读者观测。
 	closed atomic.Bool
@@ -317,15 +284,14 @@ func (c *Client) Closed() bool { return c.closed.Load() }
 //
 // auth 注入升级请求的 Authorization 头（PAT 静态 / OAuth 每次升级取新 token）。
 //
-// WS 升级 401 自动轮转（OAuthWithRotation 专属）：DialError{401}（升级无
-// 响应体不可判死）→ SDK 内单飞 refresh → 自动重连一次；仍 401 → 返回
-// DialError 且 Refreshed=true（网关据此知道已轮转过）。PAT/oauthAuth 不轮转
-// （401 直接返回 DialError，现状保持）；refresh 失败（fatal / RefreshError）
-// 经本方法透传，不被 DialError 包层吞掉（errors.As 可区分）。
+// WS 升级 401 自动轮转（OAuthWithRotation 专属）：401（有升级响应）→ SDK 内
+// 单飞 refresh → 自动重连一次；仍 401 → 返回 DialError 且 Refreshed=true（网关
+// 据此知道已轮转过）。PAT/oauthAuth 不轮转（401 直接返回 DialError）；refresh
+// 失败（fatal / RefreshError）经本方法透传，不被 DialError 包层吞掉
+// （errors.As 可区分）。无升级响应的失败（连接拒绝 / 拨号中取消）返回原始
+// 错误链，**不**构造 DialError——errors.Is(ctx) 保持成立。
 //
-// 连接建立后启动心跳：每 pingInterval 发送 WS 层 ping（默认 30s）。心跳依赖
-// 调用方的常驻 Recv 循环处理 pong（见 Client 并发语义）。心跳失败视为连接
-// 已死：立即 CloseNow 解除阻塞中的 Recv（返回网络错误），网关据此触发重连。
+// ctx 只约束握手：连接寿命与调用方 ctx 解耦（今日语义不变）。
 func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 	if auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
@@ -334,117 +300,24 @@ func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	wsURL := DefaultResponsesWSURL
-
-	// 升级头组装（重连时以新 at 重取）。
-	buildHeaders := func(ctx context.Context) (http.Header, error) {
-		hdr := make(http.Header, 10)
-		token, err := auth.Authorization(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
-		}
-		hdr.Set("Authorization", token)
-		// 伪装层默认头（WithHeader 可覆盖）。
-		applyDefaultHeaders(hdr)
-		hdr.Set("OpenAI-Beta", "responses_websockets="+cfg.beta)
-		// 会话标识握手头（真实客户端恒带；trace 不进握手头，只进帧内 metadata）。
-		if s := cfg.session; s != nil {
-			if s.SessionID != "" {
-				hdr.Set(HeaderSessionID, s.SessionID)
-			}
-			if s.ThreadID != "" {
-				hdr.Set(HeaderThreadID, s.ThreadID)
-			}
-			clientRequestID := s.ClientRequestID
-			if clientRequestID == "" {
-				clientRequestID = s.ThreadID
-			}
-			if clientRequestID != "" {
-				hdr.Set(HeaderClientRequestID, clientRequestID)
-			}
-			if s.WindowID != "" {
-				hdr.Set(HeaderWindowID, s.WindowID)
-			}
-		}
-		// 账号标识头（ChatGPT 系 auth 恒发；空 = 不发，向后兼容）。
-		applyAccountID(hdr, auth)
-		// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
-		applyHeaderOverrides(hdr, cfg.headers)
-		return hdr, nil
-	}
-
-	dialWS := func(ctx context.Context) (*coderws.Conn, *http.Response, error) {
-		hdr, err := buildHeaders(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		dopts := &coderws.DialOptions{HTTPHeader: hdr}
-		if cfg.transport != nil {
-			dopts.HTTPClient = &http.Client{Transport: cfg.transport}
-		}
-		if cfg.compression != CompressionDisabled {
-			dopts.CompressionMode = cfg.compression.coder()
-			dopts.CompressionThreshold = defaultCompressionThreshold
-		}
-		return coderws.Dial(ctx, wsURL, dopts)
-	}
-
-	conn, resp, err := dialWS(ctx)
+	cn, hs, err := dialConn(ctx, dialSpec{
+		auth:      auth,
+		opts:      cfg,
+		readLimit: cfg.readLimit,
+		mode:      modePull,
+		headers:   cfg.headers, // pull 面不剥离 turn-state（既有握手头行为）
+	})
 	if err != nil {
-		status := dialStatus(resp)
-		if status == http.StatusUnauthorized {
-			// WS 升级 401（无响应体不可判死）→ 可轮转：单飞 refresh → 自动重连一次。
-			rotated, rerr := rotateOn401(ctx, auth)
-			if rerr != nil {
-				return nil, rerr // refresh 失败（fatal / RefreshError）透传
-			}
-			if !rotated {
-				return nil, &DialError{StatusCode: status, Err: err, Body: dialErrBody(resp)} // PAT/oauthAuth：原样返回
-			}
-			conn, resp, err = dialWS(ctx)
-			if err != nil {
-				return nil, &DialError{StatusCode: dialStatus(resp), Err: err, Body: dialErrBody(resp), Refreshed: true}
-			}
-		} else {
-			return nil, &DialError{StatusCode: status, Err: err, Body: dialErrBody(resp)}
-		}
+		return nil, err
 	}
-	conn.SetReadLimit(cfg.readLimit)
-
-	cctx, cancel := context.WithCancel(context.Background())
-	c := &Client{
-		conn:            conn,
-		pingInterval:    cfg.pingInterval,
-		meta:            cfg.meta,
-		metaPassthrough: cfg.metaPassthrough,
-		session:         cfg.session,
-		trace:           cfg.trace,
-		traceAuto:       cfg.traceAuto,
-		turnAuto:        cfg.turnAuto,
-		turnProvider:    cfg.turnProvider,
-		ctx:             cctx,
-		cancel:          cancel,
-	}
+	c := &Client{cn: cn, codec: newFrameCodec(&cfg)}
 	// x-codex-turn-state 回传：上游在握手响应头签发 → SDK 缓存 →
 	// 后续 Send 帧 client_metadata 自动回传（跨轮不得回传，网关在轮结束时
 	// SetTurnState("") 清除）。
-	if resp != nil {
-		if v := resp.Header.Get(HeaderTurnState); v != "" {
-			c.setTurnState(v)
-		}
-	}
-	if cfg.pingInterval > 0 {
-		go c.heartbeat(cctx)
+	if hs.turnState != "" {
+		c.setTurnState(hs.turnState)
 	}
 	return c, nil
-}
-
-// dialStatus 提取升级失败响应状态码（coderws 非 101 时返回响应）。
-func dialStatus(resp *http.Response) int {
-	if resp != nil {
-		return resp.StatusCode
-	}
-	return 0
 }
 
 // Send 发送一帧字节（文本帧）。
@@ -454,77 +327,24 @@ func dialStatus(resp *http.Response) int {
 // （CodexMeta 静态值 / trace / turn_metadata；整体替换帧内 client_metadata——
 // 客户端自带的永不透传）。Write 同步消费——Send 返回前不得复用 frame。
 func (c *Client) Send(ctx context.Context, frame []byte) error {
-	frame, err := c.prepareFrame(frame)
+	wire, err := c.encodeFrame(frame)
 	if err != nil {
 		return err
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.conn.Write(ctx, coderws.MessageText, frame)
+	return c.cn.write(ctx, wire)
 }
 
-// prepareFrame 应用伪装层：WS 归一（无条件生效——FilterCodexWsPayload 顶层白名单
-// 过滤 + 强制 store:false）+ client_metadata 组装。优先级：CodexMeta 静态值 >
-// WithSession > turn-state 回传 > WithClientMetadata 透传 > 自动机制（turn_id /
-// trace）> turn_metadata 回调；注入**恒覆盖**帧内已有同 key——codex 面客户端自带
-// 的 client_metadata 永不透传。
-func (c *Client) prepareFrame(frame []byte) ([]byte, error) {
-	frame = RewriteEnvironmentContextTime(frame, time.Now())
-	frame, err := FilterCodexWsPayload(frame) // 始终过滤（不再有开关）
-	if err != nil {
-		return nil, err
+// encodeFrame 把原生帧编码成 wire 字节（请求级快照：turn-state + turn 计数）。
+func (c *Client) encodeFrame(frame []byte) ([]byte, error) {
+	turn := uint64(0)
+	if c.codec.turnProvider != nil {
+		turn = c.turn.Add(1)
 	}
-	frame = forceCodexStoreFalse(frame)
-	// 非法 JSON 放弃注入、帧原样返回（对齐 HTTP 面 injectResponsesClientMetadata
-	// 前置守卫——实测 sjson.SetRawBytes 对非法 JSON 静默产出损坏字节且 err=nil）。
-	if !gjson.ValidBytes(frame) {
-		return frame, nil
-	}
-	// 惰性组装 entries：先在栈上预留 8 项（典型身份键数），超出才转堆——
-	// shared helper 下须显式保留栈缓冲，否则返回切片的 helper 会使 entries
-	// 逃逸到堆、平白多一次分配（HTTP 面同理）。
-	var entryBuf [8]metadataEntry
-	entries := metaEntries(entryBuf[:0])
-	entries = entries.withCodexMetaIdentity(c.meta)
-	if m := c.meta; m != nil {
-		entries = entries.add(codexMetaTurnMetadataKey, m.TurnMetadata)
-		entries = entries.add(codexMetaTraceparentKey, m.Traceparent)
-		entries = entries.add(codexMetaTracestateKey, m.Tracestate)
-	}
-	entries = entries.withSessionIdentity(c.session)
-	// turn-state 回传（TurnState 非空时帧 metadata 恒带）：真实 codex WS
-	// 发送路径显式追加注入（client.rs:1626-1631，帧体携带 :1702-1711），与
-	// HTTP 头面（client.rs:1202）构成双面机制——此注入与真实逐点一致，勿删
-	// （完整实证见 doc.go"上游协议与参考"）。
-	if ts := c.TurnState(); ts != "" {
-		entries = entries.add(codexMetaTurnStateKey, ts)
-	}
-	// 调用方透传键（WithClientMetadata）：只透传不解析，恒覆盖帧内已有同 key
-	//（网关值为准——注入顺序在自动机制之前，同 key 由网关决定）。
-	for _, e := range c.metaPassthrough {
-		entries = entries.add(e.key, e.value)
-	}
-	// turn_id 恒带且覆盖：帧内已有 client_metadata.turn_id 不参与透传——
-	// 无静态值时每帧自动生成 UUIDv7（CodexMeta.TurnID 静态值优先），网关值恒为准。
-	if c.turnAuto && (c.meta == nil || c.meta.TurnID == "") {
-		entries = entries.add(codexMetaTurnKey, NewUUIDv7())
-	}
-	// 每帧 trace：外部 WithTraceContext 静态值优先，否则每帧自动生成
-	// （真实客户端每请求新 span，同轮多请求 traceparent 不同；帧内已有
-	// traceparent 不参与透传，网关值恒为准）。
-	if c.trace != nil {
-		entries = entries.add(codexMetaTraceparentKey, c.trace.Traceparent)
-		entries = entries.add(codexMetaTracestateKey, c.trace.Tracestate)
-	} else if c.traceAuto {
-		tc := NewTraceContext()
-		entries = entries.add(codexMetaTraceparentKey, tc.Traceparent)
-		entries = entries.add(codexMetaTracestateKey, tc.Tracestate)
-	}
-	if c.turnProvider != nil {
-		turn := c.turn.Add(1)
-		entries = entries.add(codexMetaTurnMetadataKey, c.turnProvider(turn))
-	}
-	return injectClientMetadataKeys(frame, entries), nil
+	return c.codec.encode(frame, encodeNativeWS, frameInput{
+		TurnState: c.TurnState(),
+		Turn:      turn,
+		Now:       time.Now(),
+	})
 }
 
 // SetTurnState 设置 x-codex-turn-state 回传值（服务端签发 → 后续 Send 帧
@@ -543,66 +363,37 @@ func (c *Client) TurnState() string {
 
 // Recv 读取下一帧字节（文本/二进制帧原样透传，不区分帧类型不做解析）。
 //
-// data 为 coder/websocket 每次 Read 独立分配的缓冲，跨次调用有效。
-// 对端关闭/网络断开/超 ReadLimit 时返回错误（如 coder/websocket.CloseError、
-// ErrMessageTooBig，网关自行分类处置）。
+// 直读 socket（pull 模式无 pump、无队列）。data 为 coder/websocket 每次 Read
+// 独立分配的缓冲，跨次调用有效。对端关闭/网络断开/超 ReadLimit 时返回错误
+// （如 coder/websocket.CloseError、ErrMessageTooBig，网关自行分类处置）。
+//
+// 注意：ctx 取消按 coder 语义**关闭连接**并返回 ctx 错误——它不是"只影响本次
+// 取帧"的开关。
 func (c *Client) Recv(ctx context.Context) ([]byte, error) {
-	_, data, err := c.conn.Read(ctx)
-	return data, err
+	return c.cn.readFrame(ctx)
 }
 
 // Ping 发送 WS 层 ping 并等待 pong（对端库自动回 pong；ctx 控制等待上限）。
 // 注意：pong 由常驻 Recv 循环处理——Ping 必须在调用方同时执行 Recv 时使用。
+// ctx 完全沿用调用方（不加内部封顶）。
 func (c *Client) Ping(ctx context.Context) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.conn.Ping(ctx)
+	return c.cn.probe(ctx)
 }
 
 // Close 发起关闭握手（关闭码透传，如 StatusNormalClosure；reason ≤125 字节）。
 // 注意：关闭握手可能阻塞最多 ~10s（coder 写关闭帧 5s + 等对端关闭帧 5s），
-// 等不起时用 CloseNow。停用心跳。重复调用返回首次结果（幂等；
+// 等不起时用 CloseNow。停用心跳。重复/并发调用返回首次结果（幂等；
 // 对端已断开时返回 nil）。
 func (c *Client) Close(status StatusCode, reason string) error {
-	c.closeOnce.Do(func() {
-		c.closed.Store(true)
-		c.cancel()
-		c.closeErr = c.conn.Close(status, reason)
-	})
-	return c.closeErr
+	c.closed.Store(true)
+	return c.cn.closeGracefully(status, reason)
 }
 
 // CloseNow 立即断开连接（跳过关闭握手，不等待对端），用于等不起 Close 阻塞的
 // 场景——如网关快速 failover、心跳死亡兜底。幂等；与 Close 互斥，先调用者生效。
+// 之后 Close 返回既有结果（通常 nil，与今天一致）。
 func (c *Client) CloseNow() error {
-	c.closeOnce.Do(func() {
-		c.closed.Store(true)
-		c.cancel()
-		c.closeErr = c.conn.CloseNow()
-	})
-	return c.closeErr
-}
-
-// heartbeat 周期性发送 WS 层 ping。Ping 失败（对端无 pong/连接已死）时
-// CloseNow 解除阻塞中的 Recv 并退出。
-func (c *Client) heartbeat(ctx context.Context) {
-	t := time.NewTicker(c.pingInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			pingCtx, cancel := context.WithTimeout(ctx, defaultPingTimeout)
-			err := c.Ping(pingCtx)
-			cancel()
-			if err != nil {
-				if ctx.Err() != nil {
-					return // 本地关闭竞态：不再处理
-				}
-				_ = c.CloseNow()
-				return
-			}
-		}
-	}
+	c.closed.Store(true)
+	c.cn.terminate(errConnClosing)
+	return nil
 }
