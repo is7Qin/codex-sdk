@@ -160,8 +160,9 @@ func benchWSClient(b *testing.B, up *benchWSUpstream) *HTTPClient {
 // BenchmarkFrameCodecPrepare3KB：spec §7 P1 —— 帧构造 + 归一（3.7KB 体）。
 //
 // 测量体是生产发送的等价链：frameCodec.encode(encodeWSResponses) = HTTP→WS 协议
-// 形状（buildResponsesCreateFrame）+ 伪装层归一（白名单 / store 归零 /
-// client_metadata 组装）。codec 在循环外构造（无状态），循环内构造等于把配置
+// 形状（单遍快路径 encodeOnePass；非紧凑 / 转义键 / 重复键 / 白名单外键才回退
+// buildResponsesCreateFrame）+ 伪装层归一（白名单 / store 归零 / client_metadata
+// 组装）。codec 在循环外构造（无状态），循环内构造等于把配置
 // 成本摊进被测链。traceAuto/turnAuto 保持 true —— 每帧生成 traceparent 与
 // turn_id 是真实路径。
 func BenchmarkFrameCodecPrepare3KB(b *testing.B) {
@@ -195,7 +196,8 @@ func BenchmarkFrameCodecPrepare3KB(b *testing.B) {
 //
 // T3 的测量对象是**零拷贝分段视图**：一帧被切成 prefix / raw / suffix 三段后
 // 逐段读尽（帧体不进任何中间块）。名字、输入（wsBenchFrame 1KB）、每轮口径
-// （一帧 → 一次完整渲染 + 读尽）与 T0/T2 不变，故数字可直接纵向比。
+// （一帧 → 一次完整渲染 + 读尽）与 T0/T2 不变；但 T0 测的是"构建一块"，这里是
+// "三段渲染 + 读尽"，所以 **ns/op 不与 T0 纵向比**，P2 只判 `0 B/op, 0 allocs/op`。
 // 结果必须被 benchSink 消费：读出的字节数不落地的话，整条链会被优化掉。
 func BenchmarkSSEViewRender1KB(b *testing.B) {
 	if n := len(wsBenchFrame); n < 900 || n > 1100 {
@@ -207,13 +209,13 @@ func BenchmarkSSEViewRender1KB(b *testing.B) {
 	// 视图对象是**每请求一次**的东西（生产路径在 streamBodyWS 里 newSSEView 一次，
 	// 288B 计入每请求成本而不是每帧成本）。P2 的口径是「一帧 → 三段渲染 + 读尽」
 	// 这一步：循环内重置视图状态、不重新分配视图，否则测到的是对象创建本身。
-	view := newSSEView(ctx, st, wsResponsesReadLimit)
+	view := newSSEView(ctx, st, wsStreamReadLimit)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(wsBenchFrame)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		st.i = 0
-		*view = sseView{ctx: ctx, stream: st, limit: wsResponsesReadLimit, seg: sseSegCount}
+		*view = sseView{ctx: ctx, stream: st, limit: wsStreamReadLimit, seg: sseSegCount}
 		written := 0
 		for {
 			n, err := view.Read(buf)

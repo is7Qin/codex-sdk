@@ -116,6 +116,9 @@ func (v *sseView) Read(p []byte) (int, error) {
 		}
 		v.segs[v.seg] = seg[copied:] // 段内偏移：下次从断点接着吐
 	}
+	// 循环内刚置 done（终态帧吐尽 / load 失败）且本轮未产出字节 ⇒ 立刻交付终止
+	// 原因。入口的 `if v.done` 只覆盖"上次已结束"，这里覆盖"本轮才结束"；已产出
+	// 字节时错误留到下次调用（io.Reader 约定：先交付 n>0）。
 	if n == 0 && v.done {
 		return 0, v.err
 	}
@@ -203,6 +206,13 @@ func buildLongPrefix(typ []byte) []byte {
 // 的 "type" 路径语义一致：只看顶层键）。
 //
 // 非对象根、非法 JSON、缺失 type、type 非字符串 ⇒ nil。
+//
+// 与 gjson.GetBytes(raw, "type").String() 的两处**理论**差异（都不影响 SSE 形状：
+// 事件名只出现在 `event:` 行，下游按 `data:` 解析）：
+//   - type 非字符串：gjson 会序列化成 `123` / `true`，本函数返回 nil ⇒ 不出
+//     `event:` 行（空事件名比错事件名安全）。
+//   - type 值内含转义：本函数返回**原始字节**（不 unescape）⇒ 事件名保留 `\"` 之类
+//     的转义序列；真实上游的 type 恒为 `[a-z._]`，走不到这条。
 func frameEventType(raw []byte) []byte {
 	i := skipJSONSpace(raw, 0)
 	if i >= len(raw) || raw[i] != '{' {

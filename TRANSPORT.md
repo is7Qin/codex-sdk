@@ -28,7 +28,7 @@ func WithResponsesTransport(t Transport) Option
 | 队列 | `conn.go` | `frameInbox`：pumped 的有界入站队列（帧数 + 字节双闸） |
 | 拨号 | `dial.go` | `dialConn`：升级头组装 / 401 轮转 / 升级错误面 |
 | 请求 | `exchange.go` | `wsExchange`：一次请求 = 一条连接 + 一份 turn-state 快照 + `Next` 取帧 |
-| wire 编码 | `codec.go` | `frameCodec`：无可变状态，`encode` 出字节 |
+| wire 编码 | `codec.go` | `frameCodec`：无可变状态；`encode` = 单遍快路径（`encodeOnePass`）+ 回退链（非常规形态） |
 | SSE 表示 | `sse.go` | `sseView`：帧 → SSE 字节流（仅 `StreamBody`） |
 
 ### 两种连接模式（构造期固定、互斥）
@@ -50,7 +50,8 @@ func WithResponsesTransport(t Transport) Option
 `> queueBytes/2` 的巨帧在消费者暂停时会触发背压——这是已知取舍（W5b 固化）。
 
 内存上界（pumped）= `queueBytes` + 1 帧（空队列例外）+ pump 正在投递的 1 帧 +
-消费侧持有的 1 帧；`WithReadLimit(-1)` 时无总上界。
+消费侧持有的 1 帧；传输臂的读上限是常量（流式 64MiB / 聚合 16MiB），`WithReadLimit`
+不作用于它（只用于公开 `Dial`），所以这里**没有**“无限上界”形态。
 
 `pop` 的顺序是契约：① ctx 已结束 → 立即返回 ctx 错误（不 pop）；② 有帧 → 交付
 （不再查 ctx）；③ 已关闭且空 → 返回终止 cause；④ 等 `notify` / ctx。
@@ -70,10 +71,10 @@ func WithResponsesTransport(t Transport) Option
 | 面 | HTTP 臂 | WS 臂 |
 |---|---|---|
 | `StreamBody` | `*http.Response{200, 未读 SSE body, 上游头}` | `*http.Response{200, 帧渲染的 SSE body, Content-Type + x-codex-turn-state 合成头}` |
-| `Responses` | `Stream` → `responsesAggregator` → `HTTPResponse{200, Raw, TurnState}` | 同一个聚合器（喂 `StreamBody` 的 SSE 字节）→ 同形态、逐字段同构 |
+| `Responses` | `Stream` → `responsesAggregator` → `HTTPResponse{200, Raw, TurnState}` | `responsesStreamWS` **直接从 exchange 取帧**喂同一个聚合器（不经 `sseView`/`scanSSE` 的渲染-回扫回路）→ 同形态、逐字段同构 |
 | turn-state | 请求头 `x-codex-turn-state`（`WithHeader` 下发）+ 响应头捕获 | 帧 `client_metadata."x-codex-turn-state"`（同一份 `WithHeader` 值，或 SDK 缓存的最近签发值）；握手响应头的签发值回写 `TurnState()` 与合成响应头 |
-| 读上限 | 聚合器单行 16MiB；裸 body 由下游决定 | 聚合 16MiB（`WithReadLimit`）/ 流式 64MiB——按取数路径对齐 |
-| 请求体归一 | `FilterCodexHTTPPayload` + `store:false` + HTTP `client_metadata` | `frameCodec.encode(encodeWSResponses)` = `buildResponsesCreateFrame` → 归一（`FilterCodexWsPayload` + `store:false` + WS `client_metadata`） |
+| 读上限 | 聚合器单行 16MiB；裸 body 由下游决定 | 按取数路径固定：聚合 16MiB / 流式 64MiB（`WithReadLimit` 只作用于公开 `Dial`，传输臂不读它） |
+| 请求体归一 | `FilterCodexHTTPPayload` + `store:false` + HTTP `client_metadata` | `frameCodec.encode(encodeWSResponses)`：协议形状差（`type`/续接键/`stream`）+ 白名单 + `store:false` + WS `client_metadata` 由**单遍编码器**一次落地；非常规形态回退 `buildResponsesCreateFrame` → 归一链 |
 | 401 轮转 | 判死分类 + 单飞 refresh + 重试一次 | 同（`dialConn` 内，`OAuthWithRotation`） |
 
 帧渲染（`sseView`，一帧一块）：
@@ -93,9 +94,15 @@ data:<帧字节 verbatim>\n
   只有 `CloseStatus == -1`（对端没发 close frame：直接断 TCP / 连接重置 / 超
   ReadLimit）才是传输错误，且原样返回底层错误。
 
-帧构造规则（`buildResponsesCreateFrame`）：JSON 合法 + **对象根** → 覆写
-`type:"response.create"` → 删 `previous_response_id` / `generate` → 强制
-`stream:true` → 过 WS 19 键白名单（空帧报错）。**全部在拨号之前完成**。
+帧构造规则（五条，`encodeOnePass` 与回退链 `buildResponsesCreateFrame` 同义）：
+JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
+`previous_response_id` / `generate` → 强制 `stream:true` → 过 WS 19 键白名单
+（空帧报错）。**全部在拨号之前完成**。
+
+单遍只接**紧凑 / 无转义键 / 无重复键 / 顶层键全在白名单内**的对象（此时旧链只
+原位换值、键序不变，逐字节等价）；其余形态（空白、转义键、重复键、白名单外键）
+一律回退旧链——回退不是保守，是字节一致性的**唯一**保证方式（`codec.go` 的条件表
+与 `codec_internal_test.go` 的逐字节护栏钉住这条边界）。
 
 ## 终态提交
 
@@ -123,7 +130,7 @@ data:<帧字节 verbatim>\n
 | pull 模式 `Recv` 的 ctx 取消 | — | 按 coder 语义**关闭连接**并返回 ctx 错误（不是"只影响本次取帧"） |
 | 下游消费过慢（队列饱和） | 无此形态（背压直接传到 TCP） | `ErrWSBackpressure`（传输层错误，触发即终止连接，不得当 EOF） |
 | 心跳探测超预算 | 无 | `ErrKeepaliveTimeout`（可 `errors.Is`） |
-| `Responses` 读错 | `读取响应流失败: %w` | 同文案同错误链（同一个 `scanSSE`） |
+| `Responses` 读错 | `读取响应流失败: %w`（`scanSSE` 内包） | 同文案（`responsesStreamWS` 包 `exchange.Next` 的原始错误）；**错误链不同**：WS 臂不经过 scanner |
 | `response.failed` | `*HTTPError{500, Raw: 事件 error 原始 JSON（缺失则整个事件）}` | 逐字相同（同一个 `failedError`） |
 | `response.incomplete` / 无终态 | 普通错误（"事件流截断"） | 同文案（普通错误，不是 5xx 信封） |
 | 坏请求体（坏 JSON / 非对象根） | 原样发上游，由上游 400 兜底 | 本地错误 `errResponsesFrameInvalid`：**不拨号、不发帧** |
@@ -166,13 +173,43 @@ data:<帧字节 verbatim>\n
   面沿用既有契约：心跳依赖调用方的常驻 `Recv`。
 - **一次调用一条连接**：`StreamBody` 每次拨新连接，终态后由 `Body.Close()`
   强断（不做关闭握手）；没有连接复用 / 池化（复用属后续独立任务）。
+- **回退链的白名单扫描是两次**（`buildResponsesCreateFrame` 内一次 + `normalize`
+  再一次，与 T3 完全一致）：只有形态不在单遍覆盖内（非紧凑 / 转义键 / 重复键 /
+  白名单外键）才走到；真实 codex 帧恒走单遍，那是 1 次。
 - **转发到拨号的选项**：`WithTransport` / `WithSession` / `WithCodexMeta` /
   `WithHeader`（唯一例外：`x-codex-turn-state` 不进升级头，见上）/
   `WithClientMetadata` / trace / turn / compression / ping / beta。
   `WithTimeout` 现在**对 WS 臂生效**：`>0` 时设在 pumped 连接的 ctx 上（`=0` 时
-  就是调用方 ctx）。`WithMaxLineSize` 仍只作用于 HTTP SSE 行扫描。
+  就是调用方 ctx），覆盖“连接使用期”而**不含拨号/升级**——升级本身只由调用方 ctx
+  约束，故无 deadline 的调用方 + 卡住的升级不受 `WithTimeout` 限制。
+  `WithMaxLineSize` 仍只作用于 HTTP SSE 行扫描。
 - **单消费者**：`Client.Recv` 与 `wsExchange.Next` 都不支持并发调用（未定义）；
   写与 ping 由内核写闸串行化。
+
+## 性能预算
+
+三条 benchmark 是硬门槛（`bench_ws_test.go`，T0 基线固化在同一文件里；数字为
+AMD Ryzen 7 7840H 上 `-count=10` 的中位数，换机器只比"与基线的比值"，不比绝对值）：
+
+| 门槛 | benchmark | T0 基线 | 现值 | 判据 |
+|---|---|---|---|---|
+| P1 帧编码（3.7KB 体） | `BenchmarkFrameCodecPrepare3KB` | 34,930 ns / 21,992 B / 26 allocs | **6,782 ns / 5,040 B / 5 allocs** | ≤20µs / ≤12KB / ≤12 allocs |
+| P2 帧→SSE 渲染（1KB 帧） | `BenchmarkSSEViewRender1KB` | 2,312 ns / 2,720 B / 3 allocs | **72 ns / 0 B / 0 allocs** | 只判 `0 B / 0 allocs`（口径从"构建一块"变成"三段渲染 + 读尽"，ns/op 不与 T0 纵向比） |
+| P3 WS 每请求（整链路含握手） | `BenchmarkWSStreamBodyPerRequest` | 468 allocs | **456–459 allocs** | 不得劣化：≤ T0 × 1.05 |
+
+P3 的绝对值里 ~35% 是假上游（`httptest` 侧）、~22% 是握手，SDK 可控面只有 ~31
+allocs——所以 P3 只保证**不劣化**，真正的分配改善在 P1/P2。
+
+```bash
+go test -run '^$' -bench '^BenchmarkFrameCodecPrepare3KB$'  -benchmem -count=10 .
+go test -run '^$' -bench '^BenchmarkSSEViewRender1KB$'       -benchmem -count=10 .
+go test -run '^$' -bench '^BenchmarkWSStreamBodyPerRequest$' -benchmem -benchtime=20x -count=3 .
+```
+
+单遍编码器的字节等价不靠"读代码相信"，靠 `codec_internal_test.go`：把回退链当
+参考实现，对同一批输入（52 条语料 + 2,000 帧固定种子随机帧 × 2 模式 × 3 种
+metadata 组合）逐字节比对，另有两例分别钉住"运行期 3.7KB 形状必须走单遍"与
+"该回退的形态确实回退"——防止护栏退化成"回退链 vs 回退链"的空转。
 
 ## 测试
 

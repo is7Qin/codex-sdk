@@ -55,9 +55,9 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 	}
 	agg := &responsesAggregator{}
 	if c.opts.responsesTransport == TransportWS {
-		// ws 臂：StreamBody（ws）的 SSE 字节 → 同一个响应聚合器。终态帧喂进
-		// 聚合器后不再取帧（SSE 视图在终态处收尾），所以只有"终态之后才到"
-		// 的取消/超时可以豁免，其余错误原样透传。
+		// ws 臂：responsesStreamWS 直接从 exchange 取帧喂聚合器（不经 sseView
+		// 渲染 + scanSSE 回扫）。终态帧喂进聚合器后不再取帧，所以只有"终态之后
+		// 才到"的取消/超时可以豁免，其余错误原样透传。
 		if err := c.responsesStreamWS(ctx, wire, agg.feed); err != nil {
 			if !agg.completed || !isContextError(err) {
 				return nil, err // 上游/传输错误透传（response.failed 事件级 HTTPError 同样原样）

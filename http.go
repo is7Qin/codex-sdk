@@ -24,8 +24,8 @@ const DefaultResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 // DefaultResponsesWSURL 是内置官方上游 responses WebSocket 完整端点（固定）。
 const DefaultResponsesWSURL = "wss://chatgpt.com/backend-api/codex/responses"
 
-// HTTPClient 是统一端点方法 HTTP 客户端（懒构建：NewHTTPClient 零开销，
-// 首次 Do/Stream 才创建 http.Client，连接池复用）。端点方法族：
+// HTTPClient 是统一端点方法 HTTP 客户端（懒构建：NewHTTPClient 不创建
+// http.Client——只做选项快照与升级头派生——首次 Do/Stream 才创建，连接池复用）。端点方法族：
 // Do/Stream（responses 固定端点）、GenerateImage / Search / GetUsage（各自固定官方端点）、Responses（合成非流式）。
 //
 // x-codex-turn-state 仅响应侧（真实 codex 客户端行为）：响应头/SSE 中的
@@ -179,17 +179,19 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 	return nil // EOF 结束（是否截断由网关按终态事件判定）
 }
 
-// scanSSE 逐 `data:` 行扫描 SSE 字节流并交付事件帧（原 Stream 内联循环的抽出，
-// HTTP 与 WS 两条路径共用同一份 framing 语义）。
+// scanSSE 逐 `data:` 行扫描 SSE 字节流并交付事件帧（原 Stream 内联循环的抽出）。
+//
+// 只有 HTTP 臂用它：WS 臂的 `Responses` 直接取帧喂聚合器（`responsesStreamWS`），
+// 不再把帧渲染成 SSE 字节再扫回来；WS 臂 `StreamBody` 产出的 SSE 字节是给调用方
+// 的，SDK 内部不扫描。
 //
 // 返回 done=true 表示遇到 [DONE] 终止标记（[DONE] 不进 feed）；done=false 且
 // err=nil 表示读到 EOF——是否截断由调用方按终态事件判定（本函数不解释事件）。
 // feed 返回错误立即终止扫描并原样透传。
 //
-// ctx 不入本函数：取消语义由 body 承担——HTTP body 绑定请求 ctx，WS 侧 body
-// （sseView）每次取帧用 exchange 的 ctx。此处再插一个取消检查点会改变 HTTP 臂
-// "ctx 已取消但 body 仍有缓冲数据"时的错误链与文案（现状是 scanner 读到传输层
-// 错误、包成"读取响应流失败"），违反"HTTP 路径零变化"。
+// ctx 不入本函数：取消语义由 body 承担——HTTP body 绑定请求 ctx。此处再插一个
+// 取消检查点会改变"ctx 已取消但 body 仍有缓冲数据"时的错误链与文案（现状是
+// scanner 读到传输层错误、包成"读取响应流失败"），违反"HTTP 路径零变化"。
 func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, error) {
 	if maxLine <= 0 {
 		maxLine = defaultMaxLineSize

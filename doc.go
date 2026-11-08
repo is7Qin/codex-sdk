@@ -47,13 +47,17 @@
 //     https://auth.openai.com/api/accounts，env CODEX_AUTHAPI_BASE_URL 覆盖，
 //     默认 10s 超时）；SDK 零隐式派生 + 构造零网络（落库点显式注入，拨号侧不派生）
 //
-// SDK 零协议解析：type / usage / 事件构造与业务语义（计费、透传编排、failover、
+// SDK 不做业务层协议处理：usage / 事件构造与业务语义（计费、透传编排、failover、
 // 会话粘性、内容审核）全部在网关侧（go-proxy-mini）——网关在 SDK 交付的完整
-// 字节上自行解析。不做事件层、不做模式枚举、不做任何业务钩子。
+// 字节上自行解析。不做业务钩子、不做模式枚举。
+//
+// 但**实现必须读顶层 `type`**：SSE 表示要为每帧写 `event:` 行，传输臂要判断终态
+// （completed / failed / incomplete）才能提交并收尾。这层解析限于"顶层 type 字符串"
+// （零分配扫描，见 frameEventType），不展开 usage、不解释事件负载。
 //
 // OAuthWithRotation 边界：refresh 轮转协议 / 响应解析 / 判死分类 / 退避重试
-// 属鉴权面，SDK 自包含（"零协议解析"纪律指 responses 业务协议——type/usage/
-// 事件构造/计费语义不解析，鉴权错误分类不在此列）。RefreshResponse 仅非空覆盖
+// 属鉴权面，SDK 自包含（"不解析业务协议"的纪律指 responses 的业务
+// 语义——usage / 事件构造 / 计费不解析，鉴权错误分类不在此列）。RefreshResponse 仅非空覆盖
 // （缺 refresh_token 保留旧 rt，回调与后续 refresh 均用保留值）；refresh 退避
 // SDK 自有默认（base 200ms / cap 30s / 上限 3 次，WithBackoff 可调）；token
 // 端点 401 无条件判死、RT 判死码 10 个（大小写不敏感）、账号禁用类（400 org
@@ -78,18 +82,17 @@
 // # 性能语义（性能优先：懒构建 + 热路径低分配）
 //
 //   - 无全局可变状态：连接/客户端均按需构建，心跳 goroutine 仅连接存活期间存在
-//   - WS 帧收发零额外分配：Send 直传帧字节（帧未被归一改写时零拷贝）；Recv 返回
-//     coder/websocket 每次 Read 独立分配的读缓冲（跨次调用有效，无需拷贝即可保留）
-//   - 伪装层恒开（WS/HTTP 各自顶层白名单过滤 + 强制 store:false + client_metadata
-//     注入 + 每帧 trace/turn_id；归一不可关）；WithTraceAuto(false) /
-//     WithTurnAuto(false) 且无任何注入时，帧已含 store:false 且无白名单外顶层键
-//     则归一不重写、Send 零拷贝返回原字节；顶层键扫描零拷贝零分配（仅
-//     forceCodexStoreFalse 的 store 探测有常量级小分配）。含
-//     <environment_context> 的帧另经 RewriteEnvironmentContextTime 重写
-//     （该步有 payload 级分配，非本路径。forceCodexStoreFalse 对已 false 的
-//     store 短路——真 codex 帧恒带 store:false）
-//   - 连接读模型分两种模式（构造期固定、互斥；同一条连接只有一个 socket 读点
-//   - 一个写闸 + 一个终止入口）。公开 Dial → Client 是**纯拉**：Recv 直读、
+//   - WS 帧编码是**单遍**：一次顶层扫描、一份输出缓冲，把协议形状差（type/续接键/
+//     stream）、白名单过滤、store:false 与 client_metadata 注入合并落地；只在
+//     "紧凑 / 无转义键 / 无重复键 / 顶层键全在白名单内"时走快路径，其余形态回退旧链
+//     （每步整帧重写）以保证字节一致（3.7KB 体实测 6.2µs / 5 allocs；旧链 34.9µs / 26）
+//   - 帧未被改写时零拷贝：快路径判定"一个字节都不用改"时返回原切片；含
+//     <environment_context> 的帧先经 RewriteEnvironmentContextTime 改写值内文本
+//     （该步有 payload 级分配，非本路径）
+//   - WS 帧收发零额外分配：Send 直传帧字节；Recv 返回 coder/websocket 每次 Read
+//     独立分配的读缓冲（跨次调用有效，无需拷贝即可保留）
+//   - 连接读模型分两种模式（构造期固定、互斥；同一条连接只有一个 socket 读点、
+//     一个写闸、一个终止入口）。公开 Dial → Client 是**纯拉**：Recv 直读、
 //     无常驻读者、无队列，因此 pong 由调用方的常驻 Recv 循环服务
 //     （coder/websocket：Ping 必须与 Reader 并发，否则等不到 pong）——网关透传
 //     编排天然满足该前提，这是既有契约；Close 走 coder 关闭握手。传输臂
@@ -102,7 +105,8 @@
 //     探测"对端是否还活着"（半开连接只能靠读写错误或调用方 ctx 兜底）。
 //   - HTTP 流式解析零拷贝：bufio.Scanner 复用缓冲 + 行切片提取 data: 帧内容，
 //     回调内的原始字节引用 scanner 缓冲（仅在回调执行期间有效）
-//   - HTTP 客户端懒构建：NewHTTPClient 零开销，首次 Do/Stream 才创建 http.Client
+//   - HTTP 客户端懒构建：NewHTTPClient 不创建 http.Client（只做选项快照与升级头
+//     派生），首次 Do/Stream 才创建 http.Client
 //     （连接池复用；WithTransport 可注入自定义 RoundTripper）
 //
 // # 上游协议与参考
@@ -122,7 +126,8 @@
 //     （:779-792，辅助函数本身无 turn-state）之后显式追加
 //     client_metadata.insert(X_CODEX_TURN_STATE_HEADER, ...)，流入
 //     ResponseCreateWsRequest.client_metadata（:1702-1711 帧体携带）；SDK 帧注入
-//     （frameCodec.normalize）逐点一致：升级响应头签发 → 帧内回传
+//     （frameCodec.encode 的 client_metadata 落地：单遍快路径直接写入，回退链经
+//     normalize → injectClientMetadataObject）逐点一致：升级响应头签发 → 帧内回传
 //     （Client.TurnState 缓存 + 网关 SetTurnState("") 清除，跨轮不得回传）。
 //
 // responses-lite 非独立端点：与 /responses 同端点同事件集，

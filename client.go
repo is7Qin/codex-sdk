@@ -389,8 +389,10 @@ func (c *Client) Close(status StatusCode, reason string) error {
 	return c.cn.closeGracefully(status, reason)
 }
 
-// CloseNow 立即断开连接（跳过关闭握手，不等待对端），用于等不起 Close 阻塞的
+// CloseNow 立即终止连接（跳过关闭握手，不等待对端），用于等不起 Close 阻塞的
 // 场景——如网关快速 failover、心跳死亡兜底。幂等；与 Close 互斥，先调用者生效。
+// 若 Close 的关闭握手已在飞，本调用只登记首因并立即返回，socket 由握手收尾
+// （时延上界同 Close，~10s；与基线行为等价）。
 // 之后 Close 返回既有结果（通常 nil，与今天一致）。
 func (c *Client) CloseNow() error {
 	c.closed.Store(true)
