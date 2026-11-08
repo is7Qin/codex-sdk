@@ -89,7 +89,7 @@ var codecDiffCorpus = []string{
 	`{"a":}`,
 	`{"a":1,}`,
 	`not json`,
-	// 位图上界：19 键全带（idx=18 是位图最高位；白名单扩容时这条先红）
+	// 位图上界：19 键全带（触达位图最高位 idx=18，并验证全键集合不误判重复）
 	`{"type":"response.create","model":"m","instructions":"i","previous_response_id":"p","input":[],"tools":[],"tool_choice":"auto","parallel_tool_calls":true,"reasoning":{},"store":false,"stream":true,"stream_options":{},"include":[],"service_tier":"default","prompt_cache_key":"k","text":{},"generate":false,"client_metadata":{},"access_programs":[]}`,
 	// 值里出现顶层键的名字面串：不得被当成顶层键
 	`{"model":"m","instructions":"{\"type\":\"response.create\"}","input":"{\"store\":true}"}`,

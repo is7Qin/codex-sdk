@@ -175,7 +175,9 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
   强断（不做关闭握手）；没有连接复用 / 池化（复用属后续独立任务）。
 - **回退链的白名单扫描是两次**（`buildResponsesCreateFrame` 内一次 + `normalize`
   再一次，与 T3 完全一致）：只有形态不在单遍覆盖内（非紧凑 / 转义键 / 重复键 /
-  白名单外键）才走到；真实 codex 帧恒走单遍，那是 1 次。
+  白名单外键）才走到；真实 codex 帧恒走单遍，那是 1 次。代价是这类形态比 T3 多付
+  一次 `gjson.ValidBytes`（单遍的前置校验），3.7KB 体上约 +2µs——"不劣化"只对
+  主路径成立（P1 测的正是主路径）。
 - **转发到拨号的选项**：`WithTransport` / `WithSession` / `WithCodexMeta` /
   `WithHeader`（唯一例外：`x-codex-turn-state` 不进升级头，见上）/
   `WithClientMetadata` / trace / turn / compression / ping / beta。

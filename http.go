@@ -281,7 +281,7 @@ func normalizeCodexHTTPPayload(raw []byte) ([]byte, error) {
 // turn_id 恒带）：
 //   - 恒 4 key：x-codex-installation-id / session_id / thread_id /
 //     x-codex-window-id（CodexMeta 与 WithSession 同 key 时 CodexMeta 优先
-//     ——对齐 WS 组装优先级（frameCodec.normalize；空值跳过）；
+//     ——对齐 WS 组装优先级（frameCodec.metaEntries；空值跳过）；
 //   - 恒带 turn_id：CodexMeta.TurnID 静态值优先；否则每请求自动 UUIDv7
 //     （网关每请求即一轮，对齐真实"每轮新 sub_id"语义）；客户端自带 turn_id
 //     不参与透传；
