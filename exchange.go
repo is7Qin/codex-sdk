@@ -72,6 +72,9 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, readLimit 
 //
 //   - 入口 ctx 已结束：先尝试交付**已入队**的帧（上游已完成的结果不能被消费侧
 //     超时改写），队列空才把取消当作本次请求的放弃；
+//   - 阻塞等待期间被取消：同样先 `tryPop` 一次再认输——否则"帧已在队、随后
+//     deadline 到点"这个次序（消费者已卡在 pop 里）会把已完成的终态帧丢掉，
+//     把上游成功的请求报成 DeadlineExceeded；
 //   - 有帧立即返回（取帧即提交：已取出的帧不再受 ctx 影响）；
 //   - 流结束：close frame 归一为 io.EOF，其它终止原因原样返回。
 func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
@@ -87,7 +90,10 @@ func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
 		return data, nil
 	}
 	if cerr := ctx.Err(); cerr != nil {
-		e.cn.terminate(cerr) // 阻塞等待期间被取消：请求已放弃
+		if data, ok := e.cn.inbox.tryPop(); ok { // 取消与入队并发：已入队的帧优先
+			return data, nil
+		}
+		e.cn.terminate(cerr) // 队列确实空：请求已放弃
 		return nil, cerr
 	}
 	if coderws.CloseStatus(err) >= 0 {

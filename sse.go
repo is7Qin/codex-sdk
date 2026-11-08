@@ -1,8 +1,11 @@
 package codexsdk
 
 import (
+	"bytes"
 	"context"
 	"io"
+
+	"github.com/tidwall/gjson"
 )
 
 // SSE 块的三段式落地。一帧渲染成 **三段**，按序吐出：
@@ -100,6 +103,12 @@ func (v *sseView) Read(p []byte) (int, error) {
 		if v.seg == sseSegCount { // 当前帧三段吐完：取下一帧
 			if v.terminal { // 终态帧已交付完 ⇒ 流结束（[DONE] 已随 suffix 出去）
 				v.done, v.err = true, io.EOF
+				break
+			}
+			if n > 0 {
+				// 已经产出字节：先交付，不要为了填满 p 而阻塞等下一帧。SSE 的
+				// 逐事件时延靠这条——否则上一帧会卡到下一条帧到达才被看到
+				// （模型思考期间就是秒级空白）。
 				break
 			}
 			if err := v.load(); err != nil {
@@ -240,7 +249,13 @@ func frameEventType(raw []byte) []byte {
 			j = skipJSONSpace(raw, j+1)
 			if j < len(raw) && raw[j] == '"' {
 				if val, _, vok := scanJSONStringAt(raw, j); vok {
-					return val
+					if bytes.IndexByte(val, '\\') < 0 {
+						return val // 快路径：真实上游的事件名恒无转义（零分配）
+					}
+					// 冷路径：事件名含转义（合法 JSON，例如 "response\\u002ecompleted"）。
+					// 交给 gjson 展开——"合法的 completed 必须被识别为终态"不能因为一个
+					// `\uXXXX` 就变成"事件流截断"。只在这条路径分配。
+					return []byte(gjson.GetBytes(raw, "type").String())
 				}
 			}
 			return nil // type 不是字符串 ⇒ 不出 event 行

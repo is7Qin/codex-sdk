@@ -653,6 +653,50 @@ func TestWSQueuedTerminalBeatsDeadline(t *testing.T) {
 	}
 }
 
+// ---- W12c ----
+
+// TestWSNextDeliversQueuedFrameOnCancelRace：消费者**已阻塞在 `pop` 里**、帧随后
+// 入队、取消随即到点——已入队的帧仍须交付（不变式不能只在 `Next` 入口成立）。
+//
+// 构造上保证"帧先于 deadline 入队"：`push` 返回后才 `cancel`。此时 `pop` 的
+// `select` 会同时看到 `notify` 与 `ctx.Done()`，走哪支是随机的——旧实现只要选中
+// ctx 分支就把帧丢掉（`Next` 直接 `terminate` 返回 ctx 错误），50 轮必然复现。
+func TestWSNextDeliversQueuedFrameOnCancelRace(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		cn := newTestConn(t, connConfig{readLimit: defaultReadLimit})
+		ex := &wsExchange{cn: cn}
+		ctx, cancel := context.WithCancel(context.Background())
+		type result struct {
+			data []byte
+			err  error
+		}
+		done := make(chan result, 1)
+		go func() {
+			data, err := ex.Next(ctx)
+			done <- result{data, err}
+		}()
+		time.Sleep(200 * time.Microsecond) // 让 Next 先卡在 pop 的 select 上
+		want := deltaFrame(i)
+		if err := cn.inbox.push([]byte(want)); err != nil {
+			t.Fatalf("第 %d 轮 push: %v", i, err)
+		}
+		cancel() // 帧已在队，取消到点
+		select {
+		case r := <-done:
+			if r.err != nil {
+				t.Fatalf("第 %d 轮：已入队的帧被取消吞掉: %v", i, r.err)
+			}
+			if string(r.data) != want {
+				t.Fatalf("第 %d 轮：帧内容不符: %q", i, r.data)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("第 %d 轮：Next 未返回", i)
+		}
+		cancel()
+		cn.terminate(io.EOF) // 收尾，避免 50 条连接堆积
+	}
+}
+
 // ---- W13 ----
 
 // TestWSKeepaliveDetectsHalfOpen：假上游停读（不回 pong）→ ≤ ping+pong 内

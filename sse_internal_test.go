@@ -3,7 +3,9 @@ package codexsdk
 import (
 	"bytes"
 	"context"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/tidwall/gjson"
 )
@@ -91,6 +93,8 @@ func TestFrameEventTypeTopLevel(t *testing.T) {
 		{name: "未闭合引号", raw: `{"type":"x}`, want: "", malformed: true},
 		{name: "只有键没有值", raw: `{"type":`, want: "", malformed: true},
 		{name: "截断的嵌套对象", raw: `{"a":{"b":1}`, want: "", malformed: true},
+		{name: "转义事件名（\u002e）", raw: `{"type":"response\u002ecompleted"}`, want: "response.completed"},
+		{name: "转义事件名（\u005f）", raw: `{"type":"response.incomplete"}`, want: "response.incomplete"},
 		{name: "空帧", raw: "", want: "", malformed: true},
 		{name: "非 JSON", raw: `not json`, want: "", malformed: true},
 	}
@@ -107,5 +111,61 @@ func TestFrameEventTypeTopLevel(t *testing.T) {
 				t.Fatalf("与 gjson 不一致：frameEventType(%q) = %q，gjson = %q", tc.raw, got, want)
 			}
 		})
+	}
+}
+
+// blockingStream 是 frameStream 桩：吐完 frames 后**阻塞**在 block 上（不会 io.EOF），
+// 用来证明"已经产出了字节的 Read 不会为了填满 p 而阻塞等下一帧"。
+type blockingStream struct {
+	frames [][]byte
+	i      int
+	block  chan struct{}
+}
+
+func (s *blockingStream) Next(ctx context.Context) ([]byte, error) {
+	if s.i < len(s.frames) {
+		f := s.frames[s.i]
+		s.i++
+		return f, nil
+	}
+	select {
+	case <-s.block:
+		return nil, io.EOF
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *blockingStream) Close() error { return nil }
+
+// TestSSEViewReadDoesNotBlockForNextFrame：一帧的三段吐完且 p 仍有余量时，Read
+// 必须立刻返回已产出的字节，而不是转去 load() 等下一帧——否则 SSE 的逐事件时延
+// 会变成"等下一帧到达"（模型思考期间就是秒级空白）。
+func TestSSEViewReadDoesNotBlockForNextFrame(t *testing.T) {
+	first := []byte(wsCreatedEv)
+	stream := &blockingStream{frames: [][]byte{first}, block: make(chan struct{})}
+	defer close(stream.block)
+	view := newSSEView(context.Background(), stream, wsStreamReadLimit)
+	want := prefixNeed(frameEventType(first)) + len(first) + len(sseSuffixFrame)
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := view.Read(make([]byte, 4096))
+		done <- result{n, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("读第一帧出错: %v", r.err)
+		}
+		if r.n != want {
+			t.Fatalf("首帧渲染长度 = %d，想要 %d", r.n, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read 阻塞在下一帧上（应先交付已产出的字节）")
 	}
 }
