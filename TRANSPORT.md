@@ -27,7 +27,7 @@ func WithResponsesTransport(t Transport) Option
 | socket | `conn.go` | `conn`：唯一 `ws.Read` 调用点（`readFrame`）、写/探测闸 `gate`、唯一心跳 `keepalive`、唯一终止入口 `terminate`（经 `finish` 发布） |
 | 队列 | `conn.go` | `frameInbox`：pumped 的有界入站队列（帧数 + 字节双闸） |
 | 拨号 | `dial.go` | `dialConn`：升级头组装 / 401 轮转 / 升级错误面 |
-| 请求 | `exchange.go` | `wsExchange`：一次请求 = 一次 exchange；连接可跨请求（含跨轮）复用（默认关），保留本次请求的 turn-state 快照与 `Next` 取帧 |
+| 请求 | `exchange.go` | `wsExchange`：一次请求 = 一次 exchange；连接可跨请求（含跨轮）复用（默认关）；**不驻留 turn-state**（ts 每请求随 `Identity` 进帧，签发值只经 `Identity.Sink` 出去）；`Next` 取帧 / `Release` 归还 |
 | wire 编码 | `codec.go` | `frameCodec`：无可变状态；`encode` = 单遍快路径（`encodeOnePass`）+ 回退链（非常规形态） |
 | SSE 表示 | `sse.go` | `sseView`：帧 → SSE 字节流（仅 `StreamBody`） |
 
@@ -70,7 +70,7 @@ func WithResponsesTransport(t Transport) Option
 
 | 面 | HTTP 臂 | WS 臂 |
 |---|---|---|
-| `StreamBody` | `*http.Response{200, 未读 SSE body, 上游头}` | `*http.Response{200, 帧渲染的 SSE body, Content-Type + x-codex-turn-state 合成头}` |
+| `StreamBody` | `*http.Response{200, 未读 SSE body, 上游头}` | `*http.Response{200 OK, 帧渲染的 SSE body, 合成头只有 Content-Type: text/event-stream}`（不带 ts） |
 | `Responses` | `Stream` → `responsesAggregator` → `HTTPResponse{200, Raw}`（**无 ts 字段**：签发值只走 `Identity.Sink`） | `responsesStreamWS` **直接从 exchange 取帧**喂同一个聚合器（不经 `sseView`/`scanSSE` 的渲染-回扫回路）→ 同形态、逐字段同构 |
 | turn-state | 请求头 `x-codex-turn-state`（值来自 `Identity.TurnState`，逐请求传入） | 帧 `client_metadata."x-codex-turn-state"`（同一来源）；捕获点三处（HTTP 响应头 / WS 握手头 / `response.metadata` 事件）统一回调 `Identity.Sink`；**合成响应头不带 ts**，SDK 不保留任何 ts 状态 |
 | 读上限 | 聚合器单行 16MiB；裸 body 由下游决定 | 按取数路径固定：聚合 16MiB / 流式 64MiB（`WithReadLimit` 只作用于公开 `Dial`，传输臂的上限由取数路径决定）；两条取数路径不共享连接（16MiB / 64MiB） |
@@ -156,10 +156,11 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 ## 连接复用
 
 默认关闭，`WithWSConnCache(n)`（n > 0，建议 2）开启每个 `HTTPClient` 的空闲连接缓存。
-连接身份是 `(threadKey, readLimit)`，`threadKey = installation|session|thread`：同一 thread、同取数路径
-才复用；流式 64MiB 与聚合 16MiB 不共享连接；**window 变化不换连接**（与真实 codex 一致——换连接条件里
-没有 window），ts 每请求下发、不进连接身份。**匿名（`Identity{}`）不复用**：不取缓存、读完即终止，
-因为匿名没有会话语义，共享连接等于让无关请求互相污染路由状态。
+连接身份是 `(threadKey, readLimit)`，`threadKey = installation|session|thread`（`Meta` 优先、空项由
+`Session` 补；三者全空 = 匿名）：同一 thread、同取数路径才复用；流式 64MiB 与聚合 16MiB 不共享连接；
+**window 变化不换连接**（与真实 codex 一致——换连接条件里没有 window），ts 每请求下发、不进连接身份。
+**匿名（`Identity{}`）不复用**：不取缓存、读完即终止，因为匿名没有会话语义，共享连接等于让无关请求
+互相污染路由状态。
 Authorization token 必须仍一致，取出即独占，不做请求多路复用。
 
 归还资格是读到终态、队列空且连接可用；取消、读写错误、提前关闭均终止连接。
@@ -171,17 +172,19 @@ Authorization token 必须仍一致，取出即独占，不做请求多路复用
 关掉心跳后**只剩取还时清扫**——被丢弃的 `HTTPClient`（网关每轮重建）若此后不再有
 请求，其空闲连接只能等对端断开（服务端 60min 上限）；默认 30s 心跳下最迟
 5min 加一个 tick。
-`CloseIdleConnections()` 只清空 WS 缓存里的空闲连接（缓存本身仍可用，之后新建的连接照常复用），
-并且不碰底层 `*http.Transport`；`CloseWSIdleConnections()` 是**关闭** WS 缓存：清空现有 idle，
-此后归还一律拒收（由 `Release` 终止）——用于"这个 client 要被丢弃了"的场景，**不可逆**。
+`CloseIdleConnections()` 清空 WS 缓存里的空闲连接（缓存本身仍可用，之后新建的连接照常复用），
+**并**对底层 `*http.Transport` 断言后清空其空闲池（包装型 transport 断言失败即静默 no-op）；
+`CloseWSIdleConnections()` 只**关闭** WS 缓存、不碰 `*http.Transport`：清空现有 idle，此后取用也
+直接未命中、归还一律拒收（由 `Release` 终止）——用于"这个 client 要被丢弃了"的场景，**不可逆**。
 线程退休用 `RetireThread(threadKey)`：只摘该 thread 的 idle（前置条件：该 thread 无在飞 exchange，
-由会话独占租借保证），不设墓碑。
+由会话独占租借保证），不设墓碑；`Close` 之后 idles 已空，本调用自然 no-op。
 复用首帧只接受 `response.created`、`response.in_progress`、`error`、`*.metadata`
 或 `responsesapi.websocket_timing`，否则报 `errConnDesynced` 并终止。
 
-观测使用内部原子 `hits` / `misses`（不新增公开 API）：每次打开 exchange 计一次，
-只有实际移交成功才算 hit。bench 的 P6 验证一次 accept 与每个计时请求命中，R18
-验证 `accepts == misses` 且 `hits + misses == 请求数`。
+观测使用内部原子 `hits` / `misses`（不新增公开 API）：开启缓存且非匿名时，每次打开 exchange 计一次
+（未开缓存 / 匿名请求不入统计），只有连接真的被移交（`releasable` 复查 + `unfence` 通过）才算 hit。
+bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accepts == misses` 且
+`hits + misses == 请求数`。
 从同一 thread 的**第 2 个请求**起就有收益（跨轮同样命中），收益 ∝ 命中次数；
 每实例、每条取数路径各留一条空闲连接，容量按 2 规划。
 
@@ -220,9 +223,10 @@ Authorization token 必须仍一致，取出即独占，不做请求多路复用
 - **事件流 turn-state**：`response.metadata` 的 `headers` 里带 ts 时，`turnStateTap`
   在取帧旁路捕获（不复制/不改写/不重排/不丢帧）。判定顺序：每帧先取事件类型 →
   `response.created` 记 `response_id` → `*.metadata` 做子串快筛 → 归属匹配
-  （`response_id == seenID && seenID != ""`）才写 `Identity.Sink`。fail-safe：created
-  到达前的 metadata 一律不捕获（`dropped` 计数 +1，帧照旧透传）。`Sink` 只在调用/
-  `Read` 栈内同步回调，`Body.Close` 返回后不再回调——所以不需要代际标志。
+  （`response_id == seenID && seenID != ""`）才写 `Identity.Sink`。fail-safe：带 ts 的 metadata
+  若 `seenID` 仍为空（`response.created` 未到）或 `response_id` 不归属本轮，一律不捕获（`dropped`
+  计数 +1，帧照旧透传；不带 ts 的 metadata 连计数都不加）。`Sink` 只在调用/`Read` 栈内同步回调，
+  `Body.Close` 返回后不再回调——所以不需要代际标志。
 - **回退链的白名单扫描是两次**（`buildResponsesCreateFrame` 内一次 + `normalize`
   再一次，与 T3 完全一致）：只有形态不在单遍覆盖内（非紧凑 / 转义键 / 重复键 /
   白名单外键）才走到；真实 codex 帧恒走单遍，那是 1 次。代价是这类形态比 T3 多付
@@ -230,7 +234,8 @@ Authorization token 必须仍一致，取出即独占，不做请求多路复用
   主路径成立（P1 测的正是主路径）。
 - **转发到拨号的选项**：`WithTransport` / `WithHeader`（身份保留键会在构造期 panic）/
   trace / turn / compression / ping / beta；身份（session/thread/window/metadata/ts）
-  不在此列——它随 `Dial` 的 `Identity` 实参进入握手头与每帧 `client_metadata`。
+  不在此列——它随 `Dial` / `StreamBody` / `Responses` 的 `Identity` 实参进入握手头与帧/体的
+  `client_metadata`。
   `WithTimeout` 现在**对 WS 臂生效**：`>0` 时设在请求 exchange 的 ctx 上，
   覆盖请求使用期，含拨号/升级（T5 起）；`=0` 时沿用调用方的取消与 deadline。
   `WithMaxLineSize` 仍只作用于 HTTP SSE 行扫描。
@@ -267,7 +272,8 @@ metadata 组合）逐字节比对，另有两例分别钉住"运行期 3.7KB 形
 `transport_ws_test.go`（`httptest` + `websocket.Accept` 假上游）：帧→SSE 逐字节
 断言（含 in-band error 与 `[DONE]` 位置）、与 HTTP 臂合成体逐字段相等、
 `response.failed` 两臂同形、身份与 turn-state（请求侧只认 `Identity.TurnState`；升级头不携带；
-握手头与 `response.metadata` 事件捕获后只回调 `Identity.Sink`；空身份时 payload 自带的
+握手头与 `response.metadata` 事件捕获后只回调 `Identity.Sink`；空身份且自动字段关闭
+（`WithTurnAuto(false)` + `WithTraceAuto(false)`，否则 `turn_id` 仍会补齐对象）时 payload 自带的
 `client_metadata` 被删除；连接身份 = `(threadKey, readLimit)`，跨 window 复用、匿名不复用；
 `RetireThread` 只摘 idle）、帧构造五条规则 + 非对象根、关闭
 语义（1011 / 1005 / 1000 / 无 close 帧）、默认路径零 WS 连接、并发（`-race`）。
