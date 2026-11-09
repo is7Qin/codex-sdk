@@ -35,8 +35,10 @@
 //     客户端自带的 client_metadata 永不透传）、透传（HTTP 头 WithHeader / WS
 //     client_metadata 任意键 WithClientMetadata，只注入不解析——如 responses-lite
 //     标记 HeaderResponsesLite / MetaResponsesLiteKey）、会话标识握手头（WithSession）、
-//     x-codex-turn-state（WS：升级响应头签发 → 帧内 client_metadata 回传；
-//     HTTP：仅响应侧捕获，请求不带头）、每帧新 trace 与 turn_id（UUIDv7）
+//     x-codex-turn-state（轮级 token：请求侧 WithTurnStateProvider 每次请求求值 /
+//     WithHeader 兼容入口，值落 HTTP 请求头或 WS 帧内 client_metadata；响应侧
+//     HTTP 头 / WS 握手头 / WS response.metadata 事件三处捕获，经 TurnState() 与
+//     WithTurnStateObserver 暴露）、每帧新 trace 与 turn_id（UUIDv7）
 //     ChatGPT-Account-ID（AccountIDProvider 可选接口：rotationAuth 经
 //     WithOAuthAccountID / patAuth 经 WithPATAccountID 显式注入——空 = 不发，
 //     向后兼容；OAuth(tokenProvider) 回调型不实现该接口）：上线形态经 Go
@@ -104,9 +106,9 @@
 //     StreamBody 由 Body.Close 触发归还；Responses 消费终态后自动归还。
 //     注意：WithPingInterval(0) 关闭心跳后，传输臂仍有常驻读者服务 pong，但不再
 //     探测"对端是否还活着"（半开连接只能靠读写错误或调用方 ctx 兜底）。
-//   - WithWSConnCache(n) 开启默认关闭的 WS 连接复用：同 ts 连续请求命中后不再付握手。
-//     默认从同轮第 3 个请求起（调用方自带 turn-state 时第 2 个起），
-//     收益 ∝ 命中次数；一轮 1–2 个请求时默认无收益。
+//   - WithWSConnCache(n) 开启默认关闭的 WS 连接复用：同一个 HTTPClient 上的
+//     连续请求——含跨轮——命中后不再付握手（连接身份只含 readLimit；ts 不进
+//     连接身份，与真实 codex 的"thread 级连接 + 轮级 ts"一致）。
 //   - HTTP 流式解析零拷贝：bufio.Scanner 复用缓冲 + 行切片提取 data: 帧内容，
 //     回调内的原始字节引用 scanner 缓冲（仅在回调执行期间有效）
 //   - HTTP 客户端懒构建：NewHTTPClient 不创建 http.Client（只做选项快照与升级头
@@ -119,24 +121,27 @@
 // 2026-02-06，仅 WS 握手注入；HTTP 默认不发 OpenAI-Beta，需要时 WithHeader
 // 显式注入）。真实客户端行为对齐：WS 握手与 HTTP 请求均不发 trace 头（trace
 // 只进每帧 client_metadata，每帧新值）；session-id/thread-id/x-client-request-id/
-// x-codex-window-id 会话级握手头；x-codex-turn-state 是双面机制（真实源码
+// x-codex-window-id 会话级握手头；x-codex-turn-state 是轮级机制（真实源码
 // 行号实证，防未来误删 WS 帧注入）：
 //   - HTTP 面：真实客户端请求头携带 x-codex-turn-state（client.rs:1202
-//     build_responses_headers(..., Some(&self.turn_state))）；本 SDK HTTP 路径
-//     不发送该头——仅响应侧捕获 + HTTPResponse.TurnState / TurnState() 暴露，
-//     同轮回传由网关转发层（c3api）实现
+//     build_responses_headers(..., Some(&self.turn_state))）；本 SDK 的请求侧
+//     取值是 WithTurnStateProvider（逐请求求值）/ WithHeader（兼容入口），响应侧
+//     捕获 + HTTPResponse.TurnState / TurnState() / observer 暴露
 //   - WS 面：帧 metadata 恒带（TurnState 非空时）——真实发送路径
 //     client.rs:1626-1631（stream_responses_websocket）在 build_ws_client_metadata
 //     （:779-792，辅助函数本身无 turn-state）之后显式追加
 //     client_metadata.insert(X_CODEX_TURN_STATE_HEADER, ...)，流入
 //     ResponseCreateWsRequest.client_metadata（:1702-1711 帧体携带）；SDK 帧注入
 //     （frameCodec.encode 的 client_metadata 落地：单遍快路径直接写入，回退链经
-//     normalize → injectClientMetadataObject）逐点一致：升级响应头签发 → 帧内回传
-//     （Client.TurnState 缓存 + 网关 SetTurnState("") 清除，跨轮不得回传）。
+//     normalize → injectClientMetadataObject）逐点一致：每请求取值 → 帧内回传。
+//     跨轮不得重放：请求侧**不**回落 TurnState() 缓存（缓存只作观测面）。
 //
-// WS 传输臂的连接身份包含 turn-state 与 readLimit，跨 ts 或取数路径不复用；
-// 命中没有新握手，不刷新 HTTPClient.TurnState()，签发值从缓存条目回填合成响应。
-// 事件流 response.metadata 的 turn-state 尚未跟随（T6）。
+// WS 传输臂的连接身份只含 readLimit（不含 turn-state）：连接是 thread 级、跨轮
+// 复用，ts 是轮级、每请求下发——与真实 codex 的换连接条件一致（因为
+// responses_headers 不含 ts）。合成响应头按 S5 判据回填：只有"本次请求带的 ts
+// 仍等于最近签发值"才出现，跨轮/换值一律不回填。事件级捕获（response.metadata
+// 的 headers）经 turnStateTap 逐帧旁路完成：created 先记 response_id，归属匹配
+// 才写 TurnState() + observer，fail-safe 是"created 之前的 metadata 一律不捕获"。
 //
 // responses-lite 非独立端点：与 /responses 同端点同事件集，
 // 仅 internal 标记区分——HTTP 头 x-openai-internal-codex-responses-lite（WithHeader
@@ -150,7 +155,7 @@
 // 发送前统一执行）恒 4 key（x-codex-installation-id/session_id/thread_id/
 // x-codex-window-id）+ 恒带 turn_id + 条件键（x-openai-subagent/
 // x-codex-parent-thread-id/parent_turn_id/x-codex-turn-metadata）——不含
-// trace/turn-state（trace 仅 WS 帧面；turn-state 的请求头属 HTTP 头面）。
+// trace/turn-state（trace 仅 WS 帧面；turn-state 在 HTTP 面走请求头，不在体面）。
 //
 // 依赖：github.com/coder/websocket（纯标准库实现，无 CGO）+
 // github.com/tidwall/gjson / github.com/tidwall/sjson（raw JSON 修补）。

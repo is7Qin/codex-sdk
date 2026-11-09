@@ -48,7 +48,8 @@ func newReusableUpstream(tb testing.TB, script []string) *reusableUpstream {
 	return u
 }
 
-// BenchmarkWSStreamBodyReused：spec §9 P5/P6 —— 同 turn-state 连续请求复用一条连接。
+// BenchmarkWSStreamBodyReused：spec §9 P5/P6 —— 同一 client 的连续请求复用一条连接
+// （连接身份不含 turn-state，跨轮也命中）。
 //
 // 客户端除 WithWSConnCache(2) 外与 P3 逐项同配置（含默认开启的 trace 自动注入）。
 // 口径：预热一次（建立并归还第一条连接，不计入 b.N），此后每个 b.N 只付"发一帧 +

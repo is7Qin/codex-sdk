@@ -20,9 +20,10 @@ const (
 	responseEventFailed    = "response.failed"
 )
 
-// Responses 在 WS 臂可用 WithWSConnCache(n) 开启默认关闭的连接复用：仅同 ts、
-// 同 readLimit 的连续请求可命中，消费终态后自动归还；与 StreamBody 不共享连接。
-// 收益边界见 TRANSPORT.md 的连接复用段。
+// Responses 在 WS 臂可用 WithWSConnCache(n) 开启默认关闭的连接复用：连接身份
+// 只含 readLimit（不含 turn-state），同一 HTTPClient 上的连续请求——包括跨轮——
+// 都可命中；消费终态后自动归还；与 StreamBody 不共享连接。收益边界见
+// TRANSPORT.md 的连接复用段。
 //
 // Responses 合成非流式 responses 调用：内部无条件覆盖 stream:true（上游硬性
 // 要求——payload 任意 stream 值（含显式 false）均覆盖为 true，非流式语义由
@@ -34,9 +35,8 @@ const (
 // （injectResponsesClientMetadata——非流式聚合与流式路径同一注入点）。
 // 与 Do 的区别：Do 是通用非流式 POST（对 codex responses 端点 400 不可用）；
 // 本方法走 Stream 合成——网关以非流式语义消费（一次性响应）。
-// 返回 HTTPResponse{StatusCode, Raw, TurnState}（与 Do 同形态；TurnState 读
-// c.TurnState()——Stream 内部已捕获（http.go captureTurnState），非 2xx 路径
-// 本就为空）。
+// 返回 HTTPResponse{StatusCode, Raw, TurnState}（与 Do 同形态；TurnState 按 S5
+// 判据回填——只有"本次请求带的 ts == 最近签发值"才非空；跨轮不回填旧值）。
 // 错误透传同 Stream（HTTPError 信封 / fatal 五类 / 401 判死轮转）。
 //
 // TransportWS 时取数改走上游 Responses WS（StreamBody 的 ws 臂 + 同一个
@@ -58,17 +58,25 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 		}
 	}
 	agg := &responsesAggregator{}
+	// effective 是本次请求生效的 turn-state（ws 臂由 exchange 回传，HTTP 臂按
+	// 同一优先级重算一次——两臂对"本次带的是什么"必须一致）。
+	effective := ""
 	if c.opts.responsesTransport == TransportWS {
+		var err error
 		// ws 臂：responsesStreamWS 直接从 exchange 取帧喂聚合器（不经 sseView
 		// 渲染 + scanSSE 回扫）。终态帧喂进聚合器后不再取帧，所以只有"终态之后
 		// 才到"的取消/超时可以豁免，其余错误原样透传。
-		if err := c.responsesStreamWS(ctx, wire, agg.feed); err != nil {
+		effective, err = c.responsesStreamWS(ctx, wire, agg.feed)
+		if err != nil {
 			if !agg.completed || !isContextError(err) {
 				return nil, err // 上游/传输错误透传（response.failed 事件级 HTTPError 同样原样）
 			}
 		}
-	} else if err := c.Stream(ctx, wire, agg.feed); err != nil {
-		return nil, err // 上游错误（HTTPError/fatal 五类/401 轮转）/ response.failed 事件级错误透传
+	} else {
+		effective = c.effectiveTurnState()
+		if err := c.Stream(ctx, wire, agg.feed); err != nil {
+			return nil, err // 上游错误（HTTPError/fatal 五类/401 轮转）/ response.failed 事件级错误透传
+		}
 	}
 	if !agg.completed {
 		// 截断：流结束（[DONE] 与 EOF 统一）未达 response.completed → 错误返回，
@@ -82,7 +90,9 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 	return &HTTPResponse{
 		StatusCode: http.StatusOK,
 		Raw:        body,
-		TurnState:  c.TurnState(),
+		// S5：与流式臂共用的回填判据——只回填"本次请求带的 ts 仍等于最近签发值"
+		// 的情况；跨轮（未带 / 已换成新值）绝不把旧值当成这一轮的签发值。
+		TurnState: c.syntheticTurnState(effective),
 	}, nil
 }
 

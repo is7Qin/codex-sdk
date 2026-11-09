@@ -65,11 +65,13 @@ func frameStartsResponse(raw []byte) bool {
 // 输入错误，不能为它烧一次上游握手（否则拨号失败会盖掉本地错误，两臂状态面
 // 不等价）。
 //
-// turn-state：本方法认两个来源（前者优先）：
-//  1. 调用方以 WithHeader(HeaderTurnState, ...) 下发的 per-request 值——网关既有的
-//     注入手法（HTTP 面它落在请求头上，WS 面落在帧内 client_metadata）；该头
-//     **不进升级头**（真实客户端只在帧里带，见 wsUpgradeHeaders）；
-//  2. HTTPClient 缓存的"上一次响应/握手签发值"（c.TurnState()）。
+// turn-state：请求侧来源只有两处，优先级 provider > WithHeader：
+//  1. WithTurnStateProvider 的逐请求求值结果（网关的正式入口）；
+//  2. 调用方以 WithHeader(HeaderTurnState, ...) 下发的 per-request 值（兼容入口）。
+//
+// 两者都为空 ⇒ 本次请求**不带** ts。**不**回落到 HTTPClient.TurnState()：那个
+// 缓存只作观测面（最近签发值），拿它当默认值会让跨轮第一个请求重放上一轮的 ts。
+// 该值也不进升级头（真实客户端只在帧里带，见 wsUpgradeHeaders），不改连接身份。
 //
 // ctx 只是 exchange 的构造输入（含超时预算）：**取帧用 ex.ctx**，连接 ctx 已与
 // 请求解耦。调用方取消能终止后续对 Body 的读取；已入队的帧仍先交付（取帧即提交）。
@@ -80,8 +82,11 @@ func (c *HTTPClient) streamBodyWS(ctx context.Context, payload []byte, readLimit
 	}
 	hdr := make(http.Header, 2)
 	hdr.Set("Content-Type", "text/event-stream")
-	if ex.issued != "" {
-		hdr.Set(HeaderTurnState, ex.issued)
+	// S5：只有"本次请求带的 ts 仍等于最近签发值"才回填（轮内复用）。
+	// 跨轮（未带 / 已被 provider 换成新值）不回填旧值——后到的事件 ts 走 observer，
+	// 不可能挤进这行（响应头在读到任何帧之前就已定死）。
+	if ts := c.syntheticTurnState(ex.effective); ts != "" {
+		hdr.Set(HeaderTurnState, ts)
 	}
 	return &http.Response{
 		Status:        "200 OK",
@@ -90,7 +95,7 @@ func (c *HTTPClient) streamBodyWS(ctx context.Context, payload []byte, readLimit
 		ProtoMajor:    1,
 		ProtoMinor:    1,
 		Header:        hdr,
-		Body:          newSSEView(ex.ctx, ex, readLimit),
+		Body:          newSSEView(ex.ctx, c.turnStateTapFor(ex), readLimit),
 		ContentLength: -1,
 	}, nil
 }
@@ -108,34 +113,40 @@ func (c *HTTPClient) streamBodyWS(ctx context.Context, payload []byte, readLimit
 // Next——已完成的请求不会被消费侧随后的取消/超时改写。帧自身的事件语义不变：
 // failed 的 error、incomplete 的截断判定仍归聚合器与调用方。
 //
-// 终态一成立就 Release（T5 起）：连接停在干净帧边界，可以交回缓存给同 ts 的
-// 下一个请求。feed 报错但帧本身是终态时 **照样** Release——连接状态与下游解析
-// 失败无关，杀掉它只会让下一个请求多付一次握手。
-func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, feed func(raw []byte) error) error {
+// 终态一成立就 Release（T5 起）：连接停在干净帧边界，可以交回缓存给同一个
+// HTTPClient 的下一个请求（跨轮同样复用——连接身份不含 ts）。feed 报错但帧本身
+// 是终态时 **照样** Release——连接状态与下游解析失败无关，杀掉它只会让下一个
+// 请求多付一次握手。
+//
+// 返回本次请求生效的 turn-state（"" = 未带）：调用方按 S5 判据决定合成响应头/
+// HTTPResponse.TurnState 是否回填，**不额外求值 provider**（一次请求只求值一次）。
+func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, feed func(raw []byte) error) (string, error) {
 	ex, err := c.openWSExchange(ctx, payload, wsResponsesReadLimit)
 	if err != nil {
-		return err
+		return "", err
 	}
-	// Release 之后这个 defer 是 no-op（wsExchange.closed）。
-	defer func() { _ = ex.Close() }()
+	// 事件级 ts 捕获（S3）与流式臂共用同一个装饰器；Release 之后这个 defer 是
+	// no-op（wsExchange.closed）。
+	tap := c.turnStateTapFor(ex)
+	defer func() { _ = tap.Close() }()
 	for {
-		raw, nextErr := ex.Next(ex.ctx)
+		raw, nextErr := tap.Next(ex.ctx)
 		if nextErr == io.EOF { // close frame / 正常收尾：截断与否由调用方按终态判定
-			return nil
+			return ex.effective, nil
 		}
 		if nextErr != nil {
-			return fmt.Errorf("codexsdk: 读取响应流失败: %w", nextErr)
+			return ex.effective, fmt.Errorf("codexsdk: 读取响应流失败: %w", nextErr)
 		}
 		term := isTerminalEvent(raw)
 		if ferr := feed(raw); ferr != nil {
 			if term {
-				ex.Release()
+				tap.Release()
 			}
-			return ferr
+			return ex.effective, ferr
 		}
 		if term { // 终态帧已 feed ⇒ 本次取数完成
-			ex.Release()
-			return nil
+			tap.Release()
+			return ex.effective, nil
 		}
 	}
 }
@@ -151,17 +162,20 @@ func isTerminalEvent(raw []byte) bool {
 		bytesAre(typ, responseEventIncomplete)
 }
 
-// effectiveTurnState 解析本次调用的生效 turn-state：WithHeader(HeaderTurnState, ...)
-// 优先（调用方 per-request 注入），否则 HTTPClient 缓存的最近签发值。
+// effectiveTurnState 解析本次请求的生效 turn-state：provider > WithHeader > 空串。
 //
-// 为什么两条：网关面 per-request 的 turn-state 一直是用 WithHeader 下发的（HTTP
-// 臂就靠它成为请求头），而 WS 面的同一个值必须进帧内 client_metadata——不认这条
-// 来源的话，"网关零改动"下 WS 臂永远不会回传 turn-state（HTTP 臂会）。
+// **不**回落 HTTPClient.TurnState()（S2）：缓存只作"上次签发过什么"的观测面，
+// 当默认值会让跨轮第一个请求重放上一轮的 ts（违反"ts 轮级、跨轮不得重放"）。
+// 两条非空来源仍然保留：provider 是网关的正式入口（每请求求值，更新不必重建
+// client），WithHeader 是兼容入口（构造期注入，更新只能重建 client）。
 func (c *HTTPClient) effectiveTurnState() string {
-	if v := c.opts.headers.Get(HeaderTurnState); v != "" {
-		return v
+	// 优先级写死：provider（非空才构成取值）> WithHeader > 空串。
+	if c.opts.turnStateProvider != nil {
+		if v := c.opts.turnStateProvider(); v != "" {
+			return v
+		}
 	}
-	return c.TurnState()
+	return c.opts.headers.Get(HeaderTurnState)
 }
 
 // wsUpgradeHeaders 算出升级头里的"调用方覆盖集"（构造期一次，避免每请求重建）：

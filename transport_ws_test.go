@@ -460,15 +460,17 @@ func TestResponsesWSTruncatedOnIncomplete(t *testing.T) {
 	}
 }
 
-// ---- 3. turn-state 握手签发 → 回写 → 下一轮帧回传 ----
+// ---- 3. turn-state 握手签发 → 回写；请求侧不回落缓存 ----
 
-// TestResponsesWSTurnStateRoundTrip：握手响应头签发值回写 HTTPClient.TurnState()
-// （与 HTTP 臂读 resp.Header 同义），并在下一次 StreamBody 的帧 client_metadata
-// 里回传；首轮不回传。
-func TestResponsesWSTurnStateRoundTrip(t *testing.T) {
+// TestResponsesWSTurnStateCapturedNoReplay：握手响应头签发值回写 HTTPClient.TurnState()
+// （与 HTTP 臂读 resp.Header 同义），但**不**自动成为下一次请求的 ts——缓存只是
+// 观测面，跨轮不得重放（S2）。合成响应头按 S5 判据：只有"本次请求带的 ts == 最近
+// 签发值"才回填，所以首轮（请求未带 ts）不回填。
+func TestResponsesWSTurnStateCapturedNoReplay(t *testing.T) {
 	up := newWSUpstream(t)
 	up.setTurnState("ts-issued-1")
 	up.setScripts(
+		wsScript{frames: []string{wsCreatedEv, wsCompletedEv}},
 		wsScript{frames: []string{wsCreatedEv, wsCompletedEv}},
 		wsScript{frames: []string{wsCreatedEv, wsCompletedEv}},
 	)
@@ -479,13 +481,14 @@ func TestResponsesWSTurnStateRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 第 1 轮：上游签发 ts-issued-1。
+	// 第 1 轮：上游签发 ts-issued-1。请求没带 ts ⇒ 合成响应头不回填（S5），
+	// 但签发值仍进 TurnState()（观测面）。
 	resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
 	if err != nil {
 		t.Fatalf("第 1 次 StreamBody: %v", err)
 	}
-	if got := resp.Header.Get(HeaderTurnState); got != "ts-issued-1" {
-		t.Fatalf("合成响应头 %s = %q, 期望 ts-issued-1", HeaderTurnState, got)
+	if got := resp.Header.Get(HeaderTurnState); got != "" {
+		t.Fatalf("合成响应头 %s = %q, 期望空（本次请求未带 ts，S5 不回填）", HeaderTurnState, got)
 	}
 	_ = readAllBody(t, resp.Body)
 	if got := hc.TurnState(); got != "ts-issued-1" {
@@ -499,27 +502,32 @@ func TestResponsesWSTurnStateRoundTrip(t *testing.T) {
 		t.Fatalf("首轮不应回传 turn-state, got %s", got.Raw)
 	}
 
-	// 第 2 轮：回传上一轮签发值；上游再签发 ts-issued-2。
+	// 第 2 轮：**不**回放上一轮签发值（请求侧取值不回落到 TurnState()）；
+	// 上游再签发 ts-issued-2，只更新观测面。
 	up.setTurnState("ts-issued-2")
 	resp2, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
 	if err != nil {
 		t.Fatalf("第 2 次 StreamBody: %v", err)
+	}
+	if got := resp2.Header.Get(HeaderTurnState); got != "" {
+		t.Fatalf("第 2 轮合成响应头 = %q, 期望空（不得回填旧值）", got)
 	}
 	_ = readAllBody(t, resp2.Body)
 	frames := up.sentFrames(t)
 	if len(frames) != 2 {
 		t.Fatalf("上游收到 %d 帧, 期望 2 帧", len(frames))
 	}
-	if got := gjson.GetBytes(frames[1], "client_metadata."+codexMetaTurnStateKey).String(); got != "ts-issued-1" {
-		t.Fatalf("第 2 轮帧 turn-state = %q, 期望 ts-issued-1（帧 %s）", got, frames[1])
+	if got := gjson.GetBytes(frames[1], "client_metadata."+codexMetaTurnStateKey); got.Exists() {
+		t.Fatalf("第 2 轮帧不应回传上一轮 turn-state, got %s（帧 %s）", got.Raw, frames[1])
 	}
 	if got := hc.TurnState(); got != "ts-issued-2" {
 		t.Fatalf("HTTPClient.TurnState() = %q, 期望 ts-issued-2（本轮签发值）", got)
 	}
 
-	// 第 3 轮（网关既有手法）：per-request 值以 WithHeader(HeaderTurnState) 下发
-	// （HTTP 面它就是请求头；网关按值重建客户端，所以 c.TurnState() 恒空）。WS 臂
-	// 必须把它搬进帧内 client_metadata，且**不能**出现在升级头里。
+	// 第 3 轮（兼容入口）：per-request 值以 WithHeader(HeaderTurnState) 下发。
+	// WS 臂必须把它搬进帧内 client_metadata，且**不能**出现在升级头里。
+	// 本轮握手签发的正是同一个值 ⇒ S5 判据相等 ⇒ 合成响应头回填它。
+	up.setTurnState("ts-from-gateway")
 	gw := NewHTTPClient(PAT("pat-ws"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
@@ -528,6 +536,9 @@ func TestResponsesWSTurnStateRoundTrip(t *testing.T) {
 	resp3, err := gw.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
 	if err != nil {
 		t.Fatalf("第 3 次 StreamBody（WithHeader 注入）: %v", err)
+	}
+	if got := resp3.Header.Get(HeaderTurnState); got != "ts-from-gateway" {
+		t.Fatalf("第 3 轮合成响应头 = %q, 期望 ts-from-gateway（effective == 最近签发值）", got)
 	}
 	_ = readAllBody(t, resp3.Body)
 	all := up.sentFrames(t)

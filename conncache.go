@@ -29,8 +29,9 @@ type cachedConn struct {
 	cn    *conn
 	token string // dial 时使用的 Authorization（OAuth 轮转后旧连接必须丢弃）
 	key   connKey
-	// issued 是这条连接握手时上游签发的 turn-state：命中时回填给新的 exchange，
-	// 让合成响应头与 TurnState() 与本轮握手一致（复用没有新的握手）。
+	// issued 是这条连接握手时上游签发的 turn-state：命中时回填给新的 exchange
+	// （`ex.issued`，仅作该连接的握手历史）。合成响应头**不**直接用它——S5 判据
+	// 拿 exchange.effective 与 HTTPClient.TurnState() 比较，两者在事件捕获后会分叉。
 	issued string
 	// idleSince 是入表时刻（TTL 起点）；bornAt 是拨号时刻（maxAge 起点）。
 	// bornAt 随连接在表里逐次传递，**不重置**——否则热连接永远撞不到 30min 上限。
@@ -125,7 +126,7 @@ func (c *connCache) get(key connKey, token string) (*cachedConn, bool) {
 		case c.expired(cc, now):
 			dead = append(dead, cc.cn)
 		case cc.key != key:
-			// 别的 turn-state / 另一条取数路径的连接：留在表里等它自己的请求。
+			// 另一条取数路径（readLimit）的连接：留在表里等它自己的请求。
 			kept = append(kept, cc)
 		case hit == nil:
 			cp := cc
@@ -144,8 +145,8 @@ func (c *connCache) get(key connKey, token string) (*cachedConn, bool) {
 
 // put 收下一条可复用的连接（实现 connSink）。恒返回 true。
 //
-// 满时**驱逐 idleSince 最旧的条目**再入表，绝不因满而拒收新连接：否则 ts 一变，
-// cap=1 的缓存就永久占满、命中率归零。
+// 满时**驱逐 idleSince 最旧的条目**再入表，绝不因满而拒收新连接：两条取数路径
+// （两个 readLimit）并存时，旧条目不该把新归还的连接挤掉。
 func (c *connCache) put(e *wsExchange) bool {
 	now := time.Now()
 	var dead []*conn
@@ -184,7 +185,7 @@ func (c *connCache) put(e *wsExchange) bool {
 	return true
 }
 
-// clear 清空缓存并终止其中的连接（CloseIdleConnections 用）。
+// clear 清空缓存并终止其中的连接（CloseWSIdleConnections / CloseIdleConnections 用）。
 func (c *connCache) clear() {
 	c.mu.Lock()
 	idles := c.idles
@@ -197,12 +198,13 @@ func (c *connCache) clear() {
 
 // WithWSConnCache 开启 Responses WS 臂的连接复用：n = 同时保留的空闲连接上限。
 //
-// 默认 **0 = 关闭**（每请求一条连接，与历史行为完全一致）。开启后，同一
-// turn-state、同一条取数路径（流式 64MiB / 聚合 16MiB）的**连续**请求会复用
-// 上一条连接、不再付握手成本；跨 turn-state 不复用（服务端用它做 sticky routing）。
+// 默认 **0 = 关闭**（每请求一条连接，与历史行为完全一致）。开启后，同一个
+// HTTPClient、同一条取数路径（流式 64MiB / 聚合 16MiB）的**连续**请求会复用
+// 上一条连接、不再付握手成本。连接身份**不含 turn-state**：与真实 codex 一致，
+// 连接是 thread 级、跨轮复用；ts 是轮级、每请求随 client_metadata 下发。
 //
-// 收益边界：默认从同轮第 3 个请求起（调用方自带 turn-state 时第 2 个起），
-// 收益 ∝ 命中次数；一轮 1–2 个请求时默认无收益。
+// 收益边界：从同一 thread 的**第 2 个请求**起就有收益（跨轮也命中）；
+// 每实例、每条取数路径各留一条空闲连接，容量按 2 规划。
 func WithWSConnCache(n int) Option {
 	return func(o *options) {
 		if n < 0 {

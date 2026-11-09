@@ -111,6 +111,12 @@ type options struct {
 	turnAuto        bool            // 每帧自动生成 turn_id（默认开）
 	turnProvider    func(turn uint64) string
 
+	// turn-state 请求/观测面（S2）。provider 每次请求求值，优先于 WithHeader
+	// （provider 返回空串时按优先级继续看 WithHeader）；observer 在捕获点同步
+	// 调用（握手 / HTTP 响应头 / WS 事件三处共用），实现方必须自己保证非阻塞。
+	turnStateProvider func() string
+	turnStateObserver func(string)
+
 	// HTTP 专用。
 	timeout     time.Duration
 	maxLineSize int
@@ -228,6 +234,27 @@ func WithSession(s Session) Option {
 // 优先级：帧内已存在 > CodexMeta.TurnMetadata > 本回调。
 func WithTurnMetadata(provider func(turn uint64) string) Option {
 	return func(o *options) { o.turnProvider = provider }
+}
+
+// WithTurnStateProvider 注册"每次请求求值"的 turn-state 来源（默认 nil）。
+//
+// 请求侧取值优先级：provider > WithHeader(HeaderTurnState, …) > 空串。
+// **不**回落 HTTPClient.TurnState()：缓存只作"上次签发过什么"的观测面，绝不是
+// 下一次请求的默认值——否则跨轮第一个请求必然重放上一轮的 ts（真实 codex 的
+// 契约是 ts 轮级、跨轮不得重放）。
+//
+// provider 返回值**不进连接身份**（WS 连接是 thread 级、跨轮复用）；provider
+// 返回空串不构成取值（按优先级继续看 WithHeader，两者都空 = 本次请求不带 ts）。
+func WithTurnStateProvider(fn func() string) Option {
+	return func(o *options) { o.turnStateProvider = fn }
+}
+
+// WithTurnStateObserver 注册"捕获到新 ts"的回调：响应头 / WS 握手响应头 /
+// WS 事件（response.metadata 的 headers）三处捕获点共用。
+//
+// 在捕获点**同步**调用——实现方必须自己保证非阻塞（网关只做一次原子写）。
+func WithTurnStateObserver(fn func(string)) Option {
+	return func(o *options) { o.turnStateObserver = fn }
 }
 
 // WithTimeout 设置 HTTP 客户端总超时（http.Client.Timeout；默认 0 不设限）。

@@ -213,7 +213,8 @@ func startResponsesMock(t *testing.T, hdr http.Header, events []string, sendDone
 
 // TestResponsesAggregateWire：全链路——鉴权头注入 + stream:true 注入（payload
 // 未带 stream）+ 其余字段保留 + 事件聚合合成体 + 响应头 turn-state 捕获
-// （resp.TurnState 与 c.TurnState() 一致）。
+// （新值进 c.TurnState() 观测面；HTTPResponse.TurnState 按 S5 判据——请求未带
+// ts ⇒ 不回填）。
 func TestResponsesAggregateWire(t *testing.T) {
 	var cap responsesWireCapture
 	srv := startResponsesMock(t,
@@ -254,8 +255,10 @@ func TestResponsesAggregateWire(t *testing.T) {
 	if string(resp.Raw) != want {
 		t.Fatalf("合成体 = %s\n期望     = %s", resp.Raw, want)
 	}
-	if resp.TurnState != "st-resp" {
-		t.Fatalf("HTTPResponse.TurnState = %q, 期望 st-resp", resp.TurnState)
+	if resp.TurnState != "" {
+		// S5：本次请求没带 ts ⇒ 聚合臂不回填（即便本次响应头签发了新值，新值只进
+		// 观测面/observer——否则调用方会把它当"本轮请求使用的值"再重放一次）。
+		t.Fatalf("HTTPResponse.TurnState = %q, 期望空（请求未带 ts，S5 不回填）", resp.TurnState)
 	}
 	if hc.TurnState() != "st-resp" {
 		t.Fatalf("TurnState() = %q, 期望 st-resp（Stream 内部已捕获）", hc.TurnState())

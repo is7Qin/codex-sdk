@@ -293,27 +293,40 @@ func TestHTTPConnectionReuse(t *testing.T) {
 	}
 }
 
-// TestHTTPTurnStateNoEcho：HTTP 请求绝不携带 x-codex-turn-state 头（真实
-// codex 客户端行为——turn-state 仅响应侧）；响应头签发 → 自动捕获，经
-// HTTPResponse.TurnState / TurnState() 暴露，不回传为请求头（头回传仅 WS 路径）。
-func TestHTTPTurnStateNoEcho(t *testing.T) {
-	var gotEcho string
+// TestHTTPTurnStateRequestHeader：HTTP 面的请求侧取值（S2）。
+//
+//   - 没有任何来源 ⇒ 不带 x-codex-turn-state（真实客户端只有拿到 ts 后才带）；
+//   - WithTurnStateProvider ⇒ 每次请求重新求值，值进请求头（更新不必重建 client）；
+//   - 优先级 provider > WithHeader（provider 为空时才用 WithHeader）；
+//   - 响应头签发值自动捕获进 HTTPResponse.TurnState / TurnState()（Do 是原样透传面）。
+func TestHTTPTurnStateRequestHeader(t *testing.T) {
+	var gotEcho atomic.Value // string：上游看到的请求头
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotEcho = r.Header.Get(HeaderTurnState)
+		gotEcho.Store(r.Header.Get(HeaderTurnState))
 		w.Header().Set(HeaderTurnState, "st-http")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	newClient := func(opts ...Option) *HTTPClient {
+		base := []Option{WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL))}
+		return NewHTTPClient(PAT("t"), append(base, opts...)...)
+	}
+	echo := func() string {
+		v, _ := gotEcho.Load().(string)
+		return v
+	}
+
+	// (a) 无来源：绝不携带该头（历史行为不变）。
+	hc := newClient()
 	for i := 0; i < 3; i++ {
 		resp, err := hc.Do(context.Background(), []byte(`{}`))
 		if err != nil {
 			t.Fatalf("Do #%d: %v", i, err)
 		}
-		if gotEcho != "" {
-			t.Fatalf("第 %d 次请求不应携带 x-codex-turn-state, got %q", i+1, gotEcho)
+		if got := echo(); got != "" {
+			t.Fatalf("第 %d 次请求不应携带 x-codex-turn-state, got %q", i+1, got)
 		}
 		if resp.TurnState != "st-http" {
 			t.Fatalf("HTTPResponse.TurnState = %q, 期望 st-http", resp.TurnState)
@@ -321,6 +334,33 @@ func TestHTTPTurnStateNoEcho(t *testing.T) {
 		if hc.TurnState() != "st-http" {
 			t.Fatalf("TurnState = %q, 期望 st-http（响应头自动捕获）", hc.TurnState())
 		}
+	}
+
+	// (b) provider 逐请求求值；provider 优先于 WithHeader；provider 空时用 WithHeader。
+	var cur atomic.Value
+	cur.Store("ts-req-1")
+	hc2 := newClient(
+		WithTurnStateProvider(func() string {
+			v, _ := cur.Load().(string)
+			return v
+		}),
+		WithHeader(HeaderTurnState, "ts-from-header"),
+	)
+	for _, want := range []string{"ts-req-1", "ts-req-2"} {
+		cur.Store(want)
+		if _, err := hc2.Do(context.Background(), []byte(`{}`)); err != nil {
+			t.Fatalf("Do（provider=%s）: %v", want, err)
+		}
+		if got := echo(); got != want {
+			t.Fatalf("请求头 = %q, 期望 %q（provider 逐请求求值）", got, want)
+		}
+	}
+	cur.Store("")
+	if _, err := hc2.Do(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("Do（provider 空）: %v", err)
+	}
+	if got := echo(); got != "ts-from-header" {
+		t.Fatalf("请求头 = %q, 期望 ts-from-header（provider 空 ⇒ WithHeader）", got)
 	}
 }
 

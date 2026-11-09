@@ -217,11 +217,12 @@ func TestWSConnCacheClearedByCloseIdle(t *testing.T) {
 	}
 }
 
-// ---- R11：turn-state 变化 ⇒ 不复用 ----
+// ---- S1：turn-state 变化不影响连接身份 ----
 
-// TestWSConnReuseRespectsTurnState（R11）：上游第一次签发 A、第二次签发 B，
-// 第二个请求的 key 变成 A（与第一次的 "" 不同）⇒ 新拨 ⇒ accepts==2。
-func TestWSConnReuseRespectsTurnState(t *testing.T) {
+// TestWSConnReuseIgnoresTurnState（S1）：上游第一次握手签发 A；第二个请求不带 ts
+// （新的一轮）必须**复用同一条连接**——连接身份不含 turn-state，ts 变化不摧毁连接
+// （真实 codex：连接 thread 级、ts 轮级；换连接条件里没有 ts）。
+func TestWSConnReuseIgnoresTurnState(t *testing.T) {
 	up := newReuseUpstream(t)
 	up.setTurnSeq("A", "B")
 	hc := up.client(t, WithWSConnCache(2))
@@ -230,9 +231,12 @@ func TestWSConnReuseRespectsTurnState(t *testing.T) {
 	if got := hc.TurnState(); got != "A" {
 		t.Fatalf("TurnState = %q，期望 A", got)
 	}
-	doStreamBody(t, hc) // effective = A ≠ 缓存的 "" ⇒ 未命中
-	if got := up.accepts.Load(); got != 2 {
-		t.Fatalf("accepts = %d，期望 2（跨 ts 不得复用）", got)
+	doStreamBody(t, hc) // 第二个请求不带 ts
+	if got := up.accepts.Load(); got != 1 {
+		t.Fatalf("accepts = %d，期望 1（跨 ts 必须复用同一连接）", got)
+	}
+	if got := hc.TurnState(); got != "A" {
+		t.Fatalf("TurnState = %q，期望仍为 A（复用没有新握手）", got)
 	}
 }
 
@@ -250,10 +254,10 @@ func TestWSConnReusedFirstFrameDesynced(t *testing.T) {
 	defer cancel()
 	// 两次都走聚合臂（同一条取数路径 ⇒ 同一个 key，第二次才会命中）。
 	noop := func([]byte) error { return nil }
-	if err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), noop); err != nil {
+	if _, err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), noop); err != nil {
 		t.Fatalf("第一次: %v", err)
 	}
-	err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), noop)
+	_, err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), noop)
 	if !errors.Is(err, errConnDesynced) {
 		t.Fatalf("错误 = %v，期望 errConnDesynced", err)
 	}
@@ -270,12 +274,12 @@ func TestWSConnReusedFirstFrameErrorPassesThrough(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	noop := func([]byte) error { return nil }
-	if err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), noop); err != nil {
+	if _, err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), noop); err != nil {
 		t.Fatalf("第一次: %v", err)
 	}
 
 	var seen []byte
-	err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), func(raw []byte) error {
+	_, err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), func(raw []byte) error {
 		seen = append(seen, raw...)
 		return nil
 	})

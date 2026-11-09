@@ -27,7 +27,7 @@ func WithResponsesTransport(t Transport) Option
 | socket | `conn.go` | `conn`：唯一 `ws.Read` 调用点（`readFrame`）、写/探测闸 `gate`、唯一心跳 `keepalive`、唯一终止入口 `terminate`（经 `finish` 发布） |
 | 队列 | `conn.go` | `frameInbox`：pumped 的有界入站队列（帧数 + 字节双闸） |
 | 拨号 | `dial.go` | `dialConn`：升级头组装 / 401 轮转 / 升级错误面 |
-| 请求 | `exchange.go` | `wsExchange`：一次请求 = 一次 exchange；连接可跨同 ts 请求复用（默认关），保留 turn-state 快照与 `Next` 取帧 |
+| 请求 | `exchange.go` | `wsExchange`：一次请求 = 一次 exchange；连接可跨请求（含跨轮）复用（默认关），保留本次请求的 turn-state 快照与 `Next` 取帧 |
 | wire 编码 | `codec.go` | `frameCodec`：无可变状态；`encode` = 单遍快路径（`encodeOnePass`）+ 回退链（非常规形态） |
 | SSE 表示 | `sse.go` | `sseView`：帧 → SSE 字节流（仅 `StreamBody`） |
 
@@ -72,7 +72,7 @@ func WithResponsesTransport(t Transport) Option
 |---|---|---|
 | `StreamBody` | `*http.Response{200, 未读 SSE body, 上游头}` | `*http.Response{200, 帧渲染的 SSE body, Content-Type + x-codex-turn-state 合成头}` |
 | `Responses` | `Stream` → `responsesAggregator` → `HTTPResponse{200, Raw, TurnState}` | `responsesStreamWS` **直接从 exchange 取帧**喂同一个聚合器（不经 `sseView`/`scanSSE` 的渲染-回扫回路）→ 同形态、逐字段同构 |
-| turn-state | 请求头 `x-codex-turn-state`（`WithHeader` 下发）+ 响应头捕获 | 帧 `client_metadata."x-codex-turn-state"`（同一份 `WithHeader` 值，或 SDK 缓存的最近签发值）；握手响应头的签发值回写 `TurnState()` 与合成响应头；复用命中时没有握手，签发值来自缓存条目回填 |
+| turn-state | 请求头 `x-codex-turn-state`（`WithTurnStateProvider` 逐请求求值，`WithHeader` 兼容）+ 响应头捕获 | 帧 `client_metadata."x-codex-turn-state"`（每请求取值）；握手响应头签发值回写 `TurnState()`；`response.metadata` 事件的 ts 由 `turnStateTap` 逐帧旁路捕获（created 先记 response_id、归属匹配才接受）；合成响应头按 S5 判据回填（`effective != "" && effective == TurnState()`），跨轮不回填旧值 |
 | 读上限 | 聚合器单行 16MiB；裸 body 由下游决定 | 按取数路径固定：聚合 16MiB / 流式 64MiB（`WithReadLimit` 只作用于公开 `Dial`，传输臂的上限由取数路径决定）；两条取数路径不共享连接（16MiB / 64MiB） |
 | 请求体归一 | `FilterCodexHTTPPayload` + `store:false` + HTTP `client_metadata` | `frameCodec.encode(encodeWSResponses)`：协议形状差（`type`/续接键/`stream`）+ 白名单 + `store:false` + WS `client_metadata` 由**单遍编码器**一次落地；非常规形态回退 `buildResponsesCreateFrame` → 归一链 |
 | 401 轮转 | 判死分类 + 单飞 refresh + 重试一次 | 同（`dialConn` 内，`OAuthWithRotation`） |
@@ -151,8 +151,9 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 ## 连接复用
 
 默认关闭，`WithWSConnCache(n)`（n > 0，建议 2）开启每个 `HTTPClient` 的空闲连接缓存。
-连接身份是 `(turn-state, readLimit)`：同 ts、同取数路径才可复用；流式 64MiB 与聚合
-16MiB 不共享连接。Authorization token 必须仍一致，取出即独占，不做请求多路复用。
+连接身份是 `readLimit`（**不含** turn-state）：同一 `HTTPClient`、同取数路径即可复用；流式 64MiB 与聚合
+16MiB 不共享连接。ts 是轮级、每请求下发——与真实 codex 一致（连接 thread 级、换连接条件里没有 ts）。
+Authorization token 必须仍一致，取出即独占，不做请求多路复用。
 
 归还资格是读到终态、队列空且连接可用；取消、读写错误、提前关闭均终止连接。
 `StreamBody` 须读到终态后关闭 body 才归还；`Responses` 消费终态后自动归还。空闲期收到任何帧
@@ -162,15 +163,16 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 空闲条目，不中断在飞请求。清扫发生在心跳 tick 与取还时；`WithPingInterval(0)`
 关掉心跳后**只剩取还时清扫**——被丢弃的 `HTTPClient`（网关每轮重建）若此后不再有
 请求，其空闲连接只能等对端断开（服务端 60min 上限）；默认 30s 心跳下最迟
-5min 加一个 tick。`CloseIdleConnections()` 同时清 WS 缓存。
+5min 加一个 tick。`CloseIdleConnections()` 同时清 WS 缓存；只想清 WS 空闲连接、
+不动共享 `*http.Transport` 时用 `CloseWSIdleConnections()`。
 复用首帧只接受 `response.created`、`response.in_progress`、`error`、`*.metadata`
 或 `responsesapi.websocket_timing`，否则报 `errConnDesynced` 并终止。
 
 观测使用内部原子 `hits` / `misses`（不新增公开 API）：每次打开 exchange 计一次，
 只有实际移交成功才算 hit。bench 的 P6 验证一次 accept 与每个计时请求命中，R18
 验证 `accepts == misses` 且 `hits + misses == 请求数`。
-默认从同轮第 3 个请求起（调用方自带 turn-state 时第 2 个起），收益
-∝ 命中次数；一轮 1–2 个请求时默认无收益。若握手反复签发不同 ts，命中还会后移或为零。
+从同一 thread 的**第 2 个请求**起就有收益（跨轮同样命中），收益 ∝ 命中次数；
+每实例、每条取数路径各留一条空闲连接，容量按 2 规划。
 
 ## 已知限制
 
@@ -178,13 +180,12 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
   `error.message` / `error_code`，不整篇透传）。`DialError.Refreshed`（401 已轮转过）
   在 `*HTTPError` 信封上不可见（`StatusCode` + `Raw` + cause 链可见）。
   无升级响应的失败不再是 `DialError`（`StatusCode==0` 形态消失）。
-- **turn-state 的来源与首轮**：WS 臂认两处——`WithHeader(HeaderTurnState, ...)`
-  （网关既有的 per-request 注入手法；该头**不进升级头**，只进帧内
-  `client_metadata`）优先，否则用 `HTTPClient.TurnState()`（最近一次握手签发值）。
-  首帧不带 turn-state（与 HTTP 臂首请求一致），之后回传上一次签发值。跨轮清除靠
-  调用方的 client 生命周期（网关按 turn-state 值重建 `HTTPClient`；构造本身零
-  开销、懒建连接）——`HTTPClient` 未新增清除入口。连接身份含 ts，跨 ts 不复用；
-  复用不刷新 `TurnState()`，合成响应使用该连接最初握手签发值。
+- **turn-state 的来源与跨轮**：请求侧只认两处——`WithTurnStateProvider`
+  （每次请求求值，**优先**；网关的正式入口）与 `WithHeader(HeaderTurnState, ...)`
+  （兼容入口：该头**不进升级头**，WS 面只进帧内 `client_metadata`）。两者都空 ⇒
+  本次请求不带 ts。**不**回落 `HTTPClient.TurnState()`：缓存只作"上次签发过什么"
+  的观测面，当默认值会让跨轮第一个请求重放上一轮的 ts。跨轮只需清会话里的 ts
+  （provider 返回空），**连接不动**；`CloseWSIdleConnections()` 只清 WS 池。
 - **真实上游 in-band 429 未验证**：真实上游在 WS 帧里以 `type:"error"` 表达 429
   语义的情况未实证。当前按"一律透传"处理（与 HTTP 臂的 200 流一致），因此这类
   错误在非流式臂上表现为"事件流截断"而不是 429 —— 若上游确有该形态，需要重新
@@ -200,13 +201,17 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
   连接不再由 `ErrKeepaliveTimeout` 判死，只能靠读写错误或调用方 ctx 兜底。pull
   面沿用既有契约：心跳依赖调用方的常驻 `Recv`。
 - **连接可复用（默认关）**：默认关闭，`WithWSConnCache(n)` 开启；`StreamBody`
-  读到终态后由 `Body.Close()` 尝试归还，否则强断。单请求轮次无收益；
-  默认从同轮第 3 个请求起（调用方自带 turn-state 时第 2 个起），
-  收益 ∝ 命中次数；一轮 1–2 个请求时默认无收益。
+  读到终态后由 `Body.Close()` 尝试归还，否则强断。从同一 thread 的第 2 个请求起
+  就有收益（跨轮同样命中），收益 ∝ 命中次数；每实例、每条取数路径各一条空闲连接。
 - **关闭心跳会削弱空闲连接的退役**：`WithPingInterval(0)` 下没有心跳 tick，只剩取还时清扫；
   被丢弃的 `HTTPClient` 若此后不再有请求，其空闲连接最迟等到对端断开（服务端 60min 上限）。
   默认 30s 心跳下最迟 5min 加一个 tick，不受此限。
-- **事件流 turn-state 不跟随（T6）**：目前不从 `response.metadata` 事件头刷新 turn-state。
+- **事件流 turn-state（S3）**：`response.metadata` 的 `headers` 里带 ts 时，
+  `turnStateTap` 在取帧旁路捕获（不复制/不改写/不重排/不丢帧）。判定顺序：每帧先
+  取事件类型 → `response.created` 记 `response_id` → `*.metadata` 做子串快筛 →
+  归属匹配（`response_id == seenID && seenID != ""`）才写 `TurnState()` + observer。
+  fail-safe：created 到达前的 metadata 一律不捕获（`dropped` 计数 +1，帧照旧透传）。
+  合成响应头不可能承载后到的值（响应头在读到任何帧之前就已定死）——依赖 observer。
 - **回退链的白名单扫描是两次**（`buildResponsesCreateFrame` 内一次 + `normalize`
   再一次，与 T3 完全一致）：只有形态不在单遍覆盖内（非紧凑 / 转义键 / 重复键 /
   白名单外键）才走到；真实 codex 帧恒走单遍，那是 1 次。代价是这类形态比 T3 多付
@@ -250,8 +255,9 @@ metadata 组合）逐字节比对，另有两例分别钉住"运行期 3.7KB 形
 
 `transport_ws_test.go`（`httptest` + `websocket.Accept` 假上游）：帧→SSE 逐字节
 断言（含 in-band error 与 `[DONE]` 位置）、与 HTTP 臂合成体逐字段相等、
-`response.failed` 两臂同形、turn-state 四条路径（握手签发 → 回写 → 下一轮回传；
-`WithHeader` per-request 注入；升级头不携带；连接身份：ts 进缓存键，跨 ts 不复用）、帧构造五条规则 + 非对象根、关闭
+`response.failed` 两臂同形、turn-state 五条路径（请求侧 provider 逐请求求值 /
+`WithHeader` 兼容入口；升级头不携带；握手头与 `response.metadata` 事件捕获；
+S5 回填判据；**不**回落 `TurnState()` 缓存；连接身份只有 readLimit，跨轮复用）、帧构造五条规则 + 非对象根、关闭
 语义（1011 / 1005 / 1000 / 无 close 帧）、默认路径零 WS 连接、并发（`-race`）。
 
 `transport_ws_contract_test.go`（连接内核验收面，W1–W16）：

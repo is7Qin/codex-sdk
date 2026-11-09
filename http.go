@@ -28,9 +28,10 @@ const DefaultResponsesWSURL = "wss://chatgpt.com/backend-api/codex/responses"
 // http.Client——只做选项快照与升级头派生——首次 Do/Stream 才创建，连接池复用）。端点方法族：
 // Do/Stream（responses 固定端点）、GenerateImage / Search / GetUsage（各自固定官方端点）、Responses（合成非流式）。
 //
-// x-codex-turn-state 仅响应侧（真实 codex 客户端行为）：响应头/SSE 中的
-// turn-state 自动捕获，经 TurnState() / HTTPResponse.TurnState 暴露给网关；
-// HTTP 请求不携带 x-codex-turn-state 头（头回传仅 WS 路径，见 Client）。
+// x-codex-turn-state 是**轮级** token：请求侧由 WithTurnStateProvider（每次请求
+// 求值）或 WithHeader 给出，响应侧（HTTP 响应头 / WS 握手响应头 / WS 事件）自动
+// 捕获，经 TurnState() / HTTPResponse.TurnState 暴露并回调 WithTurnStateObserver。
+// TurnState() 是观测面，**不是**下一次请求的默认值（跨轮不得重放）。
 type HTTPClient struct {
 	auth Auth
 	opts options
@@ -43,7 +44,11 @@ type HTTPClient struct {
 	mu               sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
 	client           *http.Client
 	noRedirectClient *http.Client // 仅 StreamBody：禁跟随重定向（3xx 原样返回）
-	turnState        atomic.Value // string；x-codex-turn-state 响应侧捕获值
+	turnState        atomic.Value // string；x-codex-turn-state 最近签发值
+
+	// turnStateDropped 是事件级 ts 捕获里"归属判定丢弃"的计数（S3 观测面）：
+	// 只统计被丢掉的 ts 候选，不是帧计数。跨 goroutine 读，必须原子。
+	turnStateDropped atomic.Int64
 
 	// wsCache 是 WS 臂的空闲连接表：构造后不可变（nil = 复用关闭），
 	// 所以并发读它不需要加锁。
@@ -62,6 +67,18 @@ func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 		codec:     newFrameCodec(&cfg),
 		wsHeaders: wsUpgradeHeaders(cfg.headers),
 		wsCache:   newConnCacheIf(cfg.wsConnCache),
+	}
+}
+
+// CloseWSIdleConnections 只终止 WS 臂的空闲连接缓存，**不碰**底层 http.Transport。
+//
+// 与 CloseIdleConnections 的区别：后者会对 `*http.Transport` 断言并清空其空闲池；
+// 网关出口通常是包装型 transport（如分片 h2 池），断言失败即静默 no-op，而一旦
+// 哪天是裸 `*http.Transport` 又会打掉全站 h2 连接。丢弃一个 HTTPClient 时只需要
+// 关掉它自己的 WS 连接。
+func (c *HTTPClient) CloseWSIdleConnections() {
+	if c.wsCache != nil {
+		c.wsCache.clear()
 	}
 }
 
@@ -247,9 +264,10 @@ func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, er
 //
 // TransportWS 时改走上游 Responses WS（见 streamBodyWS）：对外形状完全一致
 // （StatusCode=200 / Body=SSE 字节流 / Header 含 x-codex-turn-state），错误语义
-// 见 TRANSPORT.md。WithWSConnCache(n) 可开启默认关闭的连接复用，仅同 ts、
-// 同 readLimit 的连续请求可命中；读到终态后必须关闭 Body 才能归还。
-// 与 Responses 的聚合路径不共享连接，收益边界见 TRANSPORT.md 的连接复用段。
+// 见 TRANSPORT.md。WithWSConnCache(n) 可开启默认关闭的连接复用：连接身份只含
+// readLimit（不含 turn-state），同一 client 上的连续请求——含跨轮——都可命中；
+// 读到终态后必须关闭 Body 才能归还。与 Responses 的聚合路径不共享连接，收益
+// 边界见 TRANSPORT.md 的连接复用段。
 func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte) (*http.Response, error) {
 	if c.opts.responsesTransport == TransportWS {
 		return c.streamBodyWS(ctx, payload, wsStreamReadLimit)
@@ -416,12 +434,18 @@ func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL
 	// 伪装层默认头（WithHeader 可覆盖）。HTTP 不发 OpenAI-Beta 与 trace 头
 	// （真实客户端行为）；需要 beta 时调用方以 WithHeader 显式注入。
 	applyDefaultHeaders(req.Header)
-	// 注意：HTTP 请求不携带 x-codex-turn-state 头（真实客户端行为——
-	// turn-state 仅响应侧，WS 路径才回传，见 Client）。
+	// 注意：默认**不**携带 x-codex-turn-state（真实客户端只在取得 ts 后才带）；
+	// 本次请求的 ts 由 provider / WithHeader 显式给出（见下方逐请求写入点）。
 	// 账号标识头（ChatGPT 系 auth 恒发；空 = 不发，向后兼容）。
 	applyAccountID(req.Header, c.auth)
-	// 调用方 WithHeader：覆盖默认头（先删后加），同名多次调用为扩展。
+	// 调用方 WithHeader：逐请求应用（先删后加，同名多次调用为扩展）。
 	applyHeaderOverrides(req.Header, c.opts.headers)
+	// 逐请求 turn-state（S2）：provider > WithHeader > 空串。与上一行的区别是
+	// 优先级更高、且**每次请求重新求值**；它不进连接身份，也不回落到 TurnState()
+	// 缓存（缓存只作观测面）。
+	if ts := c.effectiveTurnState(); ts != "" {
+		req.Header.Set(HeaderTurnState, ts)
+	}
 	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 上游请求失败: %w", err)
@@ -455,11 +479,30 @@ func respWithBody(orig *http.Response, status int, body []byte) *http.Response {
 	}
 }
 
-// TurnState 返回最近一次响应捕获的 x-codex-turn-state（仅响应侧暴露——
-// HTTP 请求不携带该头，头回传仅 WS 路径）。
+// TurnState 返回最近一次签发的 x-codex-turn-state（HTTP 响应头 / WS 握手响应头 /
+// WS response.metadata 事件三处捕获，非空才覆盖）。
+//
+// 它是**观测面**（"上次签发过什么"），不是下一次请求的默认值：请求侧的取值由
+// WithTurnStateProvider / WithHeader 决定，绝不回落本缓存（否则跨轮必重放旧 ts）。
 func (c *HTTPClient) TurnState() string {
 	v, _ := c.turnState.Load().(string)
 	return v
+}
+
+// syntheticTurnState 是合成响应头（以及非流式 HTTPResponse.TurnState）的回填判据
+// （S5，流式与聚合两臂共用这一条）：
+//
+//	lastIssued := c.TurnState()
+//	backfill := effective != "" && effective == lastIssued
+//
+// 轮内复用（effective == 最近签发值）⇒ 回填（本次请求确实带了这个 ts）；
+// 跨轮（effective == "" 或已被 provider 换成新值）⇒ **不回填**，绝不让上一轮的
+// 旧值出现在响应里被当成本轮签发值再存一次。
+func (c *HTTPClient) syntheticTurnState(effective string) string {
+	if effective != "" && effective == c.TurnState() {
+		return effective
+	}
+	return ""
 }
 
 // captureTurnState 从响应头捕获 x-codex-turn-state（非空才覆盖）。
@@ -469,11 +512,16 @@ func (c *HTTPClient) captureTurnState(resp *http.Response) {
 	}
 }
 
-// captureTurnStateValue 直接捕获 turn-state 字面值（非空才覆盖）。WS 臂用它
-// 回写握手响应头签发值（Client.TurnState()）——与 HTTP 臂读 resp.Header 同义。
+// captureTurnStateValue 直接捕获 turn-state 字面值（非空才覆盖），并同步调用
+// WithTurnStateObserver——三处捕获点（HTTP 响应头 / WS 握手响应头 / WS 事件）
+// 共用这一个写入口，观测者不会漏掉任何一条路径。
 func (c *HTTPClient) captureTurnStateValue(v string) {
-	if v != "" {
-		c.turnState.Store(v)
+	if v == "" {
+		return
+	}
+	c.turnState.Store(v)
+	if fn := c.opts.turnStateObserver; fn != nil {
+		fn(v)
 	}
 }
 

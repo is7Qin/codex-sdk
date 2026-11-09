@@ -31,22 +31,26 @@ type connSink interface {
 	put(*wsExchange) bool
 }
 
-// connKey 是一条可复用连接的身份（§3.2）。T5.1 只负责把它带在 exchange 上；
-// T5.2 用它做缓存键。
+// connKey 是一条可复用连接的身份（S1）。
+//
+// 身份里**没有** turn-state：真实 codex 的 WS 连接是 thread 级、跨轮缓存复用，
+// 换连接条件（runtime_id / responses_headers / connection_key / 路由亲和 /
+// 连接已关 / auth owner 变）不含 ts；ts 是轮级、每请求随 client_metadata 下发
+// （spec §1 E4/E5/E8）。把 ts 放进连接身份会让"每轮换连接"成为必然。
 //
 // readLimit 必须进键：两条取数路径的单帧内存上界不同（64MiB / 16MiB），按路径
 // 拨号时就把上限固定了，共享连接会把聚合臂的单帧上界放大 4 倍。
 type connKey struct {
-	turnState string // 本次请求生效的 x-codex-turn-state（"" = 无）
 	readLimit int64
 }
 
 // wsExchange 是一次 Responses WS 请求的生命周期：一条连接 + 取帧入口 + 本次
-// 握手签发值（合成响应的 x-codex-turn-state 头靠它对外可见）。conn 不知道
-// "请求"，exchange 不知道"socket"。
+// 请求生效的 turn-state 与本次握手签发值。conn 不知道"请求"，exchange 不知道
+// "socket"。
 //
-// 生效 turn-state 只出现在 `key.turnState` 里（它同时是缓存键与"本次请求用了哪个
-// ts"的唯一记录）；不再单开一个字段——那只会让人以为它还有别的读者。
+// effective 是"本次请求下发/签发时用的 ts"的唯一记录（S1 之后它不再进连接身份，
+// 所以必须单开字段）：请求侧由 provider/WithHeader 决定，合成响应头的回填判据
+// 要用它（S5）。
 //
 // 收尾契约（Release/Close 先到者生效）：
 //
@@ -56,12 +60,13 @@ type connKey struct {
 //
 // stopWatch() 的返回值故意忽略：它只能"尽力"注销，真正互斥的是第 3 步的 CAS。
 type wsExchange struct {
-	cn     *conn
-	sink   connSink // nil = 复用关闭（T5.1 恒 nil）
-	key    connKey
-	issued string    // 本次握手签发值（空 = 上游未签发）
-	token  string    // 本次升级头使用的 Authorization（401 轮转后是新的一份）
-	bornAt time.Time // 拨号起始时刻（maxAge 起点，命中不重置）
+	cn        *conn
+	sink      connSink // nil = 复用关闭
+	key       connKey
+	effective string    // 本次请求生效的 turn-state（"" = 不带）
+	issued    string    // 本次握手签发值（空 = 上游未签发）
+	token     string    // 本次升级头使用的 Authorization（401 轮转后是新的一份）
+	bornAt    time.Time // 拨号起始时刻（maxAge 起点，命中不重置）
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -125,7 +130,7 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, readLimit 
 		cancel()
 		return nil, err
 	}
-	key := connKey{turnState: effective, readLimit: readLimit}
+	key := connKey{readLimit: readLimit}
 	// sink 是归还口：**必须**在 nil 时保持真正的 nil 接口（typed-nil 陷阱：
 	// 把 (*connCache)(nil) 装进接口后 e.sink == nil 为假，Release 会调进去）。
 	var sink connSink
@@ -146,7 +151,7 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, readLimit 
 			return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", terr)
 		}
 		if cc, ok := cache.get(key, token); ok {
-			e := c.activate(exchangeCtx, cancel, cc.cn, cc.key,
+			e := c.activate(exchangeCtx, cancel, cc.cn, cc.key, effective,
 				handshake{turnState: cc.issued, token: cc.token, bornAt: cc.bornAt}, true, sink)
 			// 复查 + 解栏。顺序是契约：解栏在写 create 帧**之前**——反过来的话，
 			// 一个响应极快的上游会在我们写完的几微秒内回帧，撞上 fenced 被判废。
@@ -181,9 +186,9 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, readLimit 
 	}
 	// 本次握手签发值回写（HTTP 臂在这里读 resp.Header；WS 面只有这一个观测点）。
 	// 顺序不能反：帧已按 effective 编码，回写不会污染本轮帧。命中路径没有握手，
-	// 所以不回写（合成的 x-codex-turn-state 头由 cache 条目里的 issued 提供）。
+	// 所以不回写（合成响应头的回填判据见 S5：比较 effective 与 TurnState()）。
 	c.captureTurnStateValue(hs.turnState)
-	e := c.activate(exchangeCtx, cancel, cn, key, hs, false, sink)
+	e := c.activate(exchangeCtx, cancel, cn, key, effective, hs, false, sink)
 	if werr := cn.write(exchangeCtx, frame); werr != nil {
 		e.teardown(werr) // 写失败不重试、不重拨（response.create 可能已进 socket）
 		return nil, werr
@@ -196,18 +201,19 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, readLimit 
 // 次序是契约：lease 必须先 Store 再注册 AfterFunc。若注册时 ctx 已经取消，回调会
 // 立刻在新 goroutine 里跑；此时 lease 还没落地的话 CAS 必失败 ⇒ 没人终止这条连接，
 // 而 write 只查 err()/isClosing()，会把 response.create 照常写出去。
-func (c *HTTPClient) activate(ctx context.Context, cancel context.CancelFunc, cn *conn, key connKey, hs handshake, reused bool, sink connSink) *wsExchange {
+func (c *HTTPClient) activate(ctx context.Context, cancel context.CancelFunc, cn *conn, key connKey, effective string, hs handshake, reused bool, sink connSink) *wsExchange {
 	e := &wsExchange{
-		cn:     cn,
-		sink:   sink,
-		key:    key,
-		issued: hs.turnState,
-		token:  hs.token,
-		bornAt: hs.bornAt,
-		ctx:    ctx,
-		cancel: cancel,
-		reused: reused,
-		first:  true,
+		cn:        cn,
+		sink:      sink,
+		key:       key,
+		effective: effective,
+		issued:    hs.turnState,
+		token:     hs.token,
+		bornAt:    hs.bornAt,
+		ctx:       ctx,
+		cancel:    cancel,
+		reused:    reused,
+		first:     true,
 	}
 	cn.lease.Store(e)
 	e.stopWatch = context.AfterFunc(ctx, func() {
