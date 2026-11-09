@@ -492,13 +492,21 @@ func (c *HTTPClient) TurnState() string {
 // syntheticTurnState 是合成响应头（以及非流式 HTTPResponse.TurnState）的回填判据
 // （S5，流式与聚合两臂共用这一条）：
 //
-//	lastIssued := c.TurnState()
-//	backfill := effective != "" && effective == lastIssued
+//	backfill := !reused || (effective != "" && effective == c.TurnState())
+//	值：      !reused ⇒ issued；否则 effective
 //
-// 轮内复用（effective == 最近签发值）⇒ 回填（本次请求确实带了这个 ts）；
-// 跨轮（effective == "" 或已被 provider 换成新值）⇒ **不回填**，绝不让上一轮的
-// 旧值出现在响应里被当成本轮签发值再存一次。
-func (c *HTTPClient) syntheticTurnState(effective string) string {
+// 为什么"握手路径必须回填"：一次真实的握手响应头是 ts 的**唯一发现通道**——
+// 事件级 ts（response.metadata）是后到的，进不了已经定死的合成响应头；HTTP 请求
+// 的响应头也一样。所以只要本次 exchange 真的握手了，本次签发值（issued）就是
+// 新鲜值，永远该回显（issued 为空 = 上游没签发，那就不带）。
+//
+// 命中复用没有新握手：只有"本次请求带的 ts 仍等于最近签发值"（轮内复用）才回填；
+// 跨轮（未带 / 已被 provider 换成新值）一律不回填旧值——否则上一轮的值会被下游
+// 当成本轮的签发值再存一次，下一请求就会重放它。
+func (c *HTTPClient) syntheticTurnState(issued, effective string, reused bool) string {
+	if !reused {
+		return issued
+	}
 	if effective != "" && effective == c.TurnState() {
 		return effective
 	}

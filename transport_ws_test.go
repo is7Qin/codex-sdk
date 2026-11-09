@@ -463,9 +463,8 @@ func TestResponsesWSTruncatedOnIncomplete(t *testing.T) {
 // ---- 3. turn-state 握手签发 → 回写；请求侧不回落缓存 ----
 
 // TestResponsesWSTurnStateCapturedNoReplay：握手响应头签发值回写 HTTPClient.TurnState()
-// （与 HTTP 臂读 resp.Header 同义），但**不**自动成为下一次请求的 ts——缓存只是
-// 观测面，跨轮不得重放（S2）。合成响应头按 S5 判据：只有"本次请求带的 ts == 最近
-// 签发值"才回填，所以首轮（请求未带 ts）不回填。
+// 并回填到合成响应头（S5 的"真握手"分支：那是 ts 的唯一发现通道），但**不**自动
+// 成为下一次请求的 ts——缓存只是观测面，跨轮不得重放（S2）。
 func TestResponsesWSTurnStateCapturedNoReplay(t *testing.T) {
 	up := newWSUpstream(t)
 	up.setTurnState("ts-issued-1")
@@ -481,14 +480,14 @@ func TestResponsesWSTurnStateCapturedNoReplay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 第 1 轮：上游签发 ts-issued-1。请求没带 ts ⇒ 合成响应头不回填（S5），
-	// 但签发值仍进 TurnState()（观测面）。
+	// 第 1 轮：上游签发 ts-issued-1。请求没带 ts，但本次真的握手了 ⇒ 合成响应头
+	// 回填本次签发值（S5 新鲜值分支），同时回写 TurnState()（观测面）。
 	resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
 	if err != nil {
 		t.Fatalf("第 1 次 StreamBody: %v", err)
 	}
-	if got := resp.Header.Get(HeaderTurnState); got != "" {
-		t.Fatalf("合成响应头 %s = %q, 期望空（本次请求未带 ts，S5 不回填）", HeaderTurnState, got)
+	if got := resp.Header.Get(HeaderTurnState); got != "ts-issued-1" {
+		t.Fatalf("合成响应头 %s = %q, 期望 ts-issued-1（真握手必须回填本次签发值）", HeaderTurnState, got)
 	}
 	_ = readAllBody(t, resp.Body)
 	if got := hc.TurnState(); got != "ts-issued-1" {
@@ -503,14 +502,14 @@ func TestResponsesWSTurnStateCapturedNoReplay(t *testing.T) {
 	}
 
 	// 第 2 轮：**不**回放上一轮签发值（请求侧取值不回落到 TurnState()）；
-	// 上游再签发 ts-issued-2，只更新观测面。
+	// 本轮又拨了一条新连接（缓存关闭）⇒ 真握手 ⇒ 回填它自己的签发值 ts-issued-2。
 	up.setTurnState("ts-issued-2")
 	resp2, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
 	if err != nil {
 		t.Fatalf("第 2 次 StreamBody: %v", err)
 	}
-	if got := resp2.Header.Get(HeaderTurnState); got != "" {
-		t.Fatalf("第 2 轮合成响应头 = %q, 期望空（不得回填旧值）", got)
+	if got := resp2.Header.Get(HeaderTurnState); got != "ts-issued-2" {
+		t.Fatalf("第 2 轮合成响应头 = %q, 期望 ts-issued-2（本次签发值，不得是上一轮的旧值）", got)
 	}
 	_ = readAllBody(t, resp2.Body)
 	frames := up.sentFrames(t)

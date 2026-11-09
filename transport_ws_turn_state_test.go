@@ -237,6 +237,40 @@ func TestTurnStateCrossRoundReuse(t *testing.T) {
 	}
 }
 
+// TestTurnStateIntraTurnReuseBackfills（S5 第 2 支）：命中复用且本次请求带的 ts 仍
+// 等于最近签发值（轮内重试）⇒ 合成响应头回填同一个值；连接不重拨。
+func TestTurnStateIntraTurnReuseBackfills(t *testing.T) {
+	up := newTSUpstream(t, func(i int, _ []byte) []string {
+		id := fmt.Sprintf("resp_intra_%d", i+1)
+		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
+	})
+	up.setHandshake("ts-intra")
+	prov := &tsProvider{}
+	prov.set("ts-intra")
+	hc := up.client(t, WithWSConnCache(2), WithTurnStateProvider(prov.get))
+
+	resp1, _ := doStreamBodyFull(t, hc)
+	if got := resp1.Header.Get(HeaderTurnState); got != "ts-intra" {
+		t.Fatalf("第 1 次（真握手）合成响应头 = %q, 期望 ts-intra", got)
+	}
+	resp2, _ := doStreamBodyFull(t, hc) // 命中复用，provider 仍返回同一个 ts
+	if got := resp2.Header.Get(HeaderTurnState); got != "ts-intra" {
+		t.Fatalf("第 2 次（轮内复用）合成响应头 = %q, 期望 ts-intra（effective == 最近签发值）", got)
+	}
+	if got := up.accepts.Load(); got != 1 {
+		t.Fatalf("accepts = %d, 期望 1（轮内复用不重拨）", got)
+	}
+	frames := up.sentFrames(t)
+	if len(frames) != 2 {
+		t.Fatalf("上游收到 %d 帧, 期望 2 帧", len(frames))
+	}
+	for i := range frames {
+		if got := frameTurnState(t, frames[i]); got != "ts-intra" {
+			t.Fatalf("第 %d 轮帧 ts = %q, 期望 ts-intra", i+1, got)
+		}
+	}
+}
+
 // TestTurnStateAggregateArmSameCriterion（S5 共用判据）：同一个 client 跨轮两次
 // Responses（聚合臂）：连接复用，第二轮的 HTTPResponse.TurnState 不得回填旧值。
 func TestTurnStateAggregateArmSameCriterion(t *testing.T) {

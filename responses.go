@@ -36,7 +36,8 @@ const (
 // 与 Do 的区别：Do 是通用非流式 POST（对 codex responses 端点 400 不可用）；
 // 本方法走 Stream 合成——网关以非流式语义消费（一次性响应）。
 // 返回 HTTPResponse{StatusCode, Raw, TurnState}（与 Do 同形态；TurnState 按 S5
-// 判据回填——只有"本次请求带的 ts == 最近签发值"才非空；跨轮不回填旧值）。
+// 判据回填——真握手/新鲜响应回填本次签发值，命中复用只在"本次请求带的 ts ==
+// 最近签发值"时回填；跨轮不回填旧值）。
 // 错误透传同 Stream（HTTPError 信封 / fatal 五类 / 401 判死轮转）。
 //
 // TransportWS 时取数改走上游 Responses WS（StreamBody 的 ws 臂 + 同一个
@@ -58,25 +59,28 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 		}
 	}
 	agg := &responsesAggregator{}
-	// effective 是本次请求生效的 turn-state（ws 臂由 exchange 回传，HTTP 臂按
-	// 同一优先级重算一次——两臂对"本次带的是什么"必须一致）。
-	effective := ""
+	// turn-state 快照：ws 臂由 exchange 回传；HTTP 臂没有连接复用，稍后用本次响应头
+	// 的捕获值充当"新鲜签发值"（见下方 S5 回填点）。
+	snap := turnStateSnapshot{}
 	if c.opts.responsesTransport == TransportWS {
 		var err error
 		// ws 臂：responsesStreamWS 直接从 exchange 取帧喂聚合器（不经 sseView
 		// 渲染 + scanSSE 回扫）。终态帧喂进聚合器后不再取帧，所以只有"终态之后
 		// 才到"的取消/超时可以豁免，其余错误原样透传。
-		effective, err = c.responsesStreamWS(ctx, wire, agg.feed)
+		snap, err = c.responsesStreamWS(ctx, wire, agg.feed)
 		if err != nil {
 			if !agg.completed || !isContextError(err) {
 				return nil, err // 上游/传输错误透传（response.failed 事件级 HTTPError 同样原样）
 			}
 		}
 	} else {
-		effective = c.effectiveTurnState()
+		snap.effective = c.effectiveTurnState()
 		if err := c.Stream(ctx, wire, agg.feed); err != nil {
 			return nil, err // 上游错误（HTTPError/fatal 五类/401 轮转）/ response.failed 事件级错误透传
 		}
+		// HTTP 臂每个请求都是一次全新的响应：响应头（已在上面的 Stream 里捕获）
+		// 就是新鲜签发值，等价于"刚握手"。
+		snap.issued, snap.reused = c.TurnState(), false
 	}
 	if !agg.completed {
 		// 截断：流结束（[DONE] 与 EOF 统一）未达 response.completed → 错误返回，
@@ -90,9 +94,9 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 	return &HTTPResponse{
 		StatusCode: http.StatusOK,
 		Raw:        body,
-		// S5：与流式臂共用的回填判据——只回填"本次请求带的 ts 仍等于最近签发值"
-		// 的情况；跨轮（未带 / 已换成新值）绝不把旧值当成这一轮的签发值。
-		TurnState: c.syntheticTurnState(effective),
+		// S5：与流式臂共用的回填判据——真握手回填本次签发值；命中复用只在轮内
+		// 相等时回填，跨轮绝不把旧值当成这一轮的签发值。
+		TurnState: c.syntheticTurnState(snap.issued, snap.effective, snap.reused),
 	}, nil
 }
 

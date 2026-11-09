@@ -138,8 +138,10 @@
 //
 // WS 传输臂的连接身份只含 readLimit（不含 turn-state）：连接是 thread 级、跨轮
 // 复用，ts 是轮级、每请求下发——与真实 codex 的换连接条件一致（因为
-// responses_headers 不含 ts）。合成响应头按 S5 判据回填：只有"本次请求带的 ts
-// 仍等于最近签发值"才出现，跨轮/换值一律不回填。事件级捕获（response.metadata
+// responses_headers 不含 ts）。合成响应头按 S5 判据回填：本次真的握手 ⇒ 回填本次
+// 签发值（那是 ts 的唯一发现通道，事件 ts 后到、挤不进已定死的响应头）；命中复用
+// 则只在"本次请求带的 ts == 最近签发值"（轮内）时回填，跨轮/换值一律不回填。事件
+// 级捕获（response.metadata
 // 的 headers）经 turnStateTap 逐帧旁路完成：created 先记 response_id，归属匹配
 // 才写 TurnState() + observer，fail-safe 是"created 之前的 metadata 一律不捕获"。
 //

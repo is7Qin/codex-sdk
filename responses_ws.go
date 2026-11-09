@@ -82,10 +82,10 @@ func (c *HTTPClient) streamBodyWS(ctx context.Context, payload []byte, readLimit
 	}
 	hdr := make(http.Header, 2)
 	hdr.Set("Content-Type", "text/event-stream")
-	// S5：只有"本次请求带的 ts 仍等于最近签发值"才回填（轮内复用）。
-	// 跨轮（未带 / 已被 provider 换成新值）不回填旧值——后到的事件 ts 走 observer，
-	// 不可能挤进这行（响应头在读到任何帧之前就已定死）。
-	if ts := c.syntheticTurnState(ex.effective); ts != "" {
+	// S5：真握手 ⇒ 回填本次签发值（ts 的唯一发现通道：后到的事件 ts 挤不进这行，
+	// 响应头在读到任何帧之前就已定死）；命中复用 ⇒ 仅当"本次请求带的 ts 仍等于最近
+	// 签发值"才回填，跨轮（未带 / 已被 provider 换成新值）不回填旧值。
+	if ts := c.syntheticTurnState(ex.issued, ex.effective, ex.reused); ts != "" {
 		hdr.Set(HeaderTurnState, ts)
 	}
 	return &http.Response{
@@ -118,13 +118,16 @@ func (c *HTTPClient) streamBodyWS(ctx context.Context, payload []byte, readLimit
 // 是终态时 **照样** Release——连接状态与下游解析失败无关，杀掉它只会让下一个
 // 请求多付一次握手。
 //
-// 返回本次请求生效的 turn-state（"" = 未带）：调用方按 S5 判据决定合成响应头/
-// HTTPResponse.TurnState 是否回填，**不额外求值 provider**（一次请求只求值一次）。
-func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, feed func(raw []byte) error) (string, error) {
+// 返回本次 exchange 的 turn-state 快照（生效值 / 本次签发值 / 是否命中复用）：
+// 调用方按 S5 判据决定合成响应头与 HTTPResponse.TurnState 是否回填，**不额外求值
+// provider**（一次请求只求值一次）。
+func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, feed func(raw []byte) error) (turnStateSnapshot, error) {
 	ex, err := c.openWSExchange(ctx, payload, wsResponsesReadLimit)
 	if err != nil {
-		return "", err
+		return turnStateSnapshot{}, err
 	}
+	// 快照只读 exchange 构造后不再变化的字段，取帧结束/连接归还之后读仍安全。
+	snap := turnStateSnapshot{effective: ex.effective, issued: ex.issued, reused: ex.reused}
 	// 事件级 ts 捕获（S3）与流式臂共用同一个装饰器；Release 之后这个 defer 是
 	// no-op（wsExchange.closed）。
 	tap := c.turnStateTapFor(ex)
@@ -132,23 +135,34 @@ func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, feed
 	for {
 		raw, nextErr := tap.Next(ex.ctx)
 		if nextErr == io.EOF { // close frame / 正常收尾：截断与否由调用方按终态判定
-			return ex.effective, nil
+			return snap, nil
 		}
 		if nextErr != nil {
-			return ex.effective, fmt.Errorf("codexsdk: 读取响应流失败: %w", nextErr)
+			return snap, fmt.Errorf("codexsdk: 读取响应流失败: %w", nextErr)
 		}
 		term := isTerminalEvent(raw)
 		if ferr := feed(raw); ferr != nil {
 			if term {
 				tap.Release()
 			}
-			return ex.effective, ferr
+			return snap, ferr
 		}
 		if term { // 终态帧已 feed ⇒ 本次取数完成
 			tap.Release()
-			return ex.effective, nil
+			return snap, nil
 		}
 	}
+}
+
+// turnStateSnapshot 是一次 WS exchange 的 turn-state 快照（S5 回填判据的输入）。
+//
+// effective 是本次请求下发的 ts（"" = 未带）；issued 是本次握手签发值（命中复用
+// 时是该连接当初的握手值，仅作记录）；reused 表示本次是否命中复用——它决定回填
+// 走"新鲜签发值"还是"轮内相等"分支。
+type turnStateSnapshot struct {
+	effective string
+	issued    string
+	reused    bool
 }
 
 // isTerminalEvent 报告 raw 是否为本次请求的终态事件（completed / failed /
