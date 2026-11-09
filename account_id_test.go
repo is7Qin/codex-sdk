@@ -123,8 +123,10 @@ func TestAccountIDWSHandshake(t *testing.T) {
 	url, gate := startAccountIDWSGate(t, func(auth string) bool { return true })
 	ctx := context.Background()
 	c, err := Dial(ctx,
-		OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-1")),
+		OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-1")), Identity{},
+
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -191,7 +193,7 @@ func TestAccountIDHTTPDoAndStream(t *testing.T) {
 		t.Cleanup(srv.Close)
 		hc := NewHTTPClient(PAT("t", WithPATAccountID("acc-1")),
 			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-		if err := hc.Stream(ctx, []byte(`{}`), func(raw []byte) error { return nil }); err != nil {
+		if err := hc.Stream(ctx, []byte(`{}`), Identity{}, func(raw []byte) error { return nil }); err != nil {
 			t.Fatalf("Stream: %v", err)
 		}
 		mu.Lock()
@@ -229,8 +231,9 @@ func TestAccountIDBackwardCompat(t *testing.T) {
 
 	// WS 面：自定义 Auth 同样无头无 panic
 	url, st := startEchoServer(t, "")
-	c, err := Dial(ctx, bareTestAuth{token: "t"},
+	c, err := Dial(ctx, bareTestAuth{token: "t"}, Identity{},
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+
 	if err != nil {
 		t.Fatalf("Dial 自定义 Auth: %v", err)
 	}
@@ -255,8 +258,9 @@ func TestAccountIDRotationRedial(t *testing.T) {
 	url, gate := startAccountIDWSGate(t, func(auth string) bool { return auth == "Bearer at-new" })
 	auth := OAuthWithRotation("rt-0",
 		WithInitialAccessToken("at-old"), WithOAuthAccountID("acc-5"))
-	c, err := Dial(context.Background(), auth,
+	c, err := Dial(context.Background(), auth, Identity{},
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -573,9 +577,11 @@ func TestAccountIDWSOverrideAndTrim(t *testing.T) {
 	t.Run("WS WithHeader 后写赢", func(t *testing.T) {
 		url, gate := startAccountIDWSGate(t, func(auth string) bool { return true })
 		c, err := Dial(ctx,
-			OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-default")),
+			OAuthWithRotation("rt-0", WithInitialAccessToken("at-1"), WithOAuthAccountID("acc-default")), Identity{},
+
 			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
 			WithHeader("ChatGPT-Account-ID", "ws-override"))
+
 		if err != nil {
 			t.Fatalf("Dial: %v", err)
 		}
@@ -589,8 +595,10 @@ func TestAccountIDWSOverrideAndTrim(t *testing.T) {
 	t.Run("首尾空白 trim 后发送", func(t *testing.T) {
 		url, gate := startAccountIDWSGate(t, func(auth string) bool { return true })
 		c, err := Dial(ctx,
-			PAT("t", WithPATAccountID("  acc-trim  ")),
+			PAT("t", WithPATAccountID("  acc-trim  ")), Identity{},
+
 			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+
 		if err != nil {
 			t.Fatalf("Dial: %v", err)
 		}

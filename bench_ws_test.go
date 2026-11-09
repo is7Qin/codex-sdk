@@ -169,22 +169,21 @@ func BenchmarkFrameCodecPrepare3KB(b *testing.B) {
 	if n := len(wsBenchPayload); n < 3600 || n > 3800 {
 		b.Fatalf("wsBenchPayload 长度 %d 越界（要求 3600–3800）", n)
 	}
-	fc := newFrameCodec(&options{
-		meta: &CodexMeta{
+	fc := newFrameCodec(&options{traceAuto: true, turnAuto: true})
+	id := Identity{
+		Session: Session{SessionID: "bench-session", ThreadID: "bench-thread", WindowID: "bench-thread:0"},
+		Meta: CodexMeta{
 			InstallationID: "bench-installation",
 			SessionID:      "bench-session",
 			ThreadID:       "bench-thread",
 			WindowID:       "bench-thread:0",
 		},
-		session:   &Session{SessionID: "bench-session", ThreadID: "bench-thread", WindowID: "bench-thread:0"},
-		traceAuto: true,
-		turnAuto:  true,
-	})
+	}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(wsBenchPayload)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		out, err := fc.encode(wsBenchPayload, encodeWSResponses, frameInput{Now: time.Now()})
+		out, err := fc.encode(wsBenchPayload, encodeWSResponses, frameInput{Identity: id, Now: time.Now()})
 		if err != nil {
 			b.Fatalf("frameCodec.encode: %v", err)
 		}
@@ -263,7 +262,7 @@ func BenchmarkWSStreamBodyPerRequest(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		resp, err := hc.StreamBody(ctx, wsBenchPayload)
+		resp, err := hc.StreamBody(ctx, wsBenchPayload, Identity{})
 		if err != nil {
 			b.Fatalf("StreamBody: %v", err)
 		}
@@ -287,7 +286,7 @@ func BenchmarkWSResponsesPerRequest(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		resp, err := hc.Responses(ctx, wsBenchPayload)
+		resp, err := hc.Responses(ctx, wsBenchPayload, Identity{})
 		if err != nil {
 			b.Fatalf("Responses: %v", err)
 		}

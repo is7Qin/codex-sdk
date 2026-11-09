@@ -70,7 +70,7 @@ func BenchmarkWSStreamBodyReused(b *testing.B) {
 	ctx := b.Context()
 
 	round := func() error {
-		resp, err := hc.StreamBody(ctx, wsBenchPayload)
+		resp, err := hc.StreamBody(ctx, wsBenchPayload, reuseIdentity())
 		if err != nil {
 			return err
 		}
@@ -128,7 +128,7 @@ func TestWSReuseR18Counters(t *testing.T) {
 	t.Cleanup(hc.CloseIdleConnections)
 	const requests = 8
 	for i := 0; i < requests; i++ {
-		resp, err := hc.StreamBody(t.Context(), wsBenchPayload)
+		resp, err := hc.StreamBody(t.Context(), wsBenchPayload, reuseIdentity())
 		if err != nil {
 			t.Fatal(err)
 		}

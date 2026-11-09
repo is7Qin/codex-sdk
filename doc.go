@@ -32,13 +32,13 @@
 //     （WS 帧面 8 key 恒发：installation_id/session_id/thread_id/turn_id/
 //     window_id/turn-metadata/traceparent/tracestate；HTTP 体面恒 4 key +
 //     turn_id + 条件键，不含 trace/turn-state，见 injectResponsesClientMetadata；
-//     客户端自带的 client_metadata 永不透传）、透传（HTTP 头 WithHeader / WS
-//     client_metadata 任意键 WithClientMetadata，只注入不解析——如 responses-lite
-//     标记 HeaderResponsesLite / MetaResponsesLiteKey）、会话标识握手头（WithSession）、
-//     x-codex-turn-state（轮级 token：请求侧 WithTurnStateProvider 每次请求求值 /
-//     WithHeader 兼容入口，值落 HTTP 请求头或 WS 帧内 client_metadata；响应侧
-//     HTTP 头 / WS 握手头 / WS response.metadata 事件三处捕获，经 TurnState() 与
-//     WithTurnStateObserver 暴露）、每帧新 trace 与 turn_id（UUIDv7）
+//     客户端自带的 client_metadata 永不透传）、身份完全请求级（Identity：
+//     Session/Meta/TurnState/Sink；WS 帧与 HTTP 体 client_metadata、WS 握手头都从
+//     Identity 取；默认头不得携带身份键——WithHeader 遇保留键构造期 panic）、
+//     x-codex-turn-state（轮级 token：请求侧 Identity.TurnState，值落 HTTP 请求头
+//     或 WS 帧内 client_metadata；响应侧 HTTP 头 / WS 握手头 / WS
+//     response.metadata 事件三处捕获后只回调 Identity.Sink，SDK 不保留状态）、
+//     每帧新 trace 与 turn_id（UUIDv7）
 //     ChatGPT-Account-ID（AccountIDProvider 可选接口：rotationAuth 经
 //     WithOAuthAccountID / patAuth 经 WithPATAccountID 显式注入——空 = 不发，
 //     向后兼容；OAuth(tokenProvider) 回调型不实现该接口）：上线形态经 Go
@@ -106,13 +106,14 @@
 //     StreamBody 由 Body.Close 触发归还；Responses 消费终态后自动归还。
 //     注意：WithPingInterval(0) 关闭心跳后，传输臂仍有常驻读者服务 pong，但不再
 //     探测"对端是否还活着"（半开连接只能靠读写错误或调用方 ctx 兜底）。
-//   - WithWSConnCache(n) 开启默认关闭的 WS 连接复用：同一个 HTTPClient 上的
-//     连续请求——含跨轮——命中后不再付握手（连接身份只含 readLimit；ts 不进
-//     连接身份，与真实 codex 的"thread 级连接 + 轮级 ts"一致）。
+//   - WithWSConnCache(n) 开启默认关闭的 WS 连接复用：同一个 HTTPClient 上同一
+//     thread 的连续请求——含跨轮跨窗口——命中后不再付握手（连接身份 =
+//     (threadKey, readLimit)）；匿名（Identity{}）不参与复用。线程退休走
+//     HTTPClient.RetireThread（只摘 idle，不设墓碑）。
 //   - HTTP 流式解析零拷贝：bufio.Scanner 复用缓冲 + 行切片提取 data: 帧内容，
 //     回调内的原始字节引用 scanner 缓冲（仅在回调执行期间有效）
-//   - HTTP 客户端懒构建：NewHTTPClient 不创建 http.Client（只做选项快照与升级头
-//     派生），首次 Do/Stream 才创建 http.Client
+//   - HTTP 客户端懒构建：NewHTTPClient 不创建 http.Client（只做选项快照），
+//     首次 Do/Stream 才创建 http.Client
 //     （连接池复用；WithTransport 可注入自定义 RoundTripper）
 //
 // # 上游协议与参考
@@ -125,30 +126,26 @@
 // 行号实证，防未来误删 WS 帧注入）：
 //   - HTTP 面：真实客户端请求头携带 x-codex-turn-state（client.rs:1202
 //     build_responses_headers(..., Some(&self.turn_state))）；本 SDK 的请求侧
-//     取值是 WithTurnStateProvider（逐请求求值）/ WithHeader（兼容入口），响应侧
-//     捕获 + HTTPResponse.TurnState / TurnState() / observer 暴露
-//   - WS 面：帧 metadata 恒带（TurnState 非空时）——真实发送路径
+//     取值是 Identity.TurnState，响应侧捕获后只回调 Identity.Sink
+//   - WS 面：帧 metadata 恒带（Identity.TurnState 非空时）——真实发送路径
 //     client.rs:1626-1631（stream_responses_websocket）在 build_ws_client_metadata
 //     （:779-792，辅助函数本身无 turn-state）之后显式追加
 //     client_metadata.insert(X_CODEX_TURN_STATE_HEADER, ...)，流入
 //     ResponseCreateWsRequest.client_metadata（:1702-1711 帧体携带）；SDK 帧注入
 //     （frameCodec.encode 的 client_metadata 落地：单遍快路径直接写入，回退链经
 //     normalize → injectClientMetadataObject）逐点一致：每请求取值 → 帧内回传。
-//     跨轮不得重放：请求侧**不**回落 TurnState() 缓存（缓存只作观测面）。
+//     跨轮不得重放：请求侧只读 Identity.TurnState，SDK 不缓存、不回落。
 //
-// WS 传输臂的连接身份只含 readLimit（不含 turn-state）：连接是 thread 级、跨轮
+// WS 传输臂的连接身份 = (threadKey, readLimit)：连接是 thread 级、跨轮跨窗口
 // 复用，ts 是轮级、每请求下发——与真实 codex 的换连接条件一致（因为
-// responses_headers 不含 ts）。合成响应头按 S5 判据回填：本次真的握手 ⇒ 回填本次
-// 签发值（那是 ts 的唯一发现通道，事件 ts 后到、挤不进已定死的响应头）；命中复用
-// 则只在"本次请求带的 ts == 最近签发值"（轮内）时回填，跨轮/换值一律不回填。事件
-// 级捕获（response.metadata
-// 的 headers）经 turnStateTap 逐帧旁路完成：created 先记 response_id，归属匹配
-// 才写 TurnState() + observer，fail-safe 是"created 之前的 metadata 一律不捕获"。
+// responses_headers 不含 ts）。TS 的发现通道只有 Sink：握手响应头在解析响应头时
+// 同步回调，事件级 ts（response.metadata 的 headers）经 turnStateTap 在 Read 栈内
+// 逐帧旁路捕获：created 先记 response_id，归属匹配才写 Sink，fail-safe 是
+// "created 之前的 metadata 一律不捕获"。Body.Close 之后不再回调。
 //
-// responses-lite 非独立端点：与 /responses 同端点同事件集，
-// 仅 internal 标记区分——HTTP 头 x-openai-internal-codex-responses-lite（WithHeader
-// 透传）与 WS client_metadata 键 ws_request_header_x_openai_internal_codex_responses_lite
-// （WithClientMetadata 注入），SDK 只注入不解析。
+// responses-lite 非独立端点：与 /responses 同端点同事件集，仅 internal 标记区分
+// ——HTTP 头 x-openai-internal-codex-responses-lite 可用 WithHeader 透传；S4 起
+// 不再提供任意 WS client_metadata 透传入口。
 // 传输常量对齐参考实现：16MiB ReadLimit（coder 默认 32KB 过小）、
 // CompressionContextTakeover 压缩、WS 层 ping 心跳（30s 间隔 + 2s 超时）、
 // data: SSE 行提取与 [DONE] 终止、response.create 19 字段白名单、

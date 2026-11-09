@@ -22,6 +22,10 @@ channel API.
   fatal-account detection, and 401 auto-rotation).
 - **Fingerprint alignment**: headers, send-frame top-level key whitelist, and
   `client_metadata` assembly aligned with the real Codex client.
+- **Request-scoped identity**: `Identity` carries session/meta/turn-state per
+  call; the SDK keeps no identity state and reports issued turn-state only
+  through `Identity.Sink`. Identity headers are reserved: `WithHeader` panics at
+  construction time if they are used.
 - **Protocol-aware transport**: the SDK owns framing, keepalive and the SSE
   representation, and reports attributable transport errors
   (`ErrWSBackpressure` / `ErrKeepaliveTimeout` / `*HTTPError` with an
@@ -67,6 +71,20 @@ func main() {
 	fmt.Println(resp.StatusCode, string(resp.Raw))
 }
 ```
+
+## Identity is request data (breaking change)
+
+`Stream`, `StreamBody`, `Responses` and `Dial` take an `Identity` argument.
+The old identity options (`WithSession`, `WithCodexMeta`,
+`WithTurnStateProvider`, `WithTurnStateObserver`, `WithClientMetadata`) and the
+turn-state getters/setters (`HTTPClient.TurnState`, `HTTPResponse.TurnState`,
+`Client.TurnState`/`SetTurnState`) are removed.
+
+`Identity.Session` supplies the WS handshake headers, `Identity.Meta` supplies
+the frame/body `client_metadata`, `Identity.TurnState` is the per-request
+turn-state, and `Identity.Sink` receives any turn-state issued by upstream.
+Because `x-codex-turn-state` and the other identity headers are reserved,
+`WithHeader` panics at construction time when they are used.
 
 For the full API reference, see the package documentation in
 [doc.go](./doc.go).

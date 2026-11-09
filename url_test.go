@@ -65,7 +65,7 @@ func TestWSDialFixedURLViaTransport(t *testing.T) {
 	srvURL := newWSEchoServer(t, "")
 	expectedHTTPS := "https://chatgpt.com/backend-api/codex/responses"
 	tr := newFixedTransport(t, expectedHTTPS, srvURL)
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(tr))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(tr))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

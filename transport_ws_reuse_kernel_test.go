@@ -85,7 +85,7 @@ func TestWSIdleFrameTerminatesConn(t *testing.T) {
 		opts:      hc.opts,
 		readLimit: wsStreamReadLimit,
 		mode:      modePumped,
-		headers:   hc.wsHeaders,
+		headers:   hc.opts.headers,
 	})
 	if err != nil {
 		t.Fatalf("dialConn: %v", err)
@@ -132,7 +132,7 @@ func TestWSTimeoutCoversDial(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	_, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err == nil {
 		t.Fatal("拨号挂起时 StreamBody 应当失败")
 	}
@@ -159,7 +159,7 @@ func TestWSReleaseAfterUpstreamCloseIsSafe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	ex, err := hc.openWSExchange(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), wsStreamReadLimit)
+	ex, err := hc.openWSExchange(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{}, wsStreamReadLimit)
 	if err != nil {
 		t.Fatalf("openWSExchange: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestStreamBodyAfterUpstreamCloseIsSafe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestWSCancelWithoutCloseTerminatesConn(t *testing.T) {
 
 	base := runtime.NumGoroutine()
 	ctx, cancel := context.WithCancel(context.Background())
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		cancel()
 		t.Fatalf("StreamBody: %v", err)
@@ -269,7 +269,7 @@ func TestWSReleaseSurvivesCallerCancel(t *testing.T) {
 	parent, cancelParent := context.WithCancel(context.Background())
 	defer cancelParent()
 
-	ex, err := hc.openWSExchange(parent, []byte(`{"model":"gpt-5.6","input":[]}`), wsStreamReadLimit)
+	ex, err := hc.openWSExchange(parent, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{}, wsStreamReadLimit)
 	if err != nil {
 		t.Fatalf("openWSExchange: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestWSNextAfterReleaseIsInert(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	ex, err := hc.openWSExchange(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), wsStreamReadLimit)
+	ex, err := hc.openWSExchange(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{}, wsStreamReadLimit)
 	if err != nil {
 		t.Fatalf("openWSExchange: %v", err)
 	}
@@ -375,7 +375,7 @@ func TestWSReleaseWaitsForInFlightNext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	ex, err := hc.openWSExchange(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), wsStreamReadLimit)
+	ex, err := hc.openWSExchange(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{}, wsStreamReadLimit)
 	if err != nil {
 		t.Fatalf("openWSExchange: %v", err)
 	}

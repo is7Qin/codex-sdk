@@ -18,10 +18,10 @@ const DefaultSearchURL = "https://chatgpt.com/backend-api/codex/alpha/search"
 // （Authorization + Content-Type: application/json + codex UA/Originator）；
 // 不发 OpenAI-Beta 与 x-codex-turn-metadata（网关不转发，与 resp HTTP 路径
 // 现状一致；需要时 WithHeader 注入）。
-// turn-state 不捕获（对齐 GenerateImage——doURL 路径不捕获，
-// HTTPResponse.TurnState 恒空，网关不消费）。
+// turn-state 不捕获（对齐 GenerateImage——非 responses 面不接收 Identity，
+// 也不暴露 ts）。
 func (c *HTTPClient) Search(ctx context.Context, payload []byte) (*HTTPResponse, error) {
-	resp, err := c.doURL(ctx, c.httpClient(), DefaultSearchURL, http.MethodPost, payload)
+	resp, err := c.doURL(ctx, c.httpClient(), DefaultSearchURL, http.MethodPost, payload, Identity{})
 	if err != nil {
 		return nil, err
 	}

@@ -284,8 +284,9 @@ func TestFrameCodecZeroCopyWhenNormalized(t *testing.T) {
 // 白名单内 access_programs 保留，client_metadata 仍按既有机制注入。
 func TestSendNormalizesWsFrame(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
-		WithCodexMeta(CodexMeta{InstallationID: "inst-1"}))
+	c, err := Dial(context.Background(), PAT("t"), Identity{Meta: CodexMeta{InstallationID: "inst-1"}},
+		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -328,10 +329,10 @@ func TestHTTPStreamNormalizesPayload(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
-		WithCodexMeta(CodexMeta{InstallationID: "inst-1"}))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	id := Identity{Meta: CodexMeta{InstallationID: "inst-1"}}
 	payload := []byte(`{"model":"m","input":"hi","store":true,"max_output_tokens":4096,"type":"response.create","previous_response_id":"resp_1","generate":true,"access_programs":["org-a"]}`)
-	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
+	if err := hc.Stream(context.Background(), payload, id, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	for _, k := range []string{"max_output_tokens", "type", "previous_response_id", "generate"} {
@@ -354,7 +355,7 @@ func TestHTTPStreamNormalizesPayload(t *testing.T) {
 // 过滤白名单外键 + 强制 store:false；过滤后为空帧不入网。
 func TestSendNormalizesUnconditionally(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -396,14 +397,14 @@ func TestSendNormalizesUnconditionally(t *testing.T) {
 // codex 面客户端自带的 client_metadata **永不透传**——连同非网关键一并丢弃）。
 func TestCodexMetaInjection(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
-		WithCodexMeta(CodexMeta{
-			InstallationID: "inst-1",
-			WindowID:       "win-1",
-			Subagent:       "sub-1",
-			Traceparent:    "tp-1",
-			Tracestate:     "ts-1",
-		}))
+	c, err := Dial(context.Background(), PAT("t"), Identity{Meta: CodexMeta{
+		InstallationID: "inst-1",
+		WindowID:       "win-1",
+		Subagent:       "sub-1",
+		Traceparent:    "tp-1",
+		Tracestate:     "ts-1",
+	}}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -443,46 +444,6 @@ func TestCodexMetaInjection(t *testing.T) {
 	}
 }
 
-// TestClientMetadataPassthrough：WithClientMetadata 注入任意 client_metadata 键
-// （responses-lite 键 MetaResponsesLiteKey，只注入不解析）；**恒覆盖**帧内已有同 key。
-func TestClientMetadataPassthrough(t *testing.T) {
-	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
-		WithClientMetadata(MetaResponsesLiteKey, "true"))
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer c.Close(StatusGoingAway, "")
-
-	frame := []byte(`{"type":"response.create","model":"gpt-5"}`)
-	if err := c.Send(context.Background(), frame); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	// 帧内已有同 key：被网关覆盖（客户端值不透传）
-	existing := []byte(`{"type":"response.create","model":"gpt-5","client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"false"}}`)
-	if err := c.Send(context.Background(), existing); err != nil {
-		t.Fatalf("Send #2: %v", err)
-	}
-	waitFor(t, func() bool {
-		st.mu.Lock()
-		defer st.mu.Unlock()
-		return len(st.texts) >= 2
-	})
-	st.mu.Lock()
-	got0 := st.texts[0]
-	got1 := st.texts[1]
-	st.mu.Unlock()
-
-	if v := gjson.GetBytes(got0, "client_metadata."+MetaResponsesLiteKey).String(); v != "true" {
-		t.Fatalf("透传键 %s 缺失或值不符, got %q: %s", MetaResponsesLiteKey, v, got0)
-	}
-	if v := gjson.GetBytes(got1, "client_metadata."+MetaResponsesLiteKey).String(); v != "true" {
-		t.Fatalf("帧内已有同 key 应被网关覆盖为 true, got %q: %s", v, got1)
-	}
-	// 该键只进 client_metadata：Dial 只组装默认/会话/WithHeader 握手头，
-	// 透传键按构造不可能泄漏为握手头。
-}
-
 // TestNewTraceContext：W3C traceparent 格式 + 每次调用新链路 id。
 func TestNewTraceContext(t *testing.T) {
 	a := NewTraceContext()
@@ -504,7 +465,7 @@ func TestNewTraceContext(t *testing.T) {
 func TestTraceInjection(t *testing.T) {
 	// 自动：每帧新 traceparent，帧间不同；握手头无 trace
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -538,7 +499,7 @@ func TestTraceInjection(t *testing.T) {
 	// 外部注入：静态值每帧一致
 	url2, st2 := startEchoServer(t, "")
 	external := TraceContext{Traceparent: "00-11111111111111111111111111111111-2222222222222222-01", Tracestate: "vendor=1"}
-	c2, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)), WithTraceContext(external))
+	c2, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)), WithTraceContext(external))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -563,7 +524,7 @@ func TestTraceInjection(t *testing.T) {
 
 	// 关闭自动生成：帧内无 trace key
 	url3, st3 := startEchoServer(t, "")
-	c3, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url3)), WithTraceAuto(false))
+	c3, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url3)), WithTraceAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -600,7 +561,7 @@ func TestNewUUIDv7(t *testing.T) {
 // TestTurnIDAuto：每帧自动生成新 turn_id（UUIDv7）；CodexMeta.TurnID 静态优先。
 func TestTurnIDAuto(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -629,7 +590,7 @@ func TestTurnIDAuto(t *testing.T) {
 
 	// 静态 TurnID 优先
 	url2, st2 := startEchoServer(t, "")
-	c2, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)), WithCodexMeta(CodexMeta{TurnID: "static-turn"}))
+	c2, err := Dial(context.Background(), PAT("t"), Identity{Meta: CodexMeta{TurnID: "static-turn"}}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -651,10 +612,11 @@ func TestTurnIDAuto(t *testing.T) {
 // TestTurnCounting：连接内 turn 序号自增，turn_metadata 由回调提供并组装。
 func TestTurnCounting(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
 		WithTurnMetadata(func(turn uint64) string {
 			return fmt.Sprintf(`{"turn":%d}`, turn)
 		}))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -683,10 +645,11 @@ func TestTurnCounting(t *testing.T) {
 // TestTurnMetadataProviderConcurrent：多 Send 并发下 turn 计数不重复。
 func TestTurnMetadataProviderConcurrent(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
 		WithTurnMetadata(func(turn uint64) string {
 			return fmt.Sprintf(`{"turn":%d}`, turn)
 		}))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -727,7 +690,7 @@ func TestTurnMetadataProviderConcurrent(t *testing.T) {
 // UUIDv7（客户端 turn_id 不透传）；无值帧同样自动生成。
 func TestTurnIDOverride(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

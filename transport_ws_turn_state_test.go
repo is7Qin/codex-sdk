@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,16 +18,13 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// 本文件是 S1–S5 的验收用例：
+// 本文件是 S4「身份是请求数据」的 SDK 侧验收用例（spec §2.4）：
 //
-//	1 跨轮复用（连接身份不含 ts）+ 每轮帧带各自的 ts + 跨轮不回填旧响应头
-//	2 provider 逐请求求值（值变了也不重连）
-//	3 事件级 ts 捕获（response.metadata → observer + TurnState()）
-//	4 fail-safe：created 之前的 metadata 一律不捕获（dropped +1，帧照旧透传）
-//	5 归还路径：sseView.Close() → turnStateTap.Release → 连接回缓存
-//	6 CloseWSIdleConnections 只清 WS 池，不碰共享 *http.Transport 的空闲连接
+//	S1 跨窗口复用 / S2 跨 thread 不复用 / S3 退役只摘 idle / S4 ts 只走 Sink
+//	S5 请求级身份进帧 / S6 匿名不复用 / S7 并发 / S8 Dial 身份
+//	S9 tap 负向 / S10 Close 后在飞归还 / S12 回调时序
 //
-// 另有一条聚合臂的 S5 判据用例（与流式臂共用同一实现，不许两套）。
+// S11（保留键 panic）在 identity_reserved_test.go。
 
 // ---- 假上游 ----
 
@@ -46,9 +44,9 @@ func tsCompletedFrame(id string) string {
 
 // tsUpstream 是"一条连接上循环服务多次请求"的假上游：
 //
-//   - 每次连接计数一次 accepts；握手可签发 handshake（"" = 不签发）；
+//   - 每次升级计数一次 upgrades；握手可签发 handshake（"" = 不签发）；
 //   - 每读到一帧 create 就回放 respond(全局请求序号, 帧)；
-//   - 记录客户端发来的全部帧（按请求顺序）。
+//   - 记录客户端发来的全部帧（按请求顺序）与每次升级的握手头。
 type tsUpstream struct {
 	srv *httptest.Server
 
@@ -56,13 +54,18 @@ type tsUpstream struct {
 	handshake string
 	respond   func(reqIdx int, req []byte) []string
 	frames    [][]byte
+	headers   []http.Header
 	accepts   atomic.Int64
 	upgrades  atomic.Int64
+
+	// frameSig 在每次记录请求帧后做一次非阻塞通知：waitFrames 用它等条件，
+	// 不轮询、不 sleep。
+	frameSig chan struct{}
 }
 
 func newTSUpstream(t *testing.T, respond func(int, []byte) []string) *tsUpstream {
 	t.Helper()
-	u := &tsUpstream{respond: respond}
+	u := &tsUpstream{respond: respond, frameSig: make(chan struct{}, 1)}
 	u.srv = httptest.NewServer(http.HandlerFunc(u.handle))
 	t.Cleanup(func() {
 		u.srv.CloseClientConnections()
@@ -75,6 +78,7 @@ func (u *tsUpstream) handle(w http.ResponseWriter, r *http.Request) {
 	u.upgrades.Add(1)
 	u.mu.Lock()
 	hs, respond := u.handshake, u.respond
+	u.headers = append(u.headers, r.Header.Clone())
 	u.mu.Unlock()
 	if hs != "" {
 		w.Header().Set(HeaderTurnState, hs)
@@ -94,6 +98,10 @@ func (u *tsUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		u.frames = append(u.frames, append([]byte(nil), data...))
 		idx := len(u.frames) - 1
 		u.mu.Unlock()
+		select {
+		case u.frameSig <- struct{}{}:
+		default:
+		}
 		var out []string
 		if respond != nil {
 			out = respond(idx, data)
@@ -121,6 +129,36 @@ func (u *tsUpstream) sentFrames(t *testing.T) [][]byte {
 	return out
 }
 
+func (u *tsUpstream) handshakeHeaders(t *testing.T, i int) http.Header {
+	t.Helper()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if i >= len(u.headers) {
+		t.Fatalf("第 %d 次握手不存在（共 %d 次）", i, len(u.headers))
+	}
+	return u.headers[i].Clone()
+}
+
+// waitFrames 等到上游记录到第 n 个请求帧。用通道通知 + deadline 兜底，
+// 不轮询、不 sleep（2ms 轮询在慢机器上既拖时间又可能误判超时）。
+func (u *tsUpstream) waitFrames(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		u.mu.Lock()
+		got := len(u.frames)
+		u.mu.Unlock()
+		if got >= n {
+			return
+		}
+		select {
+		case <-u.frameSig:
+		case <-deadline:
+			t.Fatalf("等待第 %d 帧超时（已记录 %d）", n, got)
+		}
+	}
+}
+
 func (u *tsUpstream) client(t *testing.T, opts ...Option) *HTTPClient {
 	t.Helper()
 	base := []Option{
@@ -131,13 +169,19 @@ func (u *tsUpstream) client(t *testing.T, opts ...Option) *HTTPClient {
 	return NewHTTPClient(PAT("pat-ts"), append(base, opts...)...)
 }
 
-// doStreamBodyFull 跑一次 StreamBody 并读尽 body（顺带触发终态后的归还），
-// 返回响应（用于断言合成响应头）与 SSE 字节流。
-func doStreamBodyFull(t *testing.T, hc *HTTPClient) (*http.Response, string) {
+// doStreamBodyFull 跑一次 StreamBody 并读尽 body（顺带触发终态后的归还）。
+func doStreamBodyFull(t *testing.T, hc *HTTPClient, id Identity) (*http.Response, string) {
+	t.Helper()
+	return doStreamBodyPayload(t, hc, id, []byte(`{"model":"gpt-5.6","input":[]}`))
+}
+
+// doStreamBodyPayload 同 doStreamBodyFull，但由调用方给 payload（用于"payload 自带
+// 身份"这类边界：SDK 必须整体覆写/删除，而不是透传）。
+func doStreamBodyPayload(t *testing.T, hc *HTTPClient, id Identity, payload []byte) (*http.Response, string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	resp, err := hc.StreamBody(ctx, payload, id)
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -150,293 +194,432 @@ func frameTurnState(t *testing.T, frame []byte) string {
 	return gjson.GetBytes(frame, "client_metadata."+codexMetaTurnStateKey).String()
 }
 
-// tsProvider 是可变的 per-request provider（模拟网关按会话槽取值）。
-type tsProvider struct{ v atomic.Value }
-
-func (p *tsProvider) set(v string) { p.v.Store(v) }
-func (p *tsProvider) get() string {
-	s, _ := p.v.Load().(string)
-	return s
+// frameMeta 取请求帧 client_metadata 的某个键（缺失 = ""）。
+func frameMeta(t *testing.T, frame []byte, key string) string {
+	t.Helper()
+	return gjson.GetBytes(frame, "client_metadata."+key).String()
 }
 
-// tsObserver 收集观察到的 ts（回调可能来自读路径，加锁）。
-type tsObserver struct {
-	mu   sync.Mutex
-	seen []string
-}
-
-func (o *tsObserver) observe(ts string) {
-	o.mu.Lock()
-	o.seen = append(o.seen, ts)
-	o.mu.Unlock()
-}
-
-func (o *tsObserver) values() []string {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return append([]string(nil), o.seen...)
-}
-
-// ---- 1. 跨轮复用 ----
-
-// TestTurnStateCrossRoundReuse（S1 + S5）：同 client 跨轮两次 StreamBody。
-// 第 1 轮带 ts（== 握手签发值）⇒ 合成响应头回填；第 2 轮 provider 清空 ⇒ 帧不带
-// ts、合成响应头**不得**回填上一轮的旧值，而连接只拨 1 次（连接身份不含 ts）。
-func TestTurnStateCrossRoundReuse(t *testing.T) {
+// S1：同 thread、window 0→1 ⇒ 只握手一次；两帧的 window 各自正确。
+func TestS1ReuseAcrossWindows(t *testing.T) {
 	up := newTSUpstream(t, func(i int, _ []byte) []string {
-		id := fmt.Sprintf("resp_%d", i+1)
-		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
-	})
-	up.setHandshake("ts-round-1")
-	prov := &tsProvider{}
-	prov.set("ts-round-1")
-	obs := &tsObserver{}
-	hc := up.client(t, WithWSConnCache(2), WithTurnStateProvider(prov.get), WithTurnStateObserver(obs.observe))
-
-	// 第 1 轮：请求带 ts-round-1（与握手签发值相同）。
-	resp1, body1 := doStreamBodyFull(t, hc)
-	if got := resp1.Header.Get(HeaderTurnState); got != "ts-round-1" {
-		t.Fatalf("第 1 轮合成响应头 = %q, 期望 ts-round-1（effective == 最近签发值）", got)
-	}
-	if !strings.Contains(body1, "[DONE]") {
-		t.Fatalf("第 1 轮响应缺少 [DONE]: %q", body1)
-	}
-	if got := hc.TurnState(); got != "ts-round-1" {
-		t.Fatalf("TurnState() = %q, 期望 ts-round-1（握手捕获）", got)
-	}
-
-	// 第 2 轮：轮结束（网关按会话清 ts）⇒ provider 返回空。
-	prov.set("")
-	resp2, body2 := doStreamBodyFull(t, hc)
-	if !strings.Contains(body2, "[DONE]") {
-		t.Fatalf("第 2 轮响应缺少 [DONE]: %q", body2)
-	}
-	if got := hc.TurnState(); got != "ts-round-1" {
-		t.Fatalf("TurnState() = %q, 期望仍是 ts-round-1（复用没有新签发）", got)
-	}
-
-	if got := up.accepts.Load(); got != 1 {
-		t.Fatalf("accepts = %d, 期望 1（跨轮必须复用同一连接）", got)
-	}
-	frames := up.sentFrames(t)
-	if len(frames) != 2 {
-		t.Fatalf("上游收到 %d 帧, 期望 2 帧", len(frames))
-	}
-	if got := frameTurnState(t, frames[0]); got != "ts-round-1" {
-		t.Fatalf("第 1 轮帧 ts = %q, 期望 ts-round-1", got)
-	}
-	if got := frameTurnState(t, frames[1]); got != "" {
-		t.Fatalf("第 2 轮帧 ts = %q, 期望空（不得重放上一轮 ts）", got)
-	}
-	if got := resp2.Header.Get(HeaderTurnState); got != "" {
-		t.Fatalf("第 2 轮合成响应头 = %q, 期望空（跨轮不得回填旧值）", got)
-	}
-	// observer 与捕获点共用写入口：握手签发值也会回调（第 2 轮无新签发，故只有一次）。
-	if got := obs.values(); len(got) != 1 || got[0] != "ts-round-1" {
-		t.Fatalf("observer 收到 %v, 期望 [ts-round-1]（握手捕获）", got)
-	}
-}
-
-// TestTurnStateIntraTurnReuseBackfills（S5 第 2 支）：命中复用且本次请求带的 ts 仍
-// 等于最近签发值（轮内重试）⇒ 合成响应头回填同一个值；连接不重拨。
-func TestTurnStateIntraTurnReuseBackfills(t *testing.T) {
-	up := newTSUpstream(t, func(i int, _ []byte) []string {
-		id := fmt.Sprintf("resp_intra_%d", i+1)
-		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
-	})
-	up.setHandshake("ts-intra")
-	prov := &tsProvider{}
-	prov.set("ts-intra")
-	hc := up.client(t, WithWSConnCache(2), WithTurnStateProvider(prov.get))
-
-	resp1, _ := doStreamBodyFull(t, hc)
-	if got := resp1.Header.Get(HeaderTurnState); got != "ts-intra" {
-		t.Fatalf("第 1 次（真握手）合成响应头 = %q, 期望 ts-intra", got)
-	}
-	resp2, _ := doStreamBodyFull(t, hc) // 命中复用，provider 仍返回同一个 ts
-	if got := resp2.Header.Get(HeaderTurnState); got != "ts-intra" {
-		t.Fatalf("第 2 次（轮内复用）合成响应头 = %q, 期望 ts-intra（effective == 最近签发值）", got)
-	}
-	if got := up.accepts.Load(); got != 1 {
-		t.Fatalf("accepts = %d, 期望 1（轮内复用不重拨）", got)
-	}
-	frames := up.sentFrames(t)
-	if len(frames) != 2 {
-		t.Fatalf("上游收到 %d 帧, 期望 2 帧", len(frames))
-	}
-	for i := range frames {
-		if got := frameTurnState(t, frames[i]); got != "ts-intra" {
-			t.Fatalf("第 %d 轮帧 ts = %q, 期望 ts-intra", i+1, got)
-		}
-	}
-}
-
-// TestTurnStateAggregateArmSameCriterion（S5 共用判据）：同一个 client 跨轮两次
-// Responses（聚合臂）：连接复用，第二轮的 HTTPResponse.TurnState 不得回填旧值。
-func TestTurnStateAggregateArmSameCriterion(t *testing.T) {
-	up := newTSUpstream(t, func(i int, _ []byte) []string {
-		id := fmt.Sprintf("resp_agg_%d", i+1)
-		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
-	})
-	up.setHandshake("ts-agg-1")
-	prov := &tsProvider{}
-	prov.set("ts-agg-1")
-	hc := up.client(t, WithWSConnCache(2), WithTurnStateProvider(prov.get))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	payload := []byte(`{"model":"gpt-5.6","input":[]}`)
-
-	first, err := hc.Responses(ctx, payload)
-	if err != nil {
-		t.Fatalf("第 1 次 Responses: %v", err)
-	}
-	if first.TurnState != "ts-agg-1" {
-		t.Fatalf("第 1 轮 HTTPResponse.TurnState = %q, 期望 ts-agg-1", first.TurnState)
-	}
-
-	prov.set("")
-	second, err := hc.Responses(ctx, payload)
-	if err != nil {
-		t.Fatalf("第 2 次 Responses: %v", err)
-	}
-	if second.TurnState != "" {
-		t.Fatalf("第 2 轮 HTTPResponse.TurnState = %q, 期望空（跨轮不得回填旧值）", second.TurnState)
-	}
-	if got := up.accepts.Load(); got != 1 {
-		t.Fatalf("accepts = %d, 期望 1（聚合臂跨轮复用）", got)
-	}
-}
-
-// ---- 2. provider 逐请求求值 ----
-
-// TestTurnStateProviderPerRequest（S2）：provider 的返回值在请求之间改变 ⇒ 每帧
-// 带当次值、**不重连**；provider 返回空时不得回落 TurnState() 缓存。
-func TestTurnStateProviderPerRequest(t *testing.T) {
-	up := newTSUpstream(t, func(i int, _ []byte) []string {
-		id := fmt.Sprintf("resp_p_%d", i+1)
-		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
-	})
-	up.setHandshake("hs-1") // 让"回落缓存"的变异有值可重放
-	prov := &tsProvider{}
-	prov.set("P1")
-	hc := up.client(t, WithWSConnCache(2), WithTurnStateProvider(prov.get))
-
-	want := []string{"P1", "P2", ""}
-	var last *http.Response
-	for _, v := range want {
-		prov.set(v)
-		last, _ = doStreamBodyFull(t, hc)
-	}
-	if got := up.accepts.Load(); got != 1 {
-		t.Fatalf("accepts = %d, 期望 1（provider 变化不得重连）", got)
-	}
-	frames := up.sentFrames(t)
-	if len(frames) != len(want) {
-		t.Fatalf("上游收到 %d 帧, 期望 %d 帧", len(frames), len(want))
-	}
-	for i, v := range want {
-		if got := frameTurnState(t, frames[i]); got != v {
-			t.Fatalf("第 %d 轮帧 ts = %q, 期望 %q（provider 逐请求求值）", i+1, got, v)
-		}
-	}
-	if got := last.Header.Get(HeaderTurnState); got != "" {
-		t.Fatalf("末轮合成响应头 = %q, 期望空（provider 空 ⇒ 不得回填缓存）", got)
-	}
-}
-
-// ---- 3. 事件级 ts 捕获 ----
-
-// TestTurnStateTapCapturesMetadata（S3）：created → metadata 顺序发帧 ⇒ observer
-// 收到事件 ts，且该值写入 TurnState()；帧本身原样透传。
-func TestTurnStateTapCapturesMetadata(t *testing.T) {
-	const id = "resp_evt"
-	md := tsMetadataFrame(id, "ts-evt")
-	up := newTSUpstream(t, func(int, []byte) []string {
-		return []string{tsCreatedFrame(id), md, tsCompletedFrame(id)}
-	})
-	obs := &tsObserver{}
-	hc := up.client(t, WithTurnStateObserver(obs.observe))
-
-	_, body := doStreamBodyFull(t, hc)
-
-	if got := hc.TurnState(); got != "ts-evt" {
-		t.Fatalf("TurnState() = %q, 期望 ts-evt（事件级捕获）", got)
-	}
-	if got := obs.values(); len(got) != 1 || got[0] != "ts-evt" {
-		t.Fatalf("observer 收到 %v, 期望 [ts-evt]", got)
-	}
-	if got := hc.turnStateDropped.Load(); got != 0 {
-		t.Fatalf("dropped = %d, 期望 0（metadata 归属正确）", got)
-	}
-	if !strings.Contains(body, md) {
-		t.Fatalf("metadata 帧没有被原样透传: %q", body)
-	}
-}
-
-// ---- 4. fail-safe：created 之前 ----
-
-// TestTurnStateTapFailSafeBeforeCreated（S3 fail-safe）：metadata 先于 created
-// 到达 ⇒ observer 不被调用（dropped +1），但帧照旧透传；随后的合法 metadata
-// 仍能被捕获。
-func TestTurnStateTapFailSafeBeforeCreated(t *testing.T) {
-	const id = "resp_x"
-	early := tsMetadataFrame(id, "ts-early")
-	late := tsMetadataFrame(id, "ts-late")
-	up := newTSUpstream(t, func(int, []byte) []string {
-		return []string{early, tsCreatedFrame(id), late, tsCompletedFrame(id)}
-	})
-	obs := &tsObserver{}
-	hc := up.client(t, WithTurnStateObserver(obs.observe))
-
-	_, body := doStreamBodyFull(t, hc)
-
-	if got := obs.values(); len(got) != 1 || got[0] != "ts-late" {
-		t.Fatalf("observer 收到 %v, 期望只有 [ts-late]（created 之前的 metadata 必须丢弃）", got)
-	}
-	if got := hc.TurnState(); got != "ts-late" {
-		t.Fatalf("TurnState() = %q, 期望 ts-late", got)
-	}
-	if got := hc.turnStateDropped.Load(); got != 1 {
-		t.Fatalf("dropped = %d, 期望 1", got)
-	}
-	// 帧一帧不少：被丢的只是 ts 候选。
-	for _, want := range []string{early, late} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("metadata 帧没有被透传（丢帧违反帧契约）: %q", body)
-		}
-	}
-}
-
-// ---- 5. 归还路径（Release 转发） ----
-
-// TestTurnStateTapForwardsRelease（S3 帧契约）：读到终态后 sseView.Close() 走
-// turnStateTap.Release（连接回缓存）⇒ 下一次请求仍复用同一条连接。
-func TestTurnStateTapForwardsRelease(t *testing.T) {
-	up := newTSUpstream(t, func(i int, _ []byte) []string {
-		id := fmt.Sprintf("resp_rel_%d", i+1)
+		id := fmt.Sprintf("resp_s1_%d", i+1)
 		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
 	})
 	hc := up.client(t, WithWSConnCache(2))
 
-	doStreamBody(t, hc) // readAllBody 里的 Close 触发 Release
-	hc.wsCache.mu.Lock()
-	idle := len(hc.wsCache.idles)
-	hc.wsCache.mu.Unlock()
-	if idle != 1 {
-		t.Fatalf("归还后缓存条目 = %d, 期望 1（Release 被 tap 吃掉了？）", idle)
+	id0 := identityFor("thread-s1", "thread-s1:0", "", nil)
+	id1 := identityFor("thread-s1", "thread-s1:1", "", nil)
+	doStreamBodyFull(t, hc, id0)
+	doStreamBodyFull(t, hc, id1)
+
+	if got := up.upgrades.Load(); got != 1 {
+		t.Fatalf("upgrades = %d, 期望 1（window 变化不得重连）", got)
 	}
-	doStreamBody(t, hc)
-	if got := up.accepts.Load(); got != 1 {
-		t.Fatalf("accepts = %d, 期望 1（Release 未转发则下一次必重拨）", got)
+	frames := up.sentFrames(t)
+	if len(frames) != 2 {
+		t.Fatalf("上游收到 %d 帧, 期望 2 帧", len(frames))
 	}
-	if got := hc.wsCache.hits.Load(); got < 1 {
-		t.Fatalf("hits = %d, 期望 ≥1", got)
+	for i, want := range []string{"thread-s1:0", "thread-s1:1"} {
+		if got := frameMeta(t, frames[i], codexMetaWindowKey); got != want {
+			t.Fatalf("第 %d 帧 window = %q, 期望 %q", i+1, got, want)
+		}
 	}
 }
 
-// ---- 6. CloseWSIdleConnections 只清 WS 池 ----
+// S2：两个 threadKey 交替 ⇒ 各拨一次（upgrades == 2）；同 thread 的第二次
+// 请求命中自己的连接。
+func TestS2NoReuseAcrossThreads(t *testing.T) {
+	up := newTSUpstream(t, func(i int, _ []byte) []string {
+		id := fmt.Sprintf("resp_s2_%d", i+1)
+		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
+	})
+	hc := up.client(t, WithWSConnCache(4))
+	idA := identityFor("thread-A", "thread-A:0", "", nil)
+	idB := identityFor("thread-B", "thread-B:0", "", nil)
+	for _, id := range []Identity{idA, idB, idA, idB} {
+		doStreamBodyFull(t, hc, id)
+	}
+	if got := up.upgrades.Load(); got != 2 {
+		t.Fatalf("upgrades = %d, 期望 2（跨 thread 不得复用）", got)
+	}
+	if got := up.accepts.Load(); got != 2 {
+		t.Fatalf("accepts = %d, 期望 2", got)
+	}
+	if got := hc.wsCache.hits.Load(); got != 2 {
+		t.Fatalf("hits = %d, 期望 2（各 thread 的第二次请求命中自己的连接）", got)
+	}
+}
 
-// TestCloseWSIdleConnectionsOnlyClearsWS（S4）：清空 WS 缓存后下一条 WS 请求必须
+// S3：RetireThread 只摘该 key 的 idle（锁外终止）；B 不受影响；Close 之后
+// RetireThread 为 no-op（无墓碑）。
+func TestS3RetireOnlyIdle(t *testing.T) {
+	up := newTSUpstream(t, func(i int, _ []byte) []string {
+		id := fmt.Sprintf("resp_s3_%d", i+1)
+		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
+	})
+	hc := up.client(t, WithWSConnCache(4))
+	idA := identityFor("thread-retire-A", "thread-retire-A:0", "", nil)
+	idB := identityFor("thread-retire-B", "thread-retire-B:0", "", nil)
+	doStreamBodyFull(t, hc, idA)
+	doStreamBodyFull(t, hc, idB)
+
+	hc.wsCache.mu.Lock()
+	if len(hc.wsCache.idles) != 2 {
+		hc.wsCache.mu.Unlock()
+		t.Fatalf("idle = %d, 期望 2", len(hc.wsCache.idles))
+	}
+	var retired *conn
+	for _, cc := range hc.wsCache.idles {
+		if cc.key.threadKey == idA.threadKey() {
+			retired = cc.cn
+		}
+	}
+	hc.wsCache.mu.Unlock()
+	if retired == nil {
+		t.Fatal("未找到 A 的 idle 连接")
+	}
+
+	hc.RetireThread(idA.threadKey())
+	if err := retired.err(); err == nil {
+		t.Fatal("RetireThread 后 A 的连接未被终止")
+	}
+	hc.wsCache.mu.Lock()
+	idles := append([]cachedConn(nil), hc.wsCache.idles...)
+	hc.wsCache.mu.Unlock()
+	if len(idles) != 1 || idles[0].key.threadKey != idB.threadKey() {
+		t.Fatalf("退役后 idle = %+v, 期望只剩 B", idles)
+	}
+
+	hc.wsCache.Close()
+	hc.RetireThread(idB.threadKey()) // Close 之后 no-op（不 panic、不复活）
+	hc.wsCache.mu.Lock()
+	got := len(hc.wsCache.idles)
+	hc.wsCache.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("Close 后 idle = %d, 期望 0", got)
+	}
+}
+
+// S4：握手头 T1 → response.metadata T2 ⇒ Sink 序列 [T1, T2]；Sink == nil
+// 不 panic，帧照旧透传。
+func TestS4TurnStateOnlyGoesToSink(t *testing.T) {
+	const id = "resp_s4"
+	up := newTSUpstream(t, func(int, []byte) []string {
+		return []string{tsCreatedFrame(id), tsMetadataFrame(id, "T2"), tsCompletedFrame(id)}
+	})
+	up.setHandshake("T1")
+	hc := up.client(t, WithWSConnCache(2))
+	var sink turnStateSink
+	id4 := identityFor("thread-s4", "thread-s4:0", "", &sink)
+	_, body := doStreamBodyFull(t, hc, id4)
+	if got := sink.values(); len(got) != 2 || got[0] != "T1" || got[1] != "T2" {
+		t.Fatalf("Sink = %v, 期望 [T1 T2]", got)
+	}
+	if !strings.Contains(body, "T2") {
+		t.Fatalf("metadata 帧未被透传: %q", body)
+	}
+
+	// nil Sink：事件照旧透传，不 panic。
+	hc2 := up.client(t, WithWSConnCache(2))
+	_, body2 := doStreamBodyFull(t, hc2, identityFor("thread-s4-nil", "thread-s4-nil:0", "", nil))
+	if !strings.Contains(body2, "T2") {
+		t.Fatalf("Sink=nil 时 metadata 帧未透传: %q", body2)
+	}
+}
+
+// S5：同一 client 交替两个 Identity ⇒ 帧内身份与握手头各自正确，无串台。
+func TestS5RequestIdentityPerRequest(t *testing.T) {
+	up := newTSUpstream(t, func(i int, _ []byte) []string {
+		id := fmt.Sprintf("resp_s5_%d", i+1)
+		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
+	})
+	hc := up.client(t, WithWSConnCache(4))
+	idA := identityFor("thread-s5-A", "thread-s5-A:0", "", nil)
+	idB := identityFor("thread-s5-B", "thread-s5-B:3", "", nil)
+	doStreamBodyFull(t, hc, idA)
+	doStreamBodyFull(t, hc, idB)
+
+	frames := up.sentFrames(t)
+	if len(frames) != 2 {
+		t.Fatalf("上游收到 %d 帧, 期望 2 帧", len(frames))
+	}
+	checks := []struct {
+		frame int
+		id    Identity
+	}{
+		{0, idA}, {1, idB},
+	}
+	for _, c := range checks {
+		if got := frameMeta(t, frames[c.frame], codexMetaSessionKey); got != c.id.Meta.SessionID {
+			t.Fatalf("第 %d 帧 session = %q, 期望 %q", c.frame+1, got, c.id.Meta.SessionID)
+		}
+		if got := frameMeta(t, frames[c.frame], codexMetaThreadKey); got != c.id.Meta.ThreadID {
+			t.Fatalf("第 %d 帧 thread = %q, 期望 %q", c.frame+1, got, c.id.Meta.ThreadID)
+		}
+		if got := frameMeta(t, frames[c.frame], codexMetaWindowKey); got != c.id.Meta.WindowID {
+			t.Fatalf("第 %d 帧 window = %q, 期望 %q", c.frame+1, got, c.id.Meta.WindowID)
+		}
+	}
+	for i, want := range []string{"thread-s5-A", "thread-s5-B"} {
+		hdr := up.handshakeHeaders(t, i)
+		if got := hdr.Get(HeaderThreadID); got != want {
+			t.Fatalf("第 %d 次握手 thread-id = %q, 期望 %q", i+1, got, want)
+		}
+		if got := hdr.Get(HeaderSessionID); got != "sess-"+want {
+			t.Fatalf("第 %d 次握手 session-id = %q, 期望 %q", i+1, got, "sess-"+want)
+		}
+	}
+}
+
+// methodCountingTransport 统计经过的 HTTP 方法（S6 断言 POST == 0）。
+type methodCountingTransport struct {
+	base  http.RoundTripper
+	posts atomic.Int64
+}
+
+func (m *methodCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPost {
+		m.posts.Add(1)
+	}
+	return m.base.RoundTrip(req)
+}
+
+// S6：缓存开启 + 同一 client：两次匿名请求都读尽并 Close ⇒ upgrades == 2、
+// HTTP POST == 0；帧内不出现身份键（turn_id 等自动字段允许）。
+func TestS6AnonymousNeverReuses(t *testing.T) {
+	up := newTSUpstream(t, func(i int, _ []byte) []string {
+		id := fmt.Sprintf("resp_s6_%d", i+1)
+		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
+	})
+	tr := &methodCountingTransport{base: newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)}
+	hc := NewHTTPClient(PAT("pat-s6"),
+		WithResponsesTransport(TransportWS),
+		WithTransport(tr),
+		WithWSConnCache(2),
+		WithTraceAuto(false),
+	)
+	// payload 自带旧身份：匿名请求必须把它整体抹掉（否则等于冒充调用方的老会话）。
+	payload := []byte(`{"model":"gpt-5.6","input":[],"client_metadata":{` +
+		`"thread_id":"old-thread","x-codex-window-id":"old-window",` +
+		`"x-codex-turn-state":"old-ts"}}`)
+	doStreamBodyPayload(t, hc, Identity{}, payload)
+	doStreamBodyPayload(t, hc, Identity{}, payload)
+
+	if got := up.upgrades.Load(); got != 2 {
+		t.Fatalf("upgrades = %d, 期望 2（匿名不复用）", got)
+	}
+	if got := tr.posts.Load(); got != 0 {
+		t.Fatalf("HTTP POST = %d, 期望 0（匿名 WS 请求不得回退 HTTP）", got)
+	}
+	frames := up.sentFrames(t)
+	if len(frames) != 2 {
+		t.Fatalf("上游收到 %d 帧, 期望 2 帧", len(frames))
+	}
+	for i, frame := range frames {
+		for _, key := range []string{codexMetaInstallationKey, codexMetaSessionKey, codexMetaThreadKey, codexMetaWindowKey, codexMetaTurnStateKey} {
+			if gjson.GetBytes(frame, "client_metadata."+key).Exists() {
+				t.Fatalf("第 %d 帧不应出现身份键 %s: %s", i+1, key, frame)
+			}
+		}
+	}
+}
+
+// S7：同 client 并发两个 Identity（不同 thread），-race 绿。
+func TestS7ConcurrentIdentities(t *testing.T) {
+	up := newTSUpstream(t, func(i int, _ []byte) []string {
+		id := fmt.Sprintf("resp_s7_%d", i+1)
+		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
+	})
+	hc := up.client(t, WithWSConnCache(4))
+	ids := []Identity{
+		identityFor("thread-s7-A", "thread-s7-A:0", "", nil),
+		identityFor("thread-s7-B", "thread-s7-B:0", "", nil),
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, len(ids))
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id Identity) {
+			defer wg.Done()
+			resp, err := hc.StreamBody(context.Background(), []byte(`{"model":"m","input":[]}`), id)
+			if err != nil {
+				errs <- err
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			errs <- resp.Body.Close()
+		}(id)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发请求失败: %v", err)
+		}
+	}
+	if got := up.upgrades.Load(); got != 2 {
+		t.Fatalf("upgrades = %d, 期望 2（两个 thread 各一条连接）", got)
+	}
+}
+
+// S8：Dial(ctx, auth, Identity) ⇒ 握手头与 Identity 一致；握手响应头 ts 进 Sink。
+func TestS8DialIdentity(t *testing.T) {
+	up := newTSUpstream(t, nil)
+	up.setHandshake("T-dial")
+	var sink turnStateSink
+	id := identityFor("thread-dial", "thread-dial:2", "T-req", &sink)
+	c, err := Dial(context.Background(), PAT("pat-dial"), id,
+		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
+		WithTurnAuto(false), WithTraceAuto(false))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close(StatusGoingAway, "")
+
+	hdr := up.handshakeHeaders(t, 0)
+	for key, want := range map[string]string{
+		HeaderSessionID:       "sess-thread-dial",
+		HeaderThreadID:        "thread-dial",
+		HeaderClientRequestID: "thread-dial",
+		HeaderWindowID:        "thread-dial:2",
+	} {
+		if got := hdr.Get(key); got != want {
+			t.Fatalf("握手头 %s = %q, 期望 %q", key, got, want)
+		}
+	}
+	if got := sink.values(); len(got) != 1 || got[0] != "T-dial" {
+		t.Fatalf("Sink = %v, 期望 [T-dial]", got)
+	}
+	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"m"}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	up.waitFrames(t, 1)
+	frame := up.sentFrames(t)[0]
+	if got := frameTurnState(t, frame); got != "T-req" {
+		t.Fatalf("帧内 ts = %q, 期望 T-req（Identity.TurnState）", got)
+	}
+}
+
+// S9：tap 负向——created 之前的 metadata 丢弃；response_id 不匹配同样丢弃。
+func TestS9TapNegative(t *testing.T) {
+	const id = "resp_s9"
+	up := newTSUpstream(t, func(int, []byte) []string {
+		return []string{
+			tsMetadataFrame(id, "T-early"),
+			tsCreatedFrame(id),
+			tsMetadataFrame("other", "T-mismatch"),
+			tsMetadataFrame(id, "T-ok"),
+			tsCompletedFrame(id),
+		}
+	})
+	hc := up.client(t)
+	var sink turnStateSink
+	_, body := doStreamBodyFull(t, hc, identityFor("thread-s9", "thread-s9:0", "", &sink))
+	if got := sink.values(); len(got) != 1 || got[0] != "T-ok" {
+		t.Fatalf("Sink = %v, 期望 [T-ok]", got)
+	}
+	if got := hc.turnStateDropped.Load(); got != 2 {
+		t.Fatalf("dropped = %d, 期望 2（早到 + response_id 不匹配）", got)
+	}
+	for _, ts := range []string{"T-early", "T-mismatch"} {
+		if !strings.Contains(body, ts) {
+			t.Fatalf("被丢弃的只是 ts 候选，帧必须透传（缺 %s）: %q", ts, body)
+		}
+	}
+}
+
+// S10：Close 之后在飞 exchange 归还 ⇒ put=false、无 idle 残留（由 Release 终止）。
+func TestS10CloseRejectsInFlightReturn(t *testing.T) {
+	up := newTSUpstream(t, func(i int, _ []byte) []string {
+		id := fmt.Sprintf("resp_s10_%d", i+1)
+		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
+	})
+	hc := up.client(t, WithWSConnCache(2))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), identityFor("thread-s10", "thread-s10:0", "", nil))
+	if err != nil {
+		t.Fatalf("StreamBody: %v", err)
+	}
+	hc.wsCache.Close() // 关闭发生在 exchange 仍在飞时
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	hc.wsCache.mu.Lock()
+	idle := len(hc.wsCache.idles)
+	hc.wsCache.mu.Unlock()
+	if idle != 0 {
+		t.Fatalf("Close 后在飞归还留下了 %d 条 idle，期望 0", idle)
+	}
+}
+
+// S12：Body.Close 之后 Sink 调用计数不再增长（提前 Close / 取消两种收尾）。
+func TestS12NoSinkAfterClose(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel bool
+	}{
+		{"提前 Close", false},
+		{"取消", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			release := make(chan struct{})
+			lateDone := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				c, err := coderws.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer c.CloseNow()
+				if _, _, rerr := c.Read(r.Context()); rerr != nil {
+					return
+				}
+				_ = c.Write(r.Context(), coderws.MessageText, []byte(tsCreatedFrame("resp_s12")))
+				<-release
+				// 迟到帧：客户端此时已 Close（或已取消）。写完（或写失败）后关闭
+				// lateDone，测试用它当同步点——不 sleep、不猜时间。
+				_ = c.Write(r.Context(), coderws.MessageText, []byte(tsMetadataFrame("resp_s12", "T-late")))
+				_ = c.Write(r.Context(), coderws.MessageText, []byte(tsCompletedFrame("resp_s12")))
+				close(lateDone)
+			}))
+			t.Cleanup(srv.Close)
+			hc := NewHTTPClient(PAT("pat-s12"),
+				WithResponsesTransport(TransportWS),
+				WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
+				WithTurnAuto(false), WithTraceAuto(false))
+			var sink turnStateSink
+			ctx, cancel := context.WithCancel(context.Background())
+			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), identityFor("thread-s12", "thread-s12:0", "", &sink))
+			if err != nil {
+				t.Fatalf("StreamBody: %v", err)
+			}
+			buf := make([]byte, 4096)
+			if _, err := resp.Body.Read(buf); err != nil {
+				t.Fatalf("读首帧: %v", err)
+			}
+			if tc.cancel {
+				cancel()
+			}
+			_ = resp.Body.Close()
+			if got := sink.count(); got != 0 {
+				t.Fatalf("Body.Close 返回时 Sink 已调用 %d 次，期望 0", got)
+			}
+			close(release)
+			select {
+			case <-lateDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("上游未在期限内尝试写入迟到帧")
+			}
+			if got := sink.count(); got != 0 {
+				t.Fatalf("迟到帧到达后 Sink 调用 %d 次，期望 0（Close 之后不得再回调）", got)
+			}
+			cancel()
+		})
+	}
+}
+
+// TestCloseWSIdleConnectionsOnlyClearsWS：清空 WS 缓存后下一条 WS 请求必须
 // 重新拨号，但**不得**影响共享 *http.Transport 的空闲连接（用真 *http.Transport +
 // DialContext 计数断言 dial 不增）。
 //
@@ -493,7 +676,7 @@ func TestCloseWSIdleConnectionsOnlyClearsWS(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	doStreamBody(t, hc) // WS：#1
+	doStreamBodyFull(t, hc, identityFor("thread-tls", "thread-tls:0", "", nil)) // WS：#1
 	if got := wsAccepts.Load(); got != 1 {
 		t.Fatalf("WS accepts = %d, 期望 1", got)
 	}
@@ -506,7 +689,7 @@ func TestCloseWSIdleConnectionsOnlyClearsWS(t *testing.T) {
 
 	hc.CloseWSIdleConnections()
 
-	doStreamBody(t, hc) // WS 必须重拨（缓存已清）
+	doStreamBodyFull(t, hc, identityFor("thread-tls", "thread-tls:0", "", nil)) // WS 必须重拨（缓存已关）
 	if got := wsAccepts.Load(); got != 2 {
 		t.Fatalf("WS accepts = %d, 期望 2（CloseWSIdleConnections 必须清 WS 池）", got)
 	}

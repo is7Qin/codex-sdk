@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -102,20 +103,12 @@ type options struct {
 	beta         string // Responses WS beta 版本（默认 DefaultBetaWS=2026-02-06，现役唯一真实值）
 	headers      http.Header
 
-	// 伪装层（Send 帧 / 升级与请求头）。
-	meta            *CodexMeta
-	metaPassthrough []metadataEntry // WithClientMetadata 注入项（WS client_metadata 任意键，只注入不解析）
-	session         *Session        // 会话标识（握手头 + 帧内 metadata）
-	trace           *TraceContext   // 外部注入（WS 帧 metadata，优先于自动生成）
-	traceAuto       bool            // 每帧自动生成 trace（默认开，WS 专用）
-	turnAuto        bool            // 每帧自动生成 turn_id（默认开）
-	turnProvider    func(turn uint64) string
-
-	// turn-state 请求/观测面（S2）。provider 每次请求求值，优先于 WithHeader
-	// （provider 返回空串时按优先级继续看 WithHeader）；observer 在捕获点同步
-	// 调用（握手 / HTTP 响应头 / WS 事件三处共用），实现方必须自己保证非阻塞。
-	turnStateProvider func() string
-	turnStateObserver func(string)
+	// 伪装层（Send 帧 / 升级与请求头）。身份（Session/Meta/turn-state）是请求
+	// 数据，经 Identity 逐次传入，不落在 options 上。
+	trace        *TraceContext // 外部注入（WS 帧 metadata，优先于自动生成）
+	traceAuto    bool          // 每帧自动生成 trace（默认开，WS 专用）
+	turnAuto     bool          // 每帧自动生成 turn_id（默认开）
+	turnProvider func(turn uint64) string
 
 	// HTTP 专用。
 	timeout     time.Duration
@@ -149,6 +142,40 @@ func defaultOptions() options {
 // Option 配置 Dial / NewHTTPClient。
 type Option func(*options)
 
+// reservedIdentityHeaders 是身份/turn-state 保留头：身份只能经 Identity 传入，
+// WithHeader（含默认头）遇到它们一律构造期 panic——否则删掉身份 Option 之后
+// 仍可从默认头注入身份，边界就白划了。匹配大小写不敏感。
+var reservedIdentityHeaders = [...]string{
+	HeaderSessionID,
+	HeaderThreadID,
+	HeaderClientRequestID,
+	HeaderWindowID,
+	HeaderInstallationID,
+	HeaderTurnState,
+}
+
+// resolveOptions 是 Dial / NewHTTPClient 共用的 Option 应用阶段：默认值 → 选项
+// → 保留键校验。两条构造入口都经过这里，过滤点不会因入口不同而漏掉。
+func resolveOptions(opts []Option) options {
+	cfg := defaultOptions()
+	for _, o := range opts {
+		o(&cfg)
+	}
+	rejectReservedHeaders(cfg.headers)
+	return cfg
+}
+
+// rejectReservedHeaders 对调用方头做大小写不敏感的保留键检查。
+func rejectReservedHeaders(h http.Header) {
+	for k := range h {
+		for _, reserved := range reservedIdentityHeaders {
+			if strings.EqualFold(k, reserved) {
+				panic("codexsdk: WithHeader 不得设置身份保留头 " + reserved + "（身份只能经 Identity 传入）")
+			}
+		}
+	}
+}
+
 // WithCompression 设置 WS 压缩模式（默认 CompressionDisabled）。
 func WithCompression(mode CompressionMode) Option {
 	return func(o *options) { o.compression = mode }
@@ -174,28 +201,16 @@ func WithBeta(version string) Option {
 
 // WithHeader 注入附加请求头（WS 升级 / HTTP 请求通用），覆盖默认头
 // （如 WithHeader("User-Agent", ...) 覆盖默认 codex UA）；同名多次调用为扩展。
+//
+// 身份/turn-state 保留键（session-id / thread-id / x-client-request-id /
+// x-codex-window-id / x-codex-installation-id / x-codex-turn-state）在构造期
+// panic：身份只能经 Identity 传入，默认头不得成为第二条注入通道。
 func WithHeader(key, value string) Option {
 	return func(o *options) {
 		if o.headers == nil {
 			o.headers = make(http.Header)
 		}
 		o.headers.Add(key, value)
-	}
-}
-
-// WithCodexMeta 设置 client_metadata 静态载体（值由调用方提供，
-// SDK 只组装不生成）。
-func WithCodexMeta(meta CodexMeta) Option {
-	return func(o *options) { o.meta = &meta }
-}
-
-// WithClientMetadata 注入 client_metadata 任意键值（网关面：SDK 只注入不解析，
-// 键名由调用方自定或引用 Meta* 常量，如 MetaResponsesLiteKey="true"）。
-// 注入按 entries 内部优先级取首次出现；对帧恒覆盖（网关值恒为准）。
-// 仅作用于 WS——HTTP 侧的对应能力用 WithHeader（请求头）。
-func WithClientMetadata(key, value string) Option {
-	return func(o *options) {
-		o.metaPassthrough = append(o.metaPassthrough, metadataEntry{key, value})
 	}
 }
 
@@ -220,41 +235,12 @@ func WithTurnAuto(enabled bool) Option {
 	return func(o *options) { o.turnAuto = enabled }
 }
 
-// WithSession 设置会话级标识（真实客户端 WS 握手恒带
-// x-client-request-id / session-id / thread-id / x-codex-window-id）：
-// 注入握手头，并补齐帧内 client_metadata 的 session_id / thread_id /
-// x-codex-window-id（CodexMeta 中同 key 优先）。会话内稳定。
-func WithSession(s Session) Option {
-	return func(o *options) { o.session = &s }
-}
-
 // WithTurnMetadata 设置 turn_metadata 内容提供回调：每次 Send 计一轮 turn
 // （从 1 起自增），以当前 turn 序号调用回调，返回值（协议约定格式的字符串，
 // 可为空=不注入）组装进 client_metadata."x-codex-turn-metadata"。
 // 优先级：帧内已存在 > CodexMeta.TurnMetadata > 本回调。
 func WithTurnMetadata(provider func(turn uint64) string) Option {
 	return func(o *options) { o.turnProvider = provider }
-}
-
-// WithTurnStateProvider 注册"每次请求求值"的 turn-state 来源（默认 nil）。
-//
-// 请求侧取值优先级：provider > WithHeader(HeaderTurnState, …) > 空串。
-// **不**回落 HTTPClient.TurnState()：缓存只作"上次签发过什么"的观测面，绝不是
-// 下一次请求的默认值——否则跨轮第一个请求必然重放上一轮的 ts（真实 codex 的
-// 契约是 ts 轮级、跨轮不得重放）。
-//
-// provider 返回值**不进连接身份**（WS 连接是 thread 级、跨轮复用）；provider
-// 返回空串不构成取值（按优先级继续看 WithHeader，两者都空 = 本次请求不带 ts）。
-func WithTurnStateProvider(fn func() string) Option {
-	return func(o *options) { o.turnStateProvider = fn }
-}
-
-// WithTurnStateObserver 注册"捕获到新 ts"的回调：响应头 / WS 握手响应头 /
-// WS 事件（response.metadata 的 headers）三处捕获点共用。
-//
-// 在捕获点**同步**调用——实现方必须自己保证非阻塞（网关只做一次原子写）。
-func WithTurnStateObserver(fn func(string)) Option {
-	return func(o *options) { o.turnStateObserver = fn }
 }
 
 // WithTimeout 设置 HTTP 客户端总超时（http.Client.Timeout；默认 0 不设限）。
@@ -297,9 +283,9 @@ func withKeepaliveInterval(d time.Duration) Option {
 type Client struct {
 	cn    *conn
 	codec *frameCodec
+	id    Identity
 
-	turn      atomic.Uint64 // turn_metadata 计数（仅 WithTurnMetadata 时自增）
-	turnState atomic.Value  // string；x-codex-turn-state 回传值
+	turn atomic.Uint64 // turn_metadata 计数（仅 WithTurnMetadata 时自增）
 
 	// closed 标记本地已发起关闭（Close/CloseNow）。对端关闭由常驻读者观测。
 	closed atomic.Bool
@@ -322,32 +308,25 @@ func (c *Client) Closed() bool { return c.closed.Load() }
 // 错误链，**不**构造 DialError——errors.Is(ctx) 保持成立。
 //
 // ctx 只约束握手：连接寿命与调用方 ctx 解耦（今日语义不变）。
-func Dial(ctx context.Context, auth Auth, opts ...Option) (*Client, error) {
+func Dial(ctx context.Context, auth Auth, id Identity, opts ...Option) (*Client, error) {
 	if auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	cfg := defaultOptions()
-	for _, o := range opts {
-		o(&cfg)
-	}
+	cfg := resolveOptions(opts)
 	cn, hs, err := dialConn(ctx, dialSpec{
 		auth:      auth,
 		opts:      cfg,
 		readLimit: cfg.readLimit,
 		mode:      modePull,
-		headers:   cfg.headers, // pull 面不剥离 turn-state（既有握手头行为）
+		headers:   cfg.headers,
+		identity:  id,
 	})
 	if err != nil {
 		return nil, err
 	}
-	c := &Client{cn: cn, codec: newFrameCodec(&cfg)}
-	// x-codex-turn-state 回传：上游在握手响应头签发 → SDK 缓存 →
-	// 后续 Send 帧 client_metadata 自动回传（跨轮不得回传，网关在轮结束时
-	// SetTurnState("") 清除）。
-	if hs.turnState != "" {
-		c.setTurnState(hs.turnState)
-	}
-	return c, nil
+	// 握手响应头签发的 ts 只走 Sink（消息身份边界：SDK 不保留状态）。
+	id.deliverTurnState(hs.turnState)
+	return &Client{cn: cn, codec: newFrameCodec(&cfg), id: id}, nil
 }
 
 // Send 发送一帧字节（文本帧）。
@@ -364,32 +343,17 @@ func (c *Client) Send(ctx context.Context, frame []byte) error {
 	return c.cn.write(ctx, wire)
 }
 
-// encodeFrame 把原生帧编码成 wire 字节（请求级快照：turn-state + turn 计数）。
+// encodeFrame 把原生帧编码成 wire 字节（请求级快照：Identity + turn 计数）。
 func (c *Client) encodeFrame(frame []byte) ([]byte, error) {
 	turn := uint64(0)
 	if c.codec.turnProvider != nil {
 		turn = c.turn.Add(1)
 	}
 	return c.codec.encode(frame, encodeNativeWS, frameInput{
-		TurnState: c.TurnState(),
-		Turn:      turn,
-		Now:       time.Now(),
+		Identity: c.id,
+		Turn:     turn,
+		Now:      time.Now(),
 	})
-}
-
-// SetTurnState 设置 x-codex-turn-state 回传值（服务端签发 → 后续 Send 帧
-// client_metadata 自动回传）。轮结束时传空串清除——跨轮不得回传。
-// 网关也可在别处观测到该值时显式设置。只影响 pull 面后续 Send 与 Client 的
-// turn-state 缓存值；不改变已建连接的身份，也不操作 HTTPClient 的 WS 连接缓存。
-func (c *Client) SetTurnState(state string) { c.setTurnState(state) }
-
-// setTurnState 是写入点（Dial 捕获握手响应头 + SetTurnState 共用）。
-func (c *Client) setTurnState(state string) { c.turnState.Store(state) }
-
-// TurnState 返回当前缓存的 x-codex-turn-state（Dial 时自动捕获握手响应头）。
-func (c *Client) TurnState() string {
-	v, _ := c.turnState.Load().(string)
-	return v
 }
 
 // Recv 读取下一帧字节（文本/二进制帧原样透传，不区分帧类型不做解析）。

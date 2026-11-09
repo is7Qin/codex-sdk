@@ -20,10 +20,10 @@ const (
 	responseEventFailed    = "response.failed"
 )
 
-// Responses 在 WS 臂可用 WithWSConnCache(n) 开启默认关闭的连接复用：连接身份
-// 只含 readLimit（不含 turn-state），同一 HTTPClient 上的连续请求——包括跨轮——
-// 都可命中；消费终态后自动归还；与 StreamBody 不共享连接。收益边界见
-// TRANSPORT.md 的连接复用段。
+// Responses 在 WS 臂可用 WithWSConnCache(n) 开启默认关闭的连接复用：连接身份 =
+// (threadKey, readLimit)（不含 turn-state/window），同一 HTTPClient 上同一
+// thread 的连续请求——包括跨轮跨窗口——都可命中；消费终态后自动归还；匿名不
+// 复用；与 StreamBody 不共享连接。收益边界见 TRANSPORT.md。
 //
 // Responses 合成非流式 responses 调用：内部无条件覆盖 stream:true（上游硬性
 // 要求——payload 任意 stream 值（含显式 false）均覆盖为 true，非流式语义由
@@ -35,9 +35,8 @@ const (
 // （injectResponsesClientMetadata——非流式聚合与流式路径同一注入点）。
 // 与 Do 的区别：Do 是通用非流式 POST（对 codex responses 端点 400 不可用）；
 // 本方法走 Stream 合成——网关以非流式语义消费（一次性响应）。
-// 返回 HTTPResponse{StatusCode, Raw, TurnState}（与 Do 同形态；TurnState 按 S5
-// 判据回填——真握手/新鲜响应回填本次签发值，命中复用只在"本次请求带的 ts ==
-// 最近签发值"时回填；跨轮不回填旧值）。
+// 返回 HTTPResponse{StatusCode, Raw}（与 Do 同形态）。上游签发的 turn-state
+// 只回调 Identity.Sink，不出现在响应对象上。
 // 错误透传同 Stream（HTTPError 信封 / fatal 五类 / 401 判死轮转）。
 //
 // TransportWS 时取数改走上游 Responses WS（StreamBody 的 ws 臂 + 同一个
@@ -47,7 +46,7 @@ const (
 // 消费侧的取消/超时不得把已完成的请求改写成失败（帧自身的事件语义不变：
 // failed / incomplete 仍按聚合器与截断规则报错）。这也覆盖"终态帧已入队、
 // deadline 随即到点"的次序：已拿到的帧先被交付。
-func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPResponse, error) {
+func (c *HTTPClient) Responses(ctx context.Context, payload []byte, id Identity) (*HTTPResponse, error) {
 	wire := payload
 	// 无条件覆盖 stream:true（含显式 stream:false）；非法 JSON 放弃注入保持原样
 	// （对齐 injectClientMetadataKeys 失败语义 + FilterCodexWsPayload/
@@ -59,32 +58,20 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 		}
 	}
 	agg := &responsesAggregator{}
-	// turn-state 快照：ws 臂由 exchange 回传；HTTP 臂没有连接复用，稍后用本次响应头
-	// 的捕获值充当"新鲜签发值"（见下方 S5 回填点）。
-	snap := turnStateSnapshot{}
 	if c.opts.responsesTransport == TransportWS {
-		var err error
 		// ws 臂：responsesStreamWS 直接从 exchange 取帧喂聚合器（不经 sseView
 		// 渲染 + scanSSE 回扫）。终态帧喂进聚合器后不再取帧，所以只有"终态之后
 		// 才到"的取消/超时可以豁免，其余错误原样透传。
-		snap, err = c.responsesStreamWS(ctx, wire, agg.feed)
+		err := c.responsesStreamWS(ctx, wire, id, agg.feed)
 		if err != nil {
 			if !agg.completed || !isContextError(err) {
 				return nil, err // 上游/传输错误透传（response.failed 事件级 HTTPError 同样原样）
 			}
 		}
 	} else {
-		// HTTP 臂每个请求都是一次全新的响应：**本次响应头**的值就是新鲜签发值
-		// （等价于"刚握手"），空 = 本次未签发。不读池级 c.TurnState()——那是
-		// "最近签发值"，本次没带 ts 时它仍是上一个响应的值，回填等于把旧 ts 当
-		// 本轮签发值（S5 要防的正是这个）；并发复用同一 client 时更不可控。
-		// 这里也不求值 effectiveTurnState()：reused == false 时判据用不到它，而
-		// sendRequest 已在发请求前求值过一次（一次请求只求值一次 provider）。
-		issued, err := c.streamIssued(ctx, wire, agg.feed)
-		if err != nil {
+		if err := c.streamIssued(ctx, wire, id, agg.feed); err != nil {
 			return nil, err // 上游错误（HTTPError/fatal 五类/401 轮转）/ response.failed 事件级错误透传
 		}
-		snap.issued, snap.reused = issued, false
 	}
 	if !agg.completed {
 		// 截断：流结束（[DONE] 与 EOF 统一）未达 response.completed → 错误返回，
@@ -95,13 +82,7 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 合成 responses 响应失败: %w", err)
 	}
-	return &HTTPResponse{
-		StatusCode: http.StatusOK,
-		Raw:        body,
-		// S5：与流式臂共用的回填判据——真握手回填本次签发值；命中复用只在轮内
-		// 相等时回填，跨轮绝不把旧值当成这一轮的签发值。
-		TurnState: c.syntheticTurnState(snap.issued, snap.effective, snap.reused),
-	}, nil
+	return &HTTPResponse{StatusCode: http.StatusOK, Raw: body}, nil
 }
 
 // responsesAggregator 是 SSE 事件 → 合成响应体的聚合态。

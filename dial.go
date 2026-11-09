@@ -23,6 +23,7 @@ type dialSpec struct {
 	readLimit int64
 	mode      connMode
 	headers   http.Header
+	identity  Identity // 握手头来源（帧内身份由编码器直接取）
 	// cache 是空闲连接的退役入口（nil = 复用关闭）；连接拿它来自行 sweep。
 	cache *connCache
 }
@@ -65,7 +66,7 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 		applyDefaultHeaders(hdr)
 		hdr.Set("OpenAI-Beta", "responses_websockets="+spec.opts.beta)
 		// 会话标识握手头（真实客户端恒带；trace 不进握手头，只进帧内 metadata）。
-		if s := spec.opts.session; s != nil {
+		if s := spec.identity.Session; s.SessionID != "" || s.ThreadID != "" || s.ClientRequestID != "" || s.WindowID != "" {
 			if s.SessionID != "" {
 				hdr.Set(HeaderSessionID, s.SessionID)
 			}

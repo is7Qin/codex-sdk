@@ -22,25 +22,25 @@ func benchPayload() []byte {
 	return []byte(b.String())
 }
 
-func benchClient() *HTTPClient {
-	return NewHTTPClient(PAT("t"),
-		WithCodexMeta(CodexMeta{
+func benchIdentity() Identity {
+	return Identity{
+		Session: Session{SessionID: "sess-1", ThreadID: "thread-1", WindowID: "thread-1:0"},
+		Meta: CodexMeta{
 			InstallationID: "inst-1", SessionID: "sess-1", ThreadID: "thread-1",
 			WindowID: "thread-1:0",
-		}),
-		WithSession(Session{SessionID: "sess-1", ThreadID: "thread-1", WindowID: "thread-1:0"}))
+		},
+	}
 }
 
 // BenchmarkInjectClientMetadata：现路径——ValidBytes + 单次 sjson.SetRawBytes
 // 整体替换 client_metadata。
 func BenchmarkInjectClientMetadata(b *testing.B) {
-	hc := benchClient()
 	p := benchPayload()
 	b.ReportAllocs()
 	b.SetBytes(int64(len(p)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = hc.injectResponsesClientMetadata(p)
+		_ = injectResponsesClientMetadata(p, benchIdentity())
 	}
 }
 

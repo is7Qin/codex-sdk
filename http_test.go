@@ -182,10 +182,11 @@ func TestHTTPStreamSSE(t *testing.T) {
 
 	// 回调内的原始字节引用 scanner 复用缓冲（仅在回调执行期间有效）——回调内拷贝。
 	var got []string
-	err := hc.Stream(context.Background(), []byte(`{"stream":true}`), func(raw []byte) error {
+	err := hc.Stream(context.Background(), []byte(`{"stream":true}`), Identity{}, func(raw []byte) error {
 		got = append(got, string(raw))
 		return nil
 	})
+
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -213,7 +214,7 @@ func TestHTTPStreamErrorStatus(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	err := hc.Stream(context.Background(), []byte(`{"stream":true}`), func(raw []byte) error { return nil })
+	err := hc.Stream(context.Background(), []byte(`{"stream":true}`), Identity{}, func(raw []byte) error { return nil })
 	var he *HTTPError
 	if !errors.As(err, &he) || he.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("期望 429 *HTTPError, got %v", err)
@@ -232,9 +233,10 @@ func TestHTTPCallbackErrorAbortsStream(t *testing.T) {
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	sentinel := errors.New("stop")
-	err := hc.Stream(context.Background(), []byte(`{}`), func(raw []byte) error {
+	err := hc.Stream(context.Background(), []byte(`{}`), Identity{}, func(raw []byte) error {
 		return sentinel
 	})
+
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("回调错误应透传, got %v", err)
 	}
@@ -293,74 +295,58 @@ func TestHTTPConnectionReuse(t *testing.T) {
 	}
 }
 
-// TestHTTPTurnStateRequestHeader：HTTP 面的请求侧取值（S2）。
-//
-//   - 没有任何来源 ⇒ 不带 x-codex-turn-state（真实客户端只有拿到 ts 后才带）；
-//   - WithTurnStateProvider ⇒ 每次请求重新求值，值进请求头（更新不必重建 client）；
-//   - 优先级 provider > WithHeader（provider 为空时才用 WithHeader）；
-//   - 响应头签发值自动捕获进 HTTPResponse.TurnState / TurnState()（Do 是原样透传面）。
-func TestHTTPTurnStateRequestHeader(t *testing.T) {
+// TestHTTPTurnStateIdentityHeader：HTTP 面请求侧 ts 只来自 Identity.TurnState，
+// 响应头签发值只回调 Identity.Sink（Do 不接收 Identity，也不暴露 ts）。
+func TestHTTPTurnStateIdentityHeader(t *testing.T) {
 	var gotEcho atomic.Value // string：上游看到的请求头
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEcho.Store(r.Header.Get(HeaderTurnState))
 		w.Header().Set(HeaderTurnState, "st-http")
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	t.Cleanup(srv.Close)
 
-	newClient := func(opts ...Option) *HTTPClient {
-		base := []Option{WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL))}
-		return NewHTTPClient(PAT("t"), append(base, opts...)...)
-	}
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	echo := func() string {
 		v, _ := gotEcho.Load().(string)
 		return v
 	}
-
-	// (a) 无来源：绝不携带该头（历史行为不变）。
-	hc := newClient()
-	for i := 0; i < 3; i++ {
-		resp, err := hc.Do(context.Background(), []byte(`{}`))
-		if err != nil {
-			t.Fatalf("Do #%d: %v", i, err)
-		}
-		if got := echo(); got != "" {
-			t.Fatalf("第 %d 次请求不应携带 x-codex-turn-state, got %q", i+1, got)
-		}
-		if resp.TurnState != "st-http" {
-			t.Fatalf("HTTPResponse.TurnState = %q, 期望 st-http", resp.TurnState)
-		}
-		if hc.TurnState() != "st-http" {
-			t.Fatalf("TurnState = %q, 期望 st-http（响应头自动捕获）", hc.TurnState())
+	stream := func(id Identity) {
+		t.Helper()
+		if err := hc.Stream(context.Background(), []byte(`{}`), id, func([]byte) error { return nil }); err != nil {
+			t.Fatalf("Stream: %v", err)
 		}
 	}
 
-	// (b) provider 逐请求求值；provider 优先于 WithHeader；provider 空时用 WithHeader。
-	var cur atomic.Value
-	cur.Store("ts-req-1")
-	hc2 := newClient(
-		WithTurnStateProvider(func() string {
-			v, _ := cur.Load().(string)
-			return v
-		}),
-		WithHeader(HeaderTurnState, "ts-from-header"),
-	)
-	for _, want := range []string{"ts-req-1", "ts-req-2"} {
-		cur.Store(want)
-		if _, err := hc2.Do(context.Background(), []byte(`{}`)); err != nil {
-			t.Fatalf("Do（provider=%s）: %v", want, err)
-		}
-		if got := echo(); got != want {
-			t.Fatalf("请求头 = %q, 期望 %q（provider 逐请求求值）", got, want)
+	// (a) 零值 Identity：不带该头；Sink nil 不 panic。
+	stream(Identity{})
+	if got := echo(); got != "" {
+		t.Fatalf("匿名请求不应携带 x-codex-turn-state, got %q", got)
+	}
+
+	// (b) 每请求身份：同一 client 两次不同 Identity.TurnState，各自进请求头；
+	// 响应头签发值进入各自 Sink。
+	var sink1, sink2 turnStateSink
+	stream(Identity{TurnState: "ts-req-1", Sink: &sink1})
+	if got := echo(); got != "ts-req-1" {
+		t.Fatalf("请求头 = %q, 期望 ts-req-1", got)
+	}
+	stream(Identity{TurnState: "ts-req-2", Sink: &sink2})
+	if got := echo(); got != "ts-req-2" {
+		t.Fatalf("请求头 = %q, 期望 ts-req-2（请求级身份，不重放）", got)
+	}
+	for name, sink := range map[string]*turnStateSink{"sink1": &sink1, "sink2": &sink2} {
+		if got := sink.values(); len(got) != 1 || got[0] != "st-http" {
+			t.Fatalf("%s = %v, 期望 [st-http]", name, got)
 		}
 	}
-	cur.Store("")
-	if _, err := hc2.Do(context.Background(), []byte(`{}`)); err != nil {
-		t.Fatalf("Do（provider 空）: %v", err)
-	}
-	if got := echo(); got != "ts-from-header" {
-		t.Fatalf("请求头 = %q, 期望 ts-from-header（provider 空 ⇒ WithHeader）", got)
+
+	// (c) 下一次不带 ts ⇒ 不重放上一轮值。
+	stream(Identity{})
+	if got := echo(); got != "" {
+		t.Fatalf("未带 Identity.TurnState 时不得重放旧值, got %q", got)
 	}
 }
 
@@ -391,7 +377,7 @@ func TestHTTPStreamDoneDrainsBodyForReuse(t *testing.T) {
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	for i := 0; i < 2; i++ {
-		if err := hc.Stream(context.Background(), []byte(`{}`), func(raw []byte) error { return nil }); err != nil {
+		if err := hc.Stream(context.Background(), []byte(`{}`), Identity{}, func(raw []byte) error { return nil }); err != nil {
 			t.Fatalf("Stream #%d: %v", i+1, err)
 		}
 	}
@@ -422,7 +408,7 @@ func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), func(raw []byte) error { return nil }); err != nil {
+	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), Identity{}, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	cm := gjson.GetBytes(gotBody, "client_metadata")
@@ -438,7 +424,7 @@ func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 
 	// 预筛判据收紧回归：instructions 字符串值含裸词 "client_metadata"
 	// （无引号包裹）→ 不触发短路，仍注入 turn_id
-	if err := hc.Stream(context.Background(), []byte(`{"model":"m","instructions":"see client_metadata docs"}`), func(raw []byte) error { return nil }); err != nil {
+	if err := hc.Stream(context.Background(), []byte(`{"model":"m","instructions":"see client_metadata docs"}`), Identity{}, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream #2: %v", err)
 	}
 	cm2 := gjson.GetBytes(gotBody, "client_metadata")
@@ -453,10 +439,10 @@ func TestHTTPStreamClientMetadataMinimal(t *testing.T) {
 	}
 }
 
-// TestHTTPStreamClientMetadataFullKeys：配置 CodexMeta（全键）+ WithSession
+// TestHTTPStreamClientMetadataFullKeys：Identity.Meta（全键）+ Identity.Session
 // （不同值）→ 恒 4 key + turn_id（meta 静态值优先于自动生成）+ 条件键全带
 // （subagent/parent-thread-id/parent_turn_id/turn-metadata）；meta 与 session
-// 同 key 时 meta 优先（对齐 WS 组装优先级 frameCodec.normalize）。不注入 trace
+// 同 key 时 Meta 优先（对齐 WS 组装优先级）。不注入 trace
 // 与 turn-state 键（HTTP 体面真实不带）。
 func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
 	var gotBody []byte
@@ -469,8 +455,10 @@ func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
-		WithCodexMeta(CodexMeta{
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	id := Identity{
+		Session: Session{SessionID: "sess-s", ThreadID: "thread-s", WindowID: "win-s:1"},
+		Meta: CodexMeta{
 			InstallationID: "inst-meta",
 			SessionID:      "sess-meta",
 			ThreadID:       "thread-meta",
@@ -480,9 +468,9 @@ func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
 			ParentThreadID: "parent-thread-1",
 			ParentTurnID:   "parent-turn-1",
 			TurnMetadata:   `{"request_kind":"turn"}`,
-		}),
-		WithSession(Session{SessionID: "sess-s", ThreadID: "thread-s", WindowID: "win-s:1"}))
-	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), func(raw []byte) error { return nil }); err != nil {
+		},
+	}
+	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), id, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	cm := gjson.GetBytes(gotBody, "client_metadata")
@@ -497,7 +485,7 @@ func TestHTTPStreamClientMetadataFullKeys(t *testing.T) {
 		"x-codex-window-id":       "win-meta:0",
 	} {
 		if got := cm.Get(key).String(); got != want {
-			t.Fatalf("%s = %q, 期望 %q（CodexMeta 优先于 WithSession）", key, got, want)
+			t.Fatalf("%s = %q, 期望 %q（Identity.Meta 优先于 Identity.Session）", key, got, want)
 		}
 	}
 	// turn_id：meta 静态值优先（不自动生成）
@@ -538,10 +526,10 @@ func TestHTTPStreamClientMetadataOverride(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
-		WithCodexMeta(CodexMeta{InstallationID: "inst-1", TurnID: "meta-turn", Subagent: "meta-sub"}))
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	id := Identity{Meta: CodexMeta{InstallationID: "inst-1", TurnID: "meta-turn", Subagent: "meta-sub"}}
 	payload := []byte(`{"model":"m","client_metadata":{"turn_id":"payload-turn","x-openai-subagent":"keep"}}`)
-	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
+	if err := hc.Stream(context.Background(), payload, id, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	// 覆盖：payload 内 turn_id/subagent 被 CodexMeta 值覆盖；缺失键补齐。
@@ -575,7 +563,7 @@ func TestHTTPStreamClientMetadataQuotedValueEdge(t *testing.T) {
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	payload := []byte(`{"model":"m","instructions":"client_metadata"}`)
-	if err := hc.Stream(context.Background(), payload, func(raw []byte) error { return nil }); err != nil {
+	if err := hc.Stream(context.Background(), payload, Identity{}, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	if got := gjson.GetBytes(gotBody, "instructions").String(); got != "client_metadata" {
@@ -586,7 +574,7 @@ func TestHTTPStreamClientMetadataQuotedValueEdge(t *testing.T) {
 	}
 }
 
-// TestHTTPStreamClientMetadataSessionFallback：未配置 meta 仅 WithSession →
+// TestHTTPStreamClientMetadataSessionFallback：未配置 Meta 仅 Session →
 // session_id/thread_id/x-codex-window-id（session 值）+ 自动 turn_id（无静态
 // 值）；installation_id 缺（仅 CodexMeta 可携带）。
 func TestHTTPStreamClientMetadataSessionFallback(t *testing.T) {
@@ -600,9 +588,9 @@ func TestHTTPStreamClientMetadataSessionFallback(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
-		WithSession(Session{SessionID: "sess-s", ThreadID: "thread-s", WindowID: "win-s:1"}))
-	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), func(raw []byte) error { return nil }); err != nil {
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	id := Identity{Session: Session{SessionID: "sess-s", ThreadID: "thread-s", WindowID: "win-s:1"}}
+	if err := hc.Stream(context.Background(), []byte(`{"model":"m"}`), id, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	cm := gjson.GetBytes(gotBody, "client_metadata")
@@ -638,9 +626,9 @@ func TestHTTPStreamClientMetadataInvalidJSON(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
-		WithCodexMeta(CodexMeta{InstallationID: "inst-1"}))
-	err := hc.Stream(context.Background(), []byte(`{"broken`), func(raw []byte) error { return nil })
+	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	id := Identity{Meta: CodexMeta{InstallationID: "inst-1"}}
+	err := hc.Stream(context.Background(), []byte(`{"broken`), id, func(raw []byte) error { return nil })
 	var he *HTTPError
 	if !errors.As(err, &he) {
 		t.Fatalf("期望 *HTTPError, got %T: %v", err, err)
@@ -686,7 +674,7 @@ func TestHTTPStreamBodyReturnsOnHeadersBeforeBodyEnds(t *testing.T) {
 	}
 	got := make(chan result, 1)
 	go func() {
-		resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+		resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`), Identity{})
 		got <- result{resp, err}
 	}()
 
@@ -734,7 +722,7 @@ func TestHTTPStreamBodySuccessDoesNotCloseBodyEarly(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+	resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`), Identity{})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -777,7 +765,7 @@ func TestHTTPStreamBodyRejectsNon200AndDrains(t *testing.T) {
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	for i := 0; i < 2; i++ {
-		resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+		resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`), Identity{})
 		if resp != nil {
 			_ = resp.Body.Close()
 			t.Fatalf("#%d 非 200 不应返回 resp", i+1)
@@ -826,7 +814,7 @@ func TestHTTPStreamBody401Rotation(t *testing.T) {
 
 	hc := NewHTTPClient(OAuthWithRotation("rt-0", WithInitialAccessToken("at-10")),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+	resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`), Identity{})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -856,16 +844,17 @@ func TestHTTPStreamBodyCapturesTurnState(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`))
+	var sink turnStateSink
+	resp, err := hc.StreamBody(context.Background(), []byte(`{"stream":true}`), Identity{Sink: &sink})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
 	defer resp.Body.Close()
 	if got := resp.Header.Get(HeaderTurnState); got != "st-body" {
-		t.Fatalf("本次响应头 turn-state = %q, 期望 st-body", got)
+		t.Fatalf("原始响应头 turn-state = %q, 期望 st-body", got)
 	}
-	if hc.TurnState() != "st-body" {
-		t.Fatalf("TurnState = %q, 期望 st-body（本次响应头捕获）", hc.TurnState())
+	if got := sink.values(); len(got) != 1 || got[0] != "st-body" {
+		t.Fatalf("Sink = %v, 期望 [st-body]（本次响应头捕获）", got)
 	}
 }
 
@@ -889,7 +878,7 @@ func TestHTTPStreamBodyCancelTerminatesRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	resp, err := hc.StreamBody(ctx, []byte(`{"stream":true}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"stream":true}`), Identity{})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -959,7 +948,7 @@ func TestHTTPStreamBodyNoRedirect3xx(t *testing.T) {
 			tr := &redirectRewriteTransport{official: "https://chatgpt.com/backend-api/codex/responses", srvBase: base}
 			hc := NewHTTPClient(PAT("t"), WithTransport(tr))
 
-			resp, err := hc.StreamBody(context.Background(), []byte(`{"model":"m"}`))
+			resp, err := hc.StreamBody(context.Background(), []byte(`{"model":"m"}`), Identity{})
 			if resp != nil {
 				_ = resp.Body.Close()
 				t.Fatalf("3xx 不应返回未关闭 resp")
@@ -990,10 +979,11 @@ func TestHTTPStreamCapturesTurnState(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	if err := hc.Stream(context.Background(), []byte(`{"stream":true}`), func(raw []byte) error { return nil }); err != nil {
+	var sink turnStateSink
+	if err := hc.Stream(context.Background(), []byte(`{"stream":true}`), Identity{Sink: &sink}, func(raw []byte) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if hc.TurnState() != "st-stream" {
-		t.Fatalf("Stream 响应头应捕获 turn-state, got %q", hc.TurnState())
+	if got := sink.values(); len(got) != 1 || got[0] != "st-stream" {
+		t.Fatalf("Sink = %v, 期望 [st-stream]", got)
 	}
 }

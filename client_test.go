@@ -133,8 +133,9 @@ func startReader(t *testing.T, c *Client) chan []byte {
 // 白名单内字段保留 + 强制 store:false；无注入项时不动 client_metadata）。
 func TestDialPATAuthAndRoundtrip(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("test-pat"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
+	c, err := Dial(context.Background(), PAT("test-pat"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
 		WithTraceAuto(false), WithTurnAuto(false))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -170,7 +171,7 @@ func TestDialPATAuthAndRoundtrip(t *testing.T) {
 // TestDialRejectsBadAuth：升级 401 时返回 DialError（携带状态码）。
 func TestDialRejectsBadAuth(t *testing.T) {
 	url, _ := startEchoServer(t, "Bearer correct")
-	_, err := Dial(context.Background(), PAT("wrong"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	_, err := Dial(context.Background(), PAT("wrong"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	var de *DialError
 	if !errors.As(err, &de) {
 		t.Fatalf("期望 *DialError, got %T: %v", err, err)
@@ -188,7 +189,7 @@ func TestOAuthProviderCalledPerDial(t *testing.T) {
 		calls.Add(1)
 		return "oauth-1", nil
 	}
-	c1, err := Dial(context.Background(), OAuth(provider), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c1, err := Dial(context.Background(), OAuth(provider), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -202,7 +203,7 @@ func TestOAuthProviderCalledPerDial(t *testing.T) {
 		t.Fatalf("provider 调用次数 = %d, 期望 1", calls.Load())
 	}
 
-	c2, err := Dial(context.Background(), OAuth(provider), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c2, err := Dial(context.Background(), OAuth(provider), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("第二次 Dial: %v", err)
 	}
@@ -217,7 +218,10 @@ func TestOAuthProviderErrorAbortsDial(t *testing.T) {
 	url, _ := startEchoServer(t, "")
 	_, err := Dial(context.Background(), OAuth(func(ctx context.Context) (string, error) {
 		return "", errors.New("token expired")
-	}), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	}), Identity{},
+
+		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+
 	if err == nil || !strings.Contains(err.Error(), "token expired") {
 		t.Fatalf("期望鉴权错误透传, got %v", err)
 	}
@@ -226,7 +230,7 @@ func TestOAuthProviderErrorAbortsDial(t *testing.T) {
 // TestDialNilAuth：auth 为 nil 直接报错。
 func TestDialNilAuth(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	if _, err := Dial(context.Background(), nil, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url))); err == nil {
+	if _, err := Dial(context.Background(), nil, Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url))); err == nil {
 		t.Fatal("auth 为 nil 应报错")
 	}
 }
@@ -235,7 +239,7 @@ func TestDialNilAuth(t *testing.T) {
 // WithHeader / WithBeta 可覆盖。
 func TestWSDefaultHeadersAndOverride(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -250,8 +254,9 @@ func TestWSDefaultHeadersAndOverride(t *testing.T) {
 
 	// 覆盖：自定义 UA + beta 任意值（现役唯一真实值 DefaultBetaWS=2026-02-06）
 	url2, st2 := startEchoServer(t, "")
-	c2, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)),
+	c2, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)),
 		WithHeader("User-Agent", "custom-ua"), WithBeta("2026-02-04"))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -266,8 +271,9 @@ func TestWSDefaultHeadersAndOverride(t *testing.T) {
 // TestBetaAndCustomHeaders：OpenAI-Beta 与自定义头注入升级请求。
 func TestBetaAndCustomHeaders(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
 		WithBeta("2026-02-04"), WithHeader("x-custom", "abc"))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -282,8 +288,9 @@ func TestBetaAndCustomHeaders(t *testing.T) {
 // TestPing：WS 层 ping 有 pong 应答（常驻读循环处理 pong），ping 后连接仍可用。
 func TestPing(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
 		WithTraceAuto(false), WithTurnAuto(false))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -314,7 +321,7 @@ func TestPing(t *testing.T) {
 // TestHeartbeatKeepalive：短间隔心跳下连接保持存活（常驻读循环处理 pong）。
 func TestHeartbeatKeepalive(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)), WithPingInterval(50*time.Millisecond))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)), WithPingInterval(50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -345,7 +352,7 @@ func TestHeartbeatDeathPath(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { close(release) }) // LIFO：先释放 handler，再关 server
 
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)), WithPingInterval(50*time.Millisecond))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)), WithPingInterval(50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -369,7 +376,7 @@ func TestHeartbeatDeathPath(t *testing.T) {
 // TestReadLimit：单帧超 ReadLimit 返回 ErrMessageTooBig。
 func TestReadLimit(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)), WithReadLimit(8))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)), WithReadLimit(8))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -388,7 +395,7 @@ func TestReadLimit(t *testing.T) {
 // TestCloseCodePassthrough：关闭码与原因透传 + Close 幂等。
 func TestCloseCodePassthrough(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -408,7 +415,7 @@ func TestCloseCodePassthrough(t *testing.T) {
 // TestCloseNow：CloseNow 立即断开且幂等，CloseNow 后 Close 为 no-op。
 func TestCloseNow(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -445,7 +452,7 @@ func TestBinaryFrameRecv(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -463,8 +470,9 @@ func TestBinaryFrameRecv(t *testing.T) {
 // TestRecvBufferOwnership：Recv 返回的缓冲归调用方所有（跨次调用有效）。
 func TestRecvBufferOwnership(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
 		WithTraceAuto(false), WithTurnAuto(false))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -500,7 +508,7 @@ var traceparentRe = regexp.MustCompile(`^00-[0-9a-f]{32}-[0-9a-f]{16}-01$`)
 // TestWSTraceHeaders：WS 握手不发 trace 头（trace 只进帧内 client_metadata）。
 func TestWSTraceHeaders(t *testing.T) {
 	url, st := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -519,12 +527,12 @@ func TestWSTraceHeaders(t *testing.T) {
 	}
 }
 
-// TestSessionHeaders：WithSession 注入握手头 + 帧内 client_metadata
+// TestSessionHeaders：Identity.Session 注入握手头 + 帧内 client_metadata
 // （session_id/thread_id/x-codex-window-id）。
 func TestSessionHeaders(t *testing.T) {
 	url, st := startEchoServer(t, "")
 	sess := Session{SessionID: "s-1", ThreadID: "t-1", WindowID: "t-1:0"}
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)), WithSession(sess))
+	c, err := Dial(context.Background(), PAT("t"), Identity{Session: sess}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -560,7 +568,7 @@ func TestSessionHeaders(t *testing.T) {
 	// ClientRequestID 显式提供
 	url2, st2 := startEchoServer(t, "")
 	sess2 := Session{SessionID: "s-2", ThreadID: "t-2", ClientRequestID: "cr-2"}
-	c2, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)), WithSession(sess2))
+	c2, err := Dial(context.Background(), PAT("t"), Identity{Session: sess2}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url2)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -572,11 +580,8 @@ func TestSessionHeaders(t *testing.T) {
 	})
 }
 
-// TestWSTurnState：握手响应头 x-codex-turn-state → SDK 缓存 → 帧内回传；
-// 显式 SetTurnState 同效；SetTurnState("") 清除（跨轮不得回传）。
-// 对齐真实 codex：WS 发送路径在 build_ws_client_metadata 后显式追加 turn-state
-// 进 client_metadata（client.rs:1626-1631，帧体携带 :1702-1711）——TurnState
-// 非空时帧 metadata 恒带该键，勿反转回"无键"断言。
+// TestWSTurnState：Dial 的 Identity 直接决定请求身份——握手响应头签发的 ts
+// 只进 Sink；帧内 ts 来自当次 Identity.TurnState（SDK 不保留状态、不自动回传）。
 func TestWSTurnState(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderTurnState, "st-1")
@@ -599,14 +604,15 @@ func TestWSTurnState(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := Dial(context.Background(), PAT("t"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
+	var sink turnStateSink
+	id := Identity{TurnState: "st-req", Sink: &sink}
+	c, err := Dial(context.Background(), PAT("t"), id, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer c.Close(StatusGoingAway, "")
-
-	if got := c.TurnState(); got != "st-1" {
-		t.Fatalf("TurnState = %q, 期望 st-1（握手响应头自动捕获）", got)
+	if got := sink.values(); len(got) != 1 || got[0] != "st-1" {
+		t.Fatalf("Sink = %v, 期望 [st-1]（握手响应头）", got)
 	}
 	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
 		t.Fatalf("Send: %v", err)
@@ -615,34 +621,7 @@ func TestWSTurnState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recv: %v", err)
 	}
-	if v := gjson.GetBytes(ev, "client_metadata.x-codex-turn-state").String(); v != "st-1" {
-		t.Fatalf("帧内应回传 x-codex-turn-state=st-1, got %q", v)
-	}
-
-	// 显式设置（网关在别处观测到该值时手动回传）：TurnState 非空 → 帧
-	// metadata 恒带该键（对齐真实 :1626-1631 追加注入）
-	c.SetTurnState("st-manual")
-	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	ev3, err := c.Recv(context.Background())
-	if err != nil {
-		t.Fatalf("Recv: %v", err)
-	}
-	if v := gjson.GetBytes(ev3, "client_metadata.x-codex-turn-state").String(); v != "st-manual" {
-		t.Fatalf("显式设置后帧内应回传 x-codex-turn-state=st-manual, got %q", v)
-	}
-
-	// 轮结束清除：不再回传
-	c.SetTurnState("")
-	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	ev2, err := c.Recv(context.Background())
-	if err != nil {
-		t.Fatalf("Recv: %v", err)
-	}
-	if gjson.GetBytes(ev2, "client_metadata.x-codex-turn-state").Exists() {
-		t.Fatal("清除后不应回传 x-codex-turn-state")
+	if v := gjson.GetBytes(ev, "client_metadata.x-codex-turn-state").String(); v != "st-req" {
+		t.Fatalf("帧内 x-codex-turn-state = %q, 期望 st-req（Identity.TurnState）", v)
 	}
 }

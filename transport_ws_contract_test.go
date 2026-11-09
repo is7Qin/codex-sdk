@@ -100,7 +100,7 @@ func contractClient(t *testing.T, srvURL string, opts ...Option) *HTTPClient {
 // contractResponseBody 打开一次 StreamBody 并返回 body（调用方负责关闭）。
 func contractResponseBody(t *testing.T, hc *HTTPClient, ctx context.Context) io.ReadCloser {
 	t.Helper()
-	resp, err := hc.StreamBody(ctx, []byte(contractPayload))
+	resp, err := hc.StreamBody(ctx, []byte(contractPayload), Identity{})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestWSDialRefusedIsNotHTTPError(t *testing.T) {
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := hc.StreamBody(ctx, []byte(contractPayload))
+	_, err := hc.StreamBody(ctx, []byte(contractPayload), Identity{})
 	if err == nil {
 		t.Fatal("期望拨号失败")
 	}
@@ -238,7 +238,7 @@ func TestWSDialCanceledCtxIsCanceled(t *testing.T) {
 	hc := contractClient(t, "http://127.0.0.1:1")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := hc.StreamBody(ctx, []byte(contractPayload))
+	_, err := hc.StreamBody(ctx, []byte(contractPayload), Identity{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("错误 = %v，想要 context.Canceled", err)
 	}
@@ -262,7 +262,7 @@ func TestWSUpgradeFailureKeepsCause(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := contractClient(t, srv.URL)
-	_, err := hc.StreamBody(context.Background(), []byte(contractPayload))
+	_, err := hc.StreamBody(context.Background(), []byte(contractPayload), Identity{})
 	var he *HTTPError
 	if !errors.As(err, &he) {
 		t.Fatalf("错误 = %T: %v，想要 *HTTPError", err, err)
@@ -799,8 +799,9 @@ func TestWSFrameShapeUnchanged(t *testing.T) {
 // 不 panic，且所有调用拿到同一结果。
 func TestWSCloseIdempotentNoPanic(t *testing.T) {
 	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("pat-close"),
+	c, err := Dial(context.Background(), PAT("pat-close"), Identity{},
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)))
+
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

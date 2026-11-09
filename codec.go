@@ -36,33 +36,28 @@ const (
 
 // frameInput 是一次编码的请求级输入（快照，不随后续状态变化）。
 type frameInput struct {
-	TurnState string    // 请求级 turn-state 快照
-	Turn      uint64    // 0 = 不生成 turn_metadata
-	Now       time.Time // 环境时间改写基准
+	Identity Identity  // 本次请求的全部身份（Session/Meta/TurnState）
+	Turn     uint64    // 0 = 不生成 turn_metadata
+	Now      time.Time // 环境时间改写基准
 }
 
 // frameCodec 负责把请求体 / 原生帧编码成 wire 字节。**无可变状态**（配置在
-// 构造期固定），可并发使用；请求级差异全部经 frameInput 传入。
+// 构造期固定），可并发使用；请求级差异全部经 frameInput 传入（身份不驻留
+// codec）。
 type frameCodec struct {
-	meta            *CodexMeta
-	metaPassthrough []metadataEntry
-	session         *Session
-	trace           *TraceContext
-	traceAuto       bool
-	turnAuto        bool
-	turnProvider    func(turn uint64) string
+	trace        *TraceContext
+	traceAuto    bool
+	turnAuto     bool
+	turnProvider func(turn uint64) string
 }
 
 // newFrameCodec 从 options 构造 codec（值拷贝语义：之后改 options 不影响它）。
 func newFrameCodec(o *options) *frameCodec {
 	return &frameCodec{
-		meta:            o.meta,
-		metaPassthrough: o.metaPassthrough,
-		session:         o.session,
-		trace:           o.trace,
-		traceAuto:       o.traceAuto,
-		turnAuto:        o.turnAuto,
-		turnProvider:    o.turnProvider,
+		trace:        o.trace,
+		traceAuto:    o.traceAuto,
+		turnAuto:     o.turnAuto,
+		turnProvider: o.turnProvider,
 	}
 }
 
@@ -97,35 +92,28 @@ func (fc *frameCodec) encode(raw []byte, mode encodeMode, in frameInput) ([]byte
 	return fc.normalize(frame, mode, obj)
 }
 
-// metaEntries 组装本次编码的 client_metadata 注入项。优先级：CodexMeta 静态值 >
-// WithSession > turn-state 回传 > WithClientMetadata 透传 > 自动机制（turn_id /
-// trace）> turn_metadata 回调；同名键取首次出现（clientMetadataObject 去重）。
+// metaEntries 组装本次编码的 client_metadata 注入项。优先级：Identity.Meta >
+// Identity.Session > turn-state 回传 > 自动机制（turn_id / trace）>
+// turn_metadata 回调；同名键取首次出现（clientMetadataObject 去重）。
 //
 // buf 由调用方在栈上预留并传入：helper 返回切片，缓冲若留在本函数内就会逃逸到堆。
 func (fc *frameCodec) metaEntries(buf []metadataEntry, in frameInput) metaEntries {
 	entries := metaEntries(buf[:0])
-	entries = entries.withCodexMetaIdentity(fc.meta)
-	if m := fc.meta; m != nil {
-		entries = entries.add(codexMetaTurnMetadataKey, m.TurnMetadata)
-		entries = entries.add(codexMetaTraceparentKey, m.Traceparent)
-		entries = entries.add(codexMetaTracestateKey, m.Tracestate)
-	}
-	entries = entries.withSessionIdentity(fc.session)
+	entries = entries.withCodexMetaIdentity(in.Identity.Meta)
+	entries = entries.add(codexMetaTurnMetadataKey, in.Identity.Meta.TurnMetadata)
+	entries = entries.add(codexMetaTraceparentKey, in.Identity.Meta.Traceparent)
+	entries = entries.add(codexMetaTracestateKey, in.Identity.Meta.Tracestate)
+	entries = entries.withSessionIdentity(in.Identity.Session)
 	// turn-state 回传（TurnState 非空时帧 metadata 恒带）：真实 codex WS
 	// 发送路径显式追加注入（client.rs:1626-1631，帧体携带 :1702-1711），与
 	// HTTP 头面（client.rs:1202）构成双面机制——此注入与真实逐点一致，勿删
 	// （完整实证见 doc.go"上游协议与参考"）。
-	if in.TurnState != "" {
-		entries = entries.add(codexMetaTurnStateKey, in.TurnState)
-	}
-	// 调用方透传键（WithClientMetadata）：只透传不解析，恒覆盖帧内已有同 key
-	//（网关值为准——注入顺序在自动机制之前，同 key 由网关决定）。
-	for _, e := range fc.metaPassthrough {
-		entries = entries.add(e.key, e.value)
+	if in.Identity.TurnState != "" {
+		entries = entries.add(codexMetaTurnStateKey, in.Identity.TurnState)
 	}
 	// turn_id 恒带且覆盖：帧内已有 client_metadata.turn_id 不参与透传——
-	// 无静态值时每帧自动生成 UUIDv7（CodexMeta.TurnID 静态值优先），网关值恒为准。
-	if fc.turnAuto && (fc.meta == nil || fc.meta.TurnID == "") {
+	// 无静态值时每帧自动生成 UUIDv7（Identity.Meta.TurnID 静态值优先），网关值恒为准。
+	if fc.turnAuto && in.Identity.Meta.TurnID == "" {
 		entries = entries.add(codexMetaTurnKey, NewUUIDv7())
 	}
 	// 每帧 trace：外部 WithTraceContext 静态值优先，否则每帧自动生成
@@ -397,7 +385,12 @@ func encodeOnePass(frame []byte, mode encodeMode, obj []byte) ([]byte, bool) {
 			}
 		case wsKeyClientMetadata:
 			wroteMeta = true
-			if len(obj) > 0 && !bytes.Equal(value, obj) { // 注入对象已一致 ⇒ 不必重写
+			switch {
+			case len(obj) == 0:
+				// 身份只来自 Identity；本次为空 ⇒ 删掉 payload 自带的身份，
+				// 否则"匿名"会把调用方的旧 session/thread/ts 透传给上游。
+				act, field = wsActDelete, wsMetaField
+			case !bytes.Equal(value, obj): // 注入对象已一致 ⇒ 不必重写
 				act, field, withObj = wsActWrite, wsMetaField, true
 			}
 		}

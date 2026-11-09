@@ -18,9 +18,9 @@ const DefaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 // 自动重试一次 / fatal 类错误透传（不被 HTTPError 吞掉，errors.As 可区分）/
 // 状态码 >= 400 返回 *HTTPError 原样交付。GET 无请求体（payload nil →
 // sendRequest 内空 reader，不特判；GET 语义由 method 参数决定）。turn-state
-// 不捕获（对齐 GenerateImage/Search——doURL 路径不捕获，网关不消费）。
+// 不捕获（对齐 GenerateImage/Search——非 responses 面不接收 Identity）。
 func (c *HTTPClient) GetUsage(ctx context.Context) (*UsageStatus, error) {
-	resp, err := c.doURL(ctx, c.httpClient(), DefaultUsageURL, http.MethodGet, nil)
+	resp, err := c.doURL(ctx, c.httpClient(), DefaultUsageURL, http.MethodGet, nil, Identity{})
 	if err != nil {
 		return nil, err
 	}

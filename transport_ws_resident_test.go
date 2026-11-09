@@ -113,7 +113,7 @@ func TestWSReaderKeepsPongsWhileConsumerIdle(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestWSReaderClosePromptAndIdempotent(t *testing.T) {
 	hc := newWSClient(t, up)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestWSDialErrorCarriesBody(t *testing.T) {
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	_, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err == nil {
 		t.Fatal("期望升级失败")
 	}
@@ -286,7 +286,7 @@ func TestWSDialOverHTTP2CapableTransport(t *testing.T) {
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("h2 能力 transport 上的 WS 升级失败: %v", err)
 	}

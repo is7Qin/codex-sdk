@@ -212,8 +212,7 @@ func startResponsesMock(t *testing.T, hdr http.Header, events []string, sendDone
 }
 
 // TestResponsesAggregateWire：全链路——鉴权头注入 + stream:true 注入（payload
-// 未带 stream）+ 其余字段保留 + 事件聚合合成体 + 响应头 turn-state 捕获
-// （resp.TurnState 与 c.TurnState() 一致：HTTP 臂每个响应都是新鲜值）。
+// 未带 stream）+ 其余字段保留 + 事件聚合合成体 + 响应头 turn-state 只进 Sink。
 func TestResponsesAggregateWire(t *testing.T) {
 	var cap responsesWireCapture
 	srv := startResponsesMock(t,
@@ -222,7 +221,9 @@ func TestResponsesAggregateWire(t *testing.T) {
 		true, &cap)
 
 	hc := NewHTTPClient(PAT("pat-resp"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
-	resp, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":"hi"}`))
+	var sink turnStateSink
+	id := identityFor("thread-resp", "thread-resp:0", "", &sink)
+	resp, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":"hi"}`), id)
 	if err != nil {
 		t.Fatalf("Responses: %v", err)
 	}
@@ -254,25 +255,14 @@ func TestResponsesAggregateWire(t *testing.T) {
 	if string(resp.Raw) != want {
 		t.Fatalf("合成体 = %s\n期望     = %s", resp.Raw, want)
 	}
-	if resp.TurnState != "st-resp" {
-		// S5 的"真握手/新鲜响应"分支：HTTP 臂没有连接复用，本次响应头就是新鲜签发值，
-		// 必须回填（否则调用方拿不到 ts，也违背旧行为）。
-		t.Fatalf("HTTPResponse.TurnState = %q, 期望 st-resp", resp.TurnState)
-	}
-	if hc.TurnState() != "st-resp" {
-		t.Fatalf("TurnState() = %q, 期望 st-resp（Stream 内部已捕获）", hc.TurnState())
+	if got := sink.values(); len(got) != 1 || got[0] != "st-resp" {
+		t.Fatalf("Sink = %v, 期望 [st-resp]（HTTP 响应头签发值）", got)
 	}
 }
 
-// TestResponsesAggregateTurnStateIsPerResponse：HTTP 臂的 HTTPResponse.TurnState
-// 必须取**本次响应头**，不能拿池级最近签发值顶替（S5 的 `!reused` 分支含义就是
-// "本次响应 = 新鲜签发值"）。
-//
-// 场景：第一个响应签发 st-first，第二个响应**不带** ts。若实现读
-// c.TurnState()（池级最近值，仅非空才覆盖），第二次会回填 st-first——调用方把
-// 它当成本轮签发值再存一次，下一请求就重放一个旧 ts（跨轮重放，正是 S3 要杜绝
-// 的 bug）。Do 一直是 per-response 语义，聚合臂必须对齐。
-func TestResponsesAggregateTurnStateIsPerResponse(t *testing.T) {
+// TestResponsesTurnStateIsPerResponseViaSink：HTTP 臂每次响应头的 ts 只回调
+// 本次 Identity.Sink；第二个响应未签发时 Sink 不增长（per-response 语义）。
+func TestResponsesTurnStateIsPerResponseViaSink(t *testing.T) {
 	var n atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -291,25 +281,18 @@ func TestResponsesAggregateTurnStateIsPerResponse(t *testing.T) {
 
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t,
 		"https://chatgpt.com/backend-api/codex/responses", srv.URL+"/v1/responses")))
-
-	first, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
-	if err != nil {
+	var sink1, sink2 turnStateSink
+	if _, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), identityFor("thread-h1", "thread-h1:0", "", &sink1)); err != nil {
 		t.Fatalf("第一次 Responses: %v", err)
 	}
-	if first.TurnState != "st-first" {
-		t.Fatalf("第一次 HTTPResponse.TurnState = %q, 期望 st-first", first.TurnState)
+	if got := sink1.values(); len(got) != 1 || got[0] != "st-first" {
+		t.Fatalf("第一次 Sink = %v, 期望 [st-first]", got)
 	}
-
-	second, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
-	if err != nil {
+	if _, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), identityFor("thread-h2", "thread-h2:0", "", &sink2)); err != nil {
 		t.Fatalf("第二次 Responses: %v", err)
 	}
-	if second.TurnState != "" {
-		t.Fatalf("第二次 HTTPResponse.TurnState = %q, 期望空（本次响应未签发，不得回填上次的值）", second.TurnState)
-	}
-	// 池级缓存是 "最近签发值"，不做清除：它只作观测面，不参与本方法的回填。
-	if got := hc.TurnState(); got != "st-first" {
-		t.Fatalf("TurnState() = %q, 期望 st-first（池级最近签发值不被空响应覆盖）", got)
+	if got := sink2.values(); len(got) != 0 {
+		t.Fatalf("第二次 Sink = %v, 期望空（本次响应未签发）", got)
 	}
 }
 
@@ -321,7 +304,7 @@ func TestResponsesStreamFalseOverridden(t *testing.T) {
 		[]string{respCreatedEvent, respItemMsgDoneEv, respCompletedEv}, true, &cap)
 
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
-	if _, err := hc.Responses(context.Background(), []byte(`{"model":"m","stream":false}`)); err != nil {
+	if _, err := hc.Responses(context.Background(), []byte(`{"model":"m","stream":false}`), Identity{}); err != nil {
 		t.Fatalf("Responses: %v", err)
 	}
 	cap.mu.Lock()
@@ -347,7 +330,7 @@ func TestResponsesInvalidPayloadAbandonInjection(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	_, err := hc.Responses(context.Background(), []byte(`{"broken`))
+	_, err := hc.Responses(context.Background(), []byte(`{"broken`), Identity{})
 	var he *HTTPError
 	if !errors.As(err, &he) {
 		t.Fatalf("期望 *HTTPError, got %T: %v", err, err)
@@ -368,7 +351,7 @@ func TestResponsesInvalidPayloadAbandonInjection(t *testing.T) {
 func TestResponsesTruncatedEOF(t *testing.T) {
 	srv := startResponsesMock(t, nil, []string{respCreatedEvent, respItemMsgDoneEv}, false, nil)
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
-	_, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
+	_, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{})
 	if err == nil {
 		t.Fatal("EOF 截断应错误返回")
 	}
@@ -386,7 +369,7 @@ func TestResponsesTruncatedEOF(t *testing.T) {
 func TestResponsesTruncatedDoneWithoutCompleted(t *testing.T) {
 	srv := startResponsesMock(t, nil, []string{respCreatedEvent, respItemMsgDoneEv}, true, nil)
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
-	if _, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`)); err == nil {
+	if _, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{}); err == nil {
 		t.Fatal("[DONE] 而无 completed 应错误返回")
 	}
 }
@@ -397,7 +380,7 @@ func TestResponsesFailedEventWire(t *testing.T) {
 	failedEv := `{"type":"response.failed","error":{"code":"server_error","message":"upstream exploded"}}`
 	srv := startResponsesMock(t, nil, []string{respCreatedEvent, failedEv}, true, nil)
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
-	_, err := hc.Responses(context.Background(), []byte(`{}`))
+	_, err := hc.Responses(context.Background(), []byte(`{}`), Identity{})
 	var he *HTTPError
 	if !errors.As(err, &he) {
 		t.Fatalf("期望 *HTTPError, got %T: %v", err, err)
@@ -425,7 +408,7 @@ func TestResponsesZeroCopyBigItem(t *testing.T) {
 		[]string{respCreatedEvent, bigEvent, filler, `{"type":"response.output_item.done","item":` + item2 + `}`, respCompletedEv},
 		true, nil)
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
-	resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
+	resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{})
 	if err != nil {
 		t.Fatalf("Responses: %v", err)
 	}
@@ -465,7 +448,7 @@ func TestResponses403Passthrough(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	_, err := hc.Responses(context.Background(), []byte(`{}`))
+	_, err := hc.Responses(context.Background(), []byte(`{}`), Identity{})
 	var he *HTTPError
 	if !errors.As(err, &he) {
 		t.Fatalf("期望 *HTTPError, got %T: %v", err, err)
@@ -491,7 +474,7 @@ func TestResponses401Fatal(t *testing.T) {
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
 	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	_, err := hc.Responses(context.Background(), []byte(`{}`))
+	_, err := hc.Responses(context.Background(), []byte(`{}`), Identity{})
 	var are *AuthPermanentlyRevokedError
 	if !errors.As(err, &are) {
 		t.Fatalf("期望 *AuthPermanentlyRevokedError 透传, got %T: %v", err, err)
@@ -503,7 +486,7 @@ func TestResponses401Fatal(t *testing.T) {
 		t.Fatalf("判死不重试, 请求数 = %d", reqs)
 	}
 	// Fatal 态：后续调用不再发请求
-	_, err = hc.Responses(context.Background(), []byte(`{}`))
+	_, err = hc.Responses(context.Background(), []byte(`{}`), Identity{})
 	if !errors.As(err, &are) {
 		t.Fatalf("Fatal 态后应恒报错, got %T: %v", err, err)
 	}
@@ -540,7 +523,7 @@ func TestResponses401Rotate(t *testing.T) {
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
 	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
+	resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{})
 	if err != nil {
 		t.Fatalf("Responses: %v", err)
 	}
@@ -585,7 +568,7 @@ func TestResponsesConnectionReuse(t *testing.T) {
 
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	for i := 0; i < 2; i++ {
-		resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
+		resp, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{})
 		if err != nil {
 			t.Fatalf("Responses #%d: %v", i+1, err)
 		}
@@ -602,22 +585,24 @@ func TestResponsesConnectionReuse(t *testing.T) {
 }
 
 // TestResponsesClientMetadataWire：Responses（非流式聚合路径，内部走 Stream
-// 统一注入点）——配置 meta + session → wire 请求体带恒 4 key（meta 优先于
-// session）+ 自动 turn_id（UUIDv7）+ stream:true 注入共存。
+// 统一注入点）——Identity.Meta + Identity.Session → wire 请求体带恒 4 key
+// （Meta 优先于 Session）+ 自动 turn_id（UUIDv7）+ stream:true 注入共存。
 func TestResponsesClientMetadataWire(t *testing.T) {
 	var cap responsesWireCapture
 	srv := startResponsesMock(t, nil,
 		[]string{respCreatedEvent, respItemMsgDoneEv, respCompletedEv}, true, &cap)
 
-	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)),
-		WithCodexMeta(CodexMeta{
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
+	id := Identity{
+		Session: Session{SessionID: "sess-other", ThreadID: "thread-other", WindowID: "win-other:1"},
+		Meta: CodexMeta{
 			InstallationID: "inst-1",
 			SessionID:      "sess-1",
 			ThreadID:       "thread-1",
 			WindowID:       "win-1:0",
-		}),
-		WithSession(Session{SessionID: "sess-other", ThreadID: "thread-other", WindowID: "win-other:1"}))
-	resp, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6"}`))
+		},
+	}
+	resp, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6"}`), id)
 	if err != nil {
 		t.Fatalf("Responses: %v", err)
 	}
@@ -641,7 +626,7 @@ func TestResponsesClientMetadataWire(t *testing.T) {
 		"x-codex-window-id":       "win-1:0",
 	} {
 		if got := cm.Get(key).String(); got != want {
-			t.Fatalf("%s = %q, 期望 %q（CodexMeta 优先于 WithSession）", key, got, want)
+			t.Fatalf("%s = %q, 期望 %q（Identity.Meta 优先于 Identity.Session）", key, got, want)
 		}
 	}
 	if turn := cm.Get("turn_id").String(); !uuidv7Re.MatchString(turn) {
@@ -655,7 +640,7 @@ func TestResponsesClientMetadataWire(t *testing.T) {
 // TestResponsesNilAuth：auth 为 nil 直接报错（不发出请求）。
 func TestResponsesNilAuth(t *testing.T) {
 	hc := NewHTTPClient(nil, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", "http://127.0.0.1:1")))
-	if _, err := hc.Responses(context.Background(), []byte(`{}`)); err == nil {
+	if _, err := hc.Responses(context.Background(), []byte(`{}`), Identity{}); err == nil {
 		t.Fatal("auth 为 nil 应报错")
 	}
 }

@@ -68,9 +68,6 @@ func TestSearchPayloadAndRaw(t *testing.T) {
 	if !bytes.Equal(resp.Raw, []byte(`{"results":[{"id":"r1"}]}`)) {
 		t.Fatalf("Raw 应原样交付完整响应体: %s", resp.Raw)
 	}
-	if resp.TurnState != "" {
-		t.Fatalf("Search 不捕获 turn-state（对齐 GenerateImage）, got %q", resp.TurnState)
-	}
 }
 
 // TestSearchErrorStatus：非 2xx → *HTTPError（状态码 + 错误体原样交付）。

@@ -29,10 +29,6 @@ type cachedConn struct {
 	cn    *conn
 	token string // dial 时使用的 Authorization（OAuth 轮转后旧连接必须丢弃）
 	key   connKey
-	// issued 是这条连接握手时上游签发的 turn-state：命中时回填给新的 exchange
-	// （`ex.issued`，仅作该连接的握手历史）。合成响应头**不**直接用它——S5 判据
-	// 拿 exchange.effective 与 HTTPClient.TurnState() 比较，两者在事件捕获后会分叉。
-	issued string
 	// idleSince 是入表时刻（TTL 起点）；bornAt 是拨号时刻（maxAge 起点）。
 	// bornAt 随连接在表里逐次传递，**不重置**——否则热连接永远撞不到 30min 上限。
 	idleSince time.Time
@@ -47,6 +43,7 @@ type connCache struct {
 	cap    int
 	ttl    time.Duration // 默认 defaultConnIdleTTL（测试可注入）
 	maxAge time.Duration // 默认 defaultConnMaxAge（测试可注入）
+	closed bool          // Close 之后 put 拒收（由 Release 终止），idle 已清空
 	idles  []cachedConn
 
 	// hits/misses 只服务 bench 与测试（不导出）：hit 仅在连接真的被移交
@@ -117,6 +114,10 @@ func (c *connCache) get(key connKey, token string) (*cachedConn, bool) {
 	var dead []*conn
 	var hit *cachedConn
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, false
+	}
 	kept := c.idles[:0]
 	for _, cc := range c.idles {
 		switch {
@@ -143,14 +144,21 @@ func (c *connCache) get(key connKey, token string) (*cachedConn, bool) {
 	return hit, hit != nil
 }
 
-// put 收下一条可复用的连接（实现 connSink）。恒返回 true。
+// put 收下一条可复用的连接（实现 connSink）。
 //
 // 满时**驱逐 idleSince 最旧的条目**再入表，绝不因满而拒收新连接：两条取数路径
 // （两个 readLimit）并存时，旧条目不该把新归还的连接挤掉。
+//
+// Close 之后返回 false 且不自行 terminate：归还中的连接由 Release 按既有四步
+// 合取终止（避免双重 terminate 与 Release 返回值语义失真）。
 func (c *connCache) put(e *wsExchange) bool {
 	now := time.Now()
 	var dead []*conn
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return false
+	}
 	kept := c.idles[:0]
 	for _, cc := range c.idles {
 		if c.expired(cc, now) {
@@ -174,7 +182,6 @@ func (c *connCache) put(e *wsExchange) bool {
 		cn:        e.cn,
 		token:     e.token,
 		key:       e.key,
-		issued:    e.issued,
 		idleSince: now,
 		bornAt:    e.bornAt, // 不重置
 	})
@@ -185,9 +192,49 @@ func (c *connCache) put(e *wsExchange) bool {
 	return true
 }
 
-// clear 清空缓存并终止其中的连接（CloseWSIdleConnections / CloseIdleConnections 用）。
-func (c *connCache) clear() {
+// RetireThread 退役一个 threadKey 的全部 idle 连接：锁内摘表、锁外 terminate。
+//
+// 不设 retired 集合/墓碑：threadKey 唯一属于一个会话，会话被 busy 独占租借；
+// 退休发生在该请求 Close（= 归还）之后、finish 之前，所以调用时该 key 不可能
+// 有在飞 exchange。Close 之后 idles 已空，本方法自然为 no-op。
+func (c *connCache) RetireThread(threadKey string) {
+	if c == nil || threadKey == "" {
+		return
+	}
+	var dead []*conn
 	c.mu.Lock()
+	kept := c.idles[:0]
+	for _, cc := range c.idles {
+		if cc.key.threadKey == threadKey {
+			dead = append(dead, cc.cn)
+			continue
+		}
+		kept = append(kept, cc)
+	}
+	c.idles = kept
+	c.mu.Unlock()
+	for _, cn := range dead {
+		cn.terminate(io.EOF)
+	}
+}
+
+// Close 关闭缓存：置 closed（此后 put 返回 false，由 Release 终止归还中的
+// 连接）+ 清空并终止全部 idle。幂等；Close 之后 RetireThread 为 no-op。
+func (c *connCache) Close() { c.dropIdle(true) }
+
+// clear 只清空 idle、不置 closed（CloseIdleConnections 用）：随后新建的连接
+// 仍可正常复用。
+func (c *connCache) clear() { c.dropIdle(false) }
+
+// dropIdle 是 Close / clear 的共同实现：锁内摘表、锁外 terminate。
+func (c *connCache) dropIdle(markClosed bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if markClosed {
+		c.closed = true
+	}
 	idles := c.idles
 	c.idles = nil
 	c.mu.Unlock()
@@ -200,8 +247,9 @@ func (c *connCache) clear() {
 //
 // 默认 **0 = 关闭**（每请求一条连接，与历史行为完全一致）。开启后，同一个
 // HTTPClient、同一条取数路径（流式 64MiB / 聚合 16MiB）的**连续**请求会复用
-// 上一条连接、不再付握手成本。连接身份**不含 turn-state**：与真实 codex 一致，
-// 连接是 thread 级、跨轮复用；ts 是轮级、每请求随 client_metadata 下发。
+// 上一条连接、不再付握手成本。连接身份 = (threadKey, readLimit)：与真实 codex
+// 一致，连接是 thread 级、跨轮跨窗口复用；ts 是轮级、每请求随 client_metadata
+// 下发；匿名（threadKey == ""）不复用。
 //
 // 收益边界：从同一 thread 的**第 2 个请求**起就有收益（跨轮也命中）；
 // 每实例、每条取数路径各留一条空闲连接，容量按 2 规划。

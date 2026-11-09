@@ -105,18 +105,11 @@ var codecDiffCorpus = []string{
 func codecDiffCodecs() map[string]*frameCodec {
 	return map[string]*frameCodec{
 		"无注入": {},
-		"静态身份+trace": newFrameCodec(&options{
-			meta: &CodexMeta{
-				InstallationID: "inst", SessionID: "sess", ThreadID: "thr",
-				WindowID: "thr:0", TurnMetadata: "tm", Traceparent: "tp", Tracestate: "ts",
-			},
-			session: &Session{SessionID: "sess", ThreadID: "thr", WindowID: "thr:0"},
-			trace:   &TraceContext{Traceparent: "00-aaa-bbb-01", Tracestate: "st"},
+		"静态 trace": newFrameCodec(&options{
+			trace: &TraceContext{Traceparent: "00-aaa-bbb-01", Tracestate: "st"},
 		}),
-		"静态身份+透传": newFrameCodec(&options{
-			meta:            &CodexMeta{InstallationID: "inst", TurnID: "static-turn"},
-			metaPassthrough: []metadataEntry{{"ws_request_header_x_openai_internal_codex_responses_lite", "true"}},
-			turnProvider:    func(uint64) string { return "turn-meta" },
+		"turn 回调": newFrameCodec(&options{
+			turnProvider: func(uint64) string { return "turn-meta" },
 		}),
 	}
 }
@@ -125,10 +118,19 @@ func codecDiffCodecs() map[string]*frameCodec {
 // （两种模式 × 三种 codec 组合 × 三种 frameInput）。
 func TestEncodeByteIdenticalToLegacyChain(t *testing.T) {
 	now := time.Date(2026, time.November, 9, 3, 30, 0, 0, time.UTC)
+	ident := Identity{
+		Session: Session{SessionID: "sess", ThreadID: "thr", WindowID: "thr:0"},
+		Meta: CodexMeta{
+			InstallationID: "inst", SessionID: "sess", ThreadID: "thr",
+			WindowID: "thr:0", TurnID: "static-turn", TurnMetadata: "tm",
+			Traceparent: "tp", Tracestate: "ts",
+		},
+		TurnState: "gw-state",
+	}
 	inputs := map[string]frameInput{
-		"零值输入":         {Now: now},
-		"带 turn-state": {Now: now, TurnState: "gw-state", Turn: 3},
-		"Now 未设":       {},
+		"零值输入":   {Now: now},
+		"带身份+ts": {Now: now, Identity: ident, Turn: 3},
+		"Now 未设": {Identity: Identity{Meta: CodexMeta{InstallationID: "inst"}}},
 	}
 	modes := map[string]encodeMode{"native": encodeNativeWS, "responses": encodeWSResponses}
 	for cname, fc := range codecDiffCodecs() {
@@ -196,7 +198,7 @@ func TestEncodeByteIdenticalRandomFrames(t *testing.T) {
 			b.WriteString("}")
 			raw := []byte(b.String())
 			for _, mode := range []encodeMode{encodeNativeWS, encodeWSResponses} {
-				in := frameInput{Now: now, TurnState: "ts", Turn: 1}
+				in := frameInput{Now: now, Identity: Identity{Meta: CodexMeta{InstallationID: "inst"}, TurnState: "ts"}, Turn: 1}
 				got, gotErr := fc.encode(raw, mode, in)
 				want, wantErr := encodeViaLegacyChain(fc, raw, mode, in)
 				if errText(gotErr) != errText(wantErr) {
@@ -216,14 +218,11 @@ func TestEncodeByteIdenticalRandomFrames(t *testing.T) {
 // TestEncodeOnePassEngagesOnRuntimeShape：P1 的测量输入（3.7KB 运行期形状）必须
 // 真的走单遍路径——否则本文件的比对会退化成"回退链 vs 回退链"，护栏空转。
 func TestEncodeOnePassEngagesOnRuntimeShape(t *testing.T) {
-	fc := newFrameCodec(&options{
-		meta:      &CodexMeta{InstallationID: "inst"},
-		traceAuto: true,
-		turnAuto:  true,
-	})
+	fc := newFrameCodec(&options{traceAuto: true, turnAuto: true})
 	frame := RewriteEnvironmentContextTime(wsBenchPayload, time.Now())
 	var entryBuf [8]metadataEntry
-	obj := clientMetadataObject(fc.metaEntries(entryBuf[:0], frameInput{}))
+	in := frameInput{Identity: Identity{Meta: CodexMeta{InstallationID: "inst"}}}
+	obj := clientMetadataObject(fc.metaEntries(entryBuf[:0], in))
 	out, ok := encodeOnePass(frame, encodeWSResponses, obj)
 	if !ok {
 		t.Fatal("运行期 3.7KB 请求体应走单遍路径（回退会破坏 P1 门槛）")
@@ -280,6 +279,46 @@ func TestEncodeZeroCopyPreservedAcrossModes(t *testing.T) {
 	}
 	if len(got) == 0 || &got[0] != &in[0] {
 		t.Fatal("已归一且无注入时 encode 应零拷贝原样返回")
+	}
+}
+
+// TestEncodeEmptyIdentityDropsPayloadMetadata：身份只来自 Identity。Identity 为空
+// （且没有自动字段）时，payload 自带的 client_metadata 必须被**删除**——否则"匿名"
+// 会把调用方的旧 session/thread/ts 透传给上游（oracle 评审 blocking）。
+//
+// 两条编码路径都要覆盖：单遍（白名单紧凑对象）与回退链（sjson）。
+func TestEncodeEmptyIdentityDropsPayloadMetadata(t *testing.T) {
+	fc := newFrameCodec(&options{}) // turn/trace 自动关：本次身份对象为空
+	now := time.Date(2026, time.November, 9, 3, 30, 0, 0, time.UTC)
+	for _, c := range []struct {
+		name  string
+		frame string
+	}{
+		{"单遍", `{"type":"response.create","model":"m","store":false,"client_metadata":{"thread_id":"old","x-codex-turn-state":"old-ts"}}`},
+		{"回退", `{ "type":"response.create", "model":"m", "store":false, "client_metadata":{"thread_id":"old"} }`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := fc.encode([]byte(c.frame), encodeNativeWS, frameInput{Now: now})
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			if gjson.GetBytes(got, "client_metadata").Exists() {
+				t.Fatalf("空身份时不得保留 payload 身份：%s", got)
+			}
+			if !gjson.GetBytes(got, "model").Exists() {
+				t.Fatalf("删除身份不得伤及其它字段：%s", got)
+			}
+		})
+	}
+
+	// 反向：payload 本来没有身份字段 ⇒ 不新增、不复制（零拷贝）。
+	in := []byte(`{"type":"response.create","model":"m","store":false}`)
+	got, err := fc.encode(in, encodeNativeWS, frameInput{Now: now})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(got) == 0 || &got[0] != &in[0] {
+		t.Fatal("无身份字段的已归一帧应零拷贝返回")
 	}
 }
 

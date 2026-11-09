@@ -200,14 +200,18 @@ func TestStreamBodyWSRendersFramesAsSSE(t *testing.T) {
 	hc := NewHTTPClient(PAT("pat-ws"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithSession(Session{SessionID: "sess-1", ThreadID: "thread-1", WindowID: "thread-1:0"}),
 		WithHeader("x-custom", "custom-value"),
-		WithClientMetadata(MetaResponsesLiteKey, "true"),
 		WithTurnAuto(false),
 	)
+	id := Identity{
+		Session: Session{SessionID: "sess-1", ThreadID: "thread-1", WindowID: "thread-1:0"},
+		Meta: CodexMeta{
+			InstallationID: "inst-1", SessionID: "sess-1", ThreadID: "thread-1", WindowID: "thread-1:0",
+		},
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[],"stream":false,"previous_response_id":"resp_old","generate":true,"junk":"drop"}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[],"stream":false,"previous_response_id":"resp_old","generate":true,"junk":"drop"}`), id)
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -256,10 +260,9 @@ func TestStreamBodyWSRendersFramesAsSSE(t *testing.T) {
 	}
 	cm := gjson.GetBytes(frame, "client_metadata")
 	for key, want := range map[string]string{
-		codexMetaSessionKey:  "sess-1",
-		codexMetaThreadKey:   "thread-1",
-		codexMetaWindowKey:   "thread-1:0",
-		MetaResponsesLiteKey: "true",
+		codexMetaSessionKey: "sess-1",
+		codexMetaThreadKey:  "thread-1",
+		codexMetaWindowKey:  "thread-1:0",
 	} {
 		if got := cm.Get(key).String(); got != want {
 			t.Fatalf("client_metadata.%s = %q, 期望 %q（帧 %s）", key, got, want, frame)
@@ -301,7 +304,7 @@ func TestStreamBodyWSFailedFramePassthroughNotDone(t *testing.T) {
 		WithTurnAuto(false), WithTraceAuto(false))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -345,7 +348,7 @@ func TestResponsesWSMatchesHTTPComposite(t *testing.T) {
 	httpClient := NewHTTPClient(PAT("pat"),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", httpURL)),
 		WithTurnAuto(false), WithTraceAuto(false))
-	httpResp, err := httpClient.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":[]}`))
+	httpResp, err := httpClient.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("HTTP 臂 Responses: %v", err)
 	}
@@ -356,16 +359,13 @@ func TestResponsesWSMatchesHTTPComposite(t *testing.T) {
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
 		WithTurnAuto(false), WithTraceAuto(false))
-	wsResp, err := wsClient.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":[]}`))
+	wsResp, err := wsClient.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("WS 臂 Responses: %v", err)
 	}
 
 	if wsResp.StatusCode != httpResp.StatusCode {
 		t.Fatalf("StatusCode = %d, HTTP 臂 %d", wsResp.StatusCode, httpResp.StatusCode)
-	}
-	if wsResp.TurnState != httpResp.TurnState {
-		t.Fatalf("TurnState = %q, HTTP 臂 %q", wsResp.TurnState, httpResp.TurnState)
 	}
 	if string(wsResp.Raw) != string(httpResp.Raw) {
 		t.Fatalf("合成体字节不等\nWS   = %s\nHTTP = %s", wsResp.Raw, httpResp.Raw)
@@ -407,7 +407,7 @@ func TestResponsesWSFailedMatchesHTTPError(t *testing.T) {
 	httpClient := NewHTTPClient(PAT("pat"),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", httpURL)),
 		WithTurnAuto(false), WithTraceAuto(false))
-	_, httpErr := httpClient.Responses(context.Background(), []byte(`{"model":"m","input":[]}`))
+	_, httpErr := httpClient.Responses(context.Background(), []byte(`{"model":"m","input":[]}`), Identity{})
 
 	up := newWSUpstream(t)
 	up.setScripts(wsScript{frames: []string{wsCreatedEv, wsFailedEv}})
@@ -415,7 +415,7 @@ func TestResponsesWSFailedMatchesHTTPError(t *testing.T) {
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
 		WithTurnAuto(false), WithTraceAuto(false))
-	_, wsErr := wsClient.Responses(context.Background(), []byte(`{"model":"m","input":[]}`))
+	_, wsErr := wsClient.Responses(context.Background(), []byte(`{"model":"m","input":[]}`), Identity{})
 
 	var httpHE, wsHE *HTTPError
 	if !errors.As(httpErr, &httpHE) {
@@ -447,7 +447,7 @@ func TestResponsesWSTruncatedOnIncomplete(t *testing.T) {
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
 		WithTurnAuto(false), WithTraceAuto(false))
-	_, err := hc.Responses(context.Background(), []byte(`{"model":"m","input":[]}`))
+	_, err := hc.Responses(context.Background(), []byte(`{"model":"m","input":[]}`), Identity{})
 	if err == nil {
 		t.Fatal("期望截断错误, got nil")
 	}
@@ -462,14 +462,13 @@ func TestResponsesWSTruncatedOnIncomplete(t *testing.T) {
 
 // ---- 3. turn-state 握手签发 → 回写；请求侧不回落缓存 ----
 
-// TestResponsesWSTurnStateCapturedNoReplay：握手响应头签发值回写 HTTPClient.TurnState()
-// 并回填到合成响应头（S5 的"真握手"分支：那是 ts 的唯一发现通道），但**不**自动
-// 成为下一次请求的 ts——缓存只是观测面，跨轮不得重放（S2）。
-func TestResponsesWSTurnStateCapturedNoReplay(t *testing.T) {
+// TestWSIdentityTurnStateNoReplay：握手/事件签发的 ts 只进 Identity.Sink；
+// 请求帧的 ts 只来自 Identity.TurnState，不自动重放上一轮值；合成响应头不带 ts，
+// 升级头也不带 ts。
+func TestWSIdentityTurnStateNoReplay(t *testing.T) {
 	up := newWSUpstream(t)
 	up.setTurnState("ts-issued-1")
 	up.setScripts(
-		wsScript{frames: []string{wsCreatedEv, wsCompletedEv}},
 		wsScript{frames: []string{wsCreatedEv, wsCompletedEv}},
 		wsScript{frames: []string{wsCreatedEv, wsCompletedEv}},
 	)
@@ -480,74 +479,47 @@ func TestResponsesWSTurnStateCapturedNoReplay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 第 1 轮：上游签发 ts-issued-1。请求没带 ts，但本次真的握手了 ⇒ 合成响应头
-	// 回填本次签发值（S5 新鲜值分支），同时回写 TurnState()（观测面）。
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
+	var sink1 turnStateSink
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), identityFor("thread-ts", "thread-ts:0", "", &sink1))
 	if err != nil {
 		t.Fatalf("第 1 次 StreamBody: %v", err)
 	}
-	if got := resp.Header.Get(HeaderTurnState); got != "ts-issued-1" {
-		t.Fatalf("合成响应头 %s = %q, 期望 ts-issued-1（真握手必须回填本次签发值）", HeaderTurnState, got)
+	if got := resp.Header.Get(HeaderTurnState); got != "" {
+		t.Fatalf("合成响应头 %s = %q, 期望空（ts 只走 Sink）", HeaderTurnState, got)
 	}
 	_ = readAllBody(t, resp.Body)
-	if got := hc.TurnState(); got != "ts-issued-1" {
-		t.Fatalf("HTTPClient.TurnState() = %q, 期望 ts-issued-1", got)
+	if got := sink1.values(); len(got) != 1 || got[0] != "ts-issued-1" {
+		t.Fatalf("Sink = %v, 期望 [ts-issued-1]", got)
 	}
 	first := up.sentFrames(t)
 	if len(first) != 1 {
 		t.Fatalf("上游收到 %d 帧, 期望 1 帧", len(first))
 	}
 	if got := gjson.GetBytes(first[0], "client_metadata."+codexMetaTurnStateKey); got.Exists() {
-		t.Fatalf("首轮不应回传 turn-state, got %s", got.Raw)
+		t.Fatalf("首轮不应带 turn-state, got %s", got.Raw)
 	}
 
-	// 第 2 轮：**不**回放上一轮签发值（请求侧取值不回落到 TurnState()）；
-	// 本轮又拨了一条新连接（缓存关闭）⇒ 真握手 ⇒ 回填它自己的签发值 ts-issued-2。
+	// 第 2 轮：请求侧显式带 ts；本轮重新握手（缓存关闭），握手签发值进 Sink，
+	// 帧内带上请求值，升级头不带 ts。
 	up.setTurnState("ts-issued-2")
-	resp2, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
+	var sink2 turnStateSink
+	id2 := identityFor("thread-ts", "thread-ts:1", "ts-req-2", &sink2)
+	resp2, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), id2)
 	if err != nil {
 		t.Fatalf("第 2 次 StreamBody: %v", err)
 	}
-	if got := resp2.Header.Get(HeaderTurnState); got != "ts-issued-2" {
-		t.Fatalf("第 2 轮合成响应头 = %q, 期望 ts-issued-2（本次签发值，不得是上一轮的旧值）", got)
-	}
 	_ = readAllBody(t, resp2.Body)
+	if got := sink2.values(); len(got) != 1 || got[0] != "ts-issued-2" {
+		t.Fatalf("Sink = %v, 期望 [ts-issued-2]", got)
+	}
 	frames := up.sentFrames(t)
 	if len(frames) != 2 {
 		t.Fatalf("上游收到 %d 帧, 期望 2 帧", len(frames))
 	}
-	if got := gjson.GetBytes(frames[1], "client_metadata."+codexMetaTurnStateKey); got.Exists() {
-		t.Fatalf("第 2 轮帧不应回传上一轮 turn-state, got %s（帧 %s）", got.Raw, frames[1])
+	if got := gjson.GetBytes(frames[1], "client_metadata."+codexMetaTurnStateKey).String(); got != "ts-req-2" {
+		t.Fatalf("第 2 轮帧 ts = %q, 期望 ts-req-2", got)
 	}
-	if got := hc.TurnState(); got != "ts-issued-2" {
-		t.Fatalf("HTTPClient.TurnState() = %q, 期望 ts-issued-2（本轮签发值）", got)
-	}
-
-	// 第 3 轮（兼容入口）：per-request 值以 WithHeader(HeaderTurnState) 下发。
-	// WS 臂必须把它搬进帧内 client_metadata，且**不能**出现在升级头里。
-	// 本轮握手签发的正是同一个值 ⇒ S5 判据相等 ⇒ 合成响应头回填它。
-	up.setTurnState("ts-from-gateway")
-	gw := NewHTTPClient(PAT("pat-ws"),
-		WithResponsesTransport(TransportWS),
-		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithHeader(HeaderTurnState, "ts-from-gateway"),
-		WithTurnAuto(false), WithTraceAuto(false))
-	resp3, err := gw.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
-	if err != nil {
-		t.Fatalf("第 3 次 StreamBody（WithHeader 注入）: %v", err)
-	}
-	if got := resp3.Header.Get(HeaderTurnState); got != "ts-from-gateway" {
-		t.Fatalf("第 3 轮合成响应头 = %q, 期望 ts-from-gateway（effective == 最近签发值）", got)
-	}
-	_ = readAllBody(t, resp3.Body)
-	all := up.sentFrames(t)
-	if len(all) != 3 {
-		t.Fatalf("上游收到 %d 帧, 期望 3 帧", len(all))
-	}
-	if got := gjson.GetBytes(all[2], "client_metadata."+codexMetaTurnStateKey).String(); got != "ts-from-gateway" {
-		t.Fatalf("WithHeader 注入的 turn-state = %q, 期望 ts-from-gateway（帧 %s）", got, all[2])
-	}
-	if got := up.handshakeHeaders(t, 2).Get(HeaderTurnState); got != "" {
+	if got := up.handshakeHeaders(t, 1).Get(HeaderTurnState); got != "" {
 		t.Fatalf("升级头不应携带 %s（真实客户端只在帧里带）, got %q", HeaderTurnState, got)
 	}
 }
@@ -637,7 +609,7 @@ func TestBuildResponsesCreateFrame(t *testing.T) {
 		hc := NewHTTPClient(PAT("pat"),
 			WithResponsesTransport(TransportWS),
 			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)))
-		if _, err := hc.StreamBody(context.Background(), []byte(`null`)); !errors.Is(err, errResponsesFrameInvalid) {
+		if _, err := hc.StreamBody(context.Background(), []byte(`null`), Identity{}); !errors.Is(err, errResponsesFrameInvalid) {
 			t.Fatalf("期望 errResponsesFrameInvalid, got %v", err)
 		}
 		if n := up.dialCount(); n != 0 {
@@ -691,7 +663,7 @@ func TestStreamBodyWSCloseSemantics(t *testing.T) {
 				WithTurnAuto(false), WithTraceAuto(false))
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
+			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), Identity{})
 			if err != nil {
 				t.Fatalf("StreamBody: %v", err)
 			}
@@ -773,7 +745,7 @@ func TestResponsesTransportHTTPKeepsHTTPPath(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
+			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), Identity{})
 			if err != nil {
 				t.Fatalf("StreamBody: %v", err)
 			}
@@ -782,7 +754,7 @@ func TestResponsesTransportHTTPKeepsHTTPPath(t *testing.T) {
 				t.Fatalf("HTTP 臂原始 SSE 字节应有 created 与 [DONE], got %q", body)
 			}
 
-			agg, err := hc.Responses(ctx, []byte(`{"model":"m","input":[]}`))
+			agg, err := hc.Responses(ctx, []byte(`{"model":"m","input":[]}`), Identity{})
 			if err != nil {
 				t.Fatalf("Responses: %v", err)
 			}
@@ -818,7 +790,7 @@ func TestStreamBodyWSConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`))
+			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), Identity{})
 			if err != nil {
 				errs[idx] = err
 				return

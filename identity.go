@@ -8,6 +8,53 @@ import (
 	"strconv"
 )
 
+// Identity 是一次 responses 请求（或一条 WS 连接）的全部身份数据。零值 = 匿名。
+//
+// 身份是**请求数据**：HTTPClient 只承载账号/传输级配置（Auth、transport、
+// readLimit、池容量、超时）；每次调用把身份经本结构传入，默认头里不允许出现
+// 身份键（保留键在构造期 panic，见 WithHeader）。
+type Identity struct {
+	Session   Session       // 握手头 session-id / thread-id / x-client-request-id / x-codex-window-id
+	Meta      CodexMeta     // 帧内与 HTTP 体 client_metadata 的身份键
+	TurnState string        // 本请求带上的 turn-state（"" = 不带）
+	Sink      TurnStateSink // 捕获到 ts 时的落点（nil = 忽略）
+}
+
+// TurnStateSink 接收上游签发的 turn-state。用接口而不是闭包：会话对象按指针
+// 塞进接口不产生分配（闭包会把捕获变量一起拖进堆），且把"ts 写到哪"变成显式
+// 边界。
+//
+// 实现约束：只做一次字段赋值，不得阻塞、不得回调回 SDK。Sink 只在调用/Read
+// 栈内同步执行；Body.Close 返回后 SDK 不再调用 Sink。
+type TurnStateSink interface{ SetTurnState(string) }
+
+// threadKey 是连接复用的线程身份：installation|session|thread。
+//
+// Meta 是主载体（与 client_metadata 的优先级一致），空项由 Session 补。
+// 三者全空 = 匿名：匿名没有会话语义，不参与连接复用（见 connKey）。
+func (id Identity) threadKey() string {
+	installation := id.Meta.InstallationID
+	session := id.Meta.SessionID
+	if session == "" {
+		session = id.Session.SessionID
+	}
+	thread := id.Meta.ThreadID
+	if thread == "" {
+		thread = id.Session.ThreadID
+	}
+	if installation == "" && session == "" && thread == "" {
+		return ""
+	}
+	return installation + "|" + session + "|" + thread
+}
+
+// deliverTurnState 把上游签发值交给 Sink（空值与 nil Sink 均忽略）。
+func (id Identity) deliverTurnState(v string) {
+	if v != "" && id.Sink != nil {
+		id.Sink.SetTurnState(v)
+	}
+}
+
 // 身份轮换（网关伪装身份的“会话池”语义）：每槽一个 thread_id，window_id =
 // "{thread_id}:{n}"。窗口推进由**本槽已服务的完成轮数**驱动（与观测 token 解耦）：
 // 每完成一轮 Turns++；跨过本窗口阈值 → window_number +1，阈值按随机 span ∈ [spanLo,

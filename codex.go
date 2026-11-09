@@ -81,7 +81,7 @@ const (
 	codexMetaTracestateKey   = "ws_request_header_tracestate"
 	// MetaResponsesLiteKey 是 responses-lite 的 client_metadata 键（值 "true"；
 	// 服务端约定把 ws_request_header_ 前缀键还原为请求头，与 HeaderResponsesLite
-	// 同一标记）。以 WithClientMetadata 透传，SDK 只透传不解析。
+	// 同一标记）。SDK 只保留键名常量，不提供任意 metadata 透传入口。
 	MetaResponsesLiteKey = "ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
@@ -412,9 +412,9 @@ func replaceXMLElement(value, name, replacement string) string {
 
 // Session 是会话级标识（真实 codex 客户端 WS 握手恒带
 // x-client-request-id / session-id / thread-id / x-codex-window-id）。
-// 会话内稳定，新会话换新值（UUIDv7，见 NewUUIDv7）。WithSession 注入
-// 握手头，并补齐帧内 client_metadata 的 session_id / thread_id /
-// x-codex-window-id（CodexMeta 中同 key 优先）。
+// 会话内稳定，新会话换新值（UUIDv7，见 NewUUIDv7）。经 Identity.Session
+// 注入握手头，并补齐帧内 client_metadata 的 session_id / thread_id /
+// x-codex-window-id（Identity.Meta 中同 key 优先）。
 type Session struct {
 	SessionID       string // 头 session-id / metadata session_id
 	ThreadID        string // 头 thread-id / metadata thread_id
@@ -424,8 +424,7 @@ type Session struct {
 
 // CodexMeta 是 client_metadata 静态载体（值由调用方提供，SDK 只组装不生成；
 // trace 与 turn_id 另有自动机制，见 WithTraceContext / WithTurnAuto，
-// 也可用本结构静态注入。优先级：帧内已存在 > CodexMeta > WithSession >
-// 自动机制）。
+// 也可用本结构静态注入。优先级：Identity.Meta > Identity.Session > 自动机制）。
 type CodexMeta struct {
 	InstallationID string // metadata "x-codex-installation-id"（UUIDv4，账号级持久）
 	SessionID      string // metadata "session_id"（UUIDv7，会话级）
@@ -543,11 +542,8 @@ func (e metaEntries) add(key, value string) metaEntries {
 // withCodexMetaIdentity 追加 CodexMeta 的共有身份键（installation/session/
 // thread/turn/window/subagent，与真实 client_metadata() 同序）。面特有键
 // （WS 的 turn_metadata/traceparent/tracestate、HTTP 的父键 + turn_metadata）
-// 由调用方紧随其后按各自键序补充。
-func (e metaEntries) withCodexMetaIdentity(m *CodexMeta) metaEntries {
-	if m == nil {
-		return e
-	}
+// 由调用方紧随其后按各自键序补充。零值不追加任何键。
+func (e metaEntries) withCodexMetaIdentity(m CodexMeta) metaEntries {
 	e = e.add(codexMetaInstallationKey, m.InstallationID)
 	e = e.add(codexMetaSessionKey, m.SessionID)
 	e = e.add(codexMetaThreadKey, m.ThreadID)
@@ -558,11 +554,8 @@ func (e metaEntries) withCodexMetaIdentity(m *CodexMeta) metaEntries {
 }
 
 // withSessionIdentity 追加 Session 兜底身份键；CodexMeta 同名键已先入，按
-// 首现优先不覆盖。
-func (e metaEntries) withSessionIdentity(s *Session) metaEntries {
-	if s == nil {
-		return e
-	}
+// 首现优先不覆盖。零值不追加任何键。
+func (e metaEntries) withSessionIdentity(s Session) metaEntries {
 	e = e.add(codexMetaSessionKey, s.SessionID)
 	e = e.add(codexMetaThreadKey, s.ThreadID)
 	e = e.add(codexMetaWindowKey, s.WindowID)
@@ -570,8 +563,8 @@ func (e metaEntries) withSessionIdentity(s *Session) metaEntries {
 }
 
 // clientMetadataObject 组装 client_metadata 对象字节：entries 按**首次出现**去重
-// （entries 自身优先级：CodexMeta > WithSession > turn-state > WithClientMetadata >
-// 自动机制）、空值跳过。键/值按 encoding/json 规则转义（含 `<`/`>`/`&` 的 HTML
+// （entries 自身优先级：Identity.Meta > Identity.Session > turn-state > 自动机制）、
+// 空值跳过。键/值按 encoding/json 规则转义（含 `<`/`>`/`&` 的 HTML
 // 转义 \u003c/\u003e/\u0026 与 U+2028/U+2029——与 sjson 对已有字节的原样直写
 // 不同）。无有效 entry → nil（调用方不动帧）。
 func clientMetadataObject(entries []metadataEntry) []byte {
@@ -696,9 +689,19 @@ func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {
 // 顶层 client_metadata（sjson.SetRawBytes 一次改写真，语义同
 // injectClientMetadataKeys）。拆出来给 WS 单遍编码器复用：那边对象只组装一次、
 // 直接写进输出缓冲，不再对整帧做第二次改写。obj 为空 → 帧零改动返回。
+// injectClientMetadataObject 用本次身份对象整体覆写 payload 的 client_metadata。
+// obj 为空（匿名且无任何自动字段）时**删除**该键：身份只来自 Identity，
+// 留着 payload 自带值等于把调用方的旧 session/thread/ts 透传给上游。
 func injectClientMetadataObject(frame, obj []byte) []byte {
 	if len(obj) == 0 {
-		return frame
+		if !bytes.Contains(frame, []byte(`"client_metadata"`)) {
+			return frame // 本来就没有身份字段：保持零拷贝
+		}
+		out, err := sjson.DeleteBytes(frame, "client_metadata")
+		if err != nil {
+			return frame // 非法 JSON：放弃本次注入，保持帧原样
+		}
+		return out
 	}
 	out, err := sjson.SetRawBytes(frame, "client_metadata", obj)
 	if err != nil {

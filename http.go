@@ -25,26 +25,22 @@ const DefaultResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 const DefaultResponsesWSURL = "wss://chatgpt.com/backend-api/codex/responses"
 
 // HTTPClient 是统一端点方法 HTTP 客户端（懒构建：NewHTTPClient 不创建
-// http.Client——只做选项快照与升级头派生——首次 Do/Stream 才创建，连接池复用）。端点方法族：
+// http.Client——只做选项快照——首次 Do/Stream 才创建，连接池复用）。端点方法族：
 // Do/Stream（responses 固定端点）、GenerateImage / Search / GetUsage（各自固定官方端点）、Responses（合成非流式）。
 //
-// x-codex-turn-state 是**轮级** token：请求侧由 WithTurnStateProvider（每次请求
-// 求值）或 WithHeader 给出，响应侧（HTTP 响应头 / WS 握手响应头 / WS 事件）自动
-// 捕获，经 TurnState() / HTTPResponse.TurnState 暴露并回调 WithTurnStateObserver。
-// TurnState() 是观测面，**不是**下一次请求的默认值（跨轮不得重放）。
+// 身份（session/thread/window/turn/turn-state）是**请求数据**：Stream /
+// StreamBody / Responses 逐次接收 Identity；捕获到上游签发的 ts 时只回调
+// Identity.Sink，SDK 不保留任何身份状态。
 type HTTPClient struct {
 	auth Auth
 	opts options
 
-	// codec 是帧编码器（无可变状态，可并发使用）；wsHeaders 是升级头的
-	// 调用方覆盖集（构造期算好，已按 WS 面规则去掉 x-codex-turn-state）。
-	codec     *frameCodec
-	wsHeaders http.Header
+	// codec 是帧编码器（无可变状态，可并发使用）。
+	codec *frameCodec
 
 	mu               sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
 	client           *http.Client
 	noRedirectClient *http.Client // 仅 StreamBody：禁跟随重定向（3xx 原样返回）
-	turnState        atomic.Value // string；x-codex-turn-state 最近签发值
 
 	// turnStateDropped 是事件级 ts 捕获里"归属判定丢弃"的计数（S3 观测面）：
 	// 只统计被丢掉的 ts 候选，不是帧计数。跨 goroutine 读，必须原子。
@@ -57,16 +53,12 @@ type HTTPClient struct {
 
 // NewHTTPClient 创建 Responses HTTP 客户端（端点方法族客户端，所有数据面 URL 由 SDK 固定维护，不可覆盖）。
 func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
-	cfg := defaultOptions()
-	for _, o := range opts {
-		o(&cfg)
-	}
+	cfg := resolveOptions(opts)
 	return &HTTPClient{
-		auth:      auth,
-		opts:      cfg,
-		codec:     newFrameCodec(&cfg),
-		wsHeaders: wsUpgradeHeaders(cfg.headers),
-		wsCache:   newConnCacheIf(cfg.wsConnCache),
+		auth:    auth,
+		opts:    cfg,
+		codec:   newFrameCodec(&cfg),
+		wsCache: newConnCacheIf(cfg.wsConnCache),
 	}
 }
 
@@ -78,12 +70,22 @@ func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 // 关掉它自己的 WS 连接。
 func (c *HTTPClient) CloseWSIdleConnections() {
 	if c.wsCache != nil {
-		c.wsCache.clear()
+		c.wsCache.Close()
+	}
+}
+
+// RetireThread 退役一个线程的空闲 WS 连接：缓存锁内摘出该 threadKey 的
+// idle，锁外终止。前置条件 = 该 key 无在飞 exchange（会话独占租借保证）；
+// 不设 retired 集合/墓碑。Close 之后为 no-op。
+func (c *HTTPClient) RetireThread(threadKey string) {
+	if c.wsCache != nil {
+		c.wsCache.RetireThread(threadKey)
 	}
 }
 
 // CloseIdleConnections 关闭底层空闲连接（懒构建未使用时为零开销调用；
-// 与首个请求并发调用安全——内部加锁）。同时清空 WS 臂的空闲连接缓存并终止其中连接，不中断在飞请求。
+// 与首个请求并发调用安全——内部加锁）。同时清空 WS 臂的空闲连接缓存并终止其中
+// 连接，不中断在飞请求；缓存本身不关闭，后续新建连接仍可复用。
 func (c *HTTPClient) CloseIdleConnections() {
 	if c.wsCache != nil {
 		c.wsCache.clear()
@@ -108,7 +110,6 @@ func (c *HTTPClient) CloseIdleConnections() {
 type HTTPResponse struct {
 	StatusCode int
 	Raw        []byte // 完整响应体
-	TurnState  string // 响应头 x-codex-turn-state（服务端签发，仅响应侧暴露）
 }
 
 // HTTPError 是上游非 2xx 响应（状态码 + 错误体原样交付，error 信封由网关解析）。
@@ -142,7 +143,7 @@ func (e *HTTPError) Unwrap() error { return e.cause }
 // RefreshOAuthError / AccountDisabledError 等）经本方法透传，不被 HTTPError
 // 包层吞掉（errors.As 可区分）。
 func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, error) {
-	resp, err := c.do(ctx, payload)
+	resp, err := c.do(ctx, payload, Identity{})
 	if err != nil {
 		return nil, err
 	}
@@ -151,17 +152,13 @@ func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, err
 	if err != nil {
 		return nil, err
 	}
-	c.captureTurnState(resp)
-	return &HTTPResponse{
-		StatusCode: resp.StatusCode,
-		Raw:        body,
-		TurnState:  resp.Header.Get(HeaderTurnState),
-	}, nil
+	return &HTTPResponse{StatusCode: resp.StatusCode, Raw: body}, nil
 }
 
 // Stream 发送 POST 请求并提取 SSE 事件帧：逐 data: 行交付原始字节（零拷贝
 // 行切片——回调内的字节引用 scanner 复用缓冲，仅在回调执行期间有效；
-// 跨回调保留需自行拷贝），[DONE] 标记流正常终止。
+// 跨回调保留需自行拷贝），[DONE] 标记流正常终止。身份与 ts 都来自 id；响应头
+// 签发的 ts 只回调 id.Sink。
 //
 // 发送前无条件归一（HTTP 白名单过滤 FilterCodexHTTPPayload + 强制 store:false），
 // 再统一注入 client_metadata（对齐真实 codex client_metadata()——
@@ -171,41 +168,31 @@ func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, err
 //
 // fn 返回错误立即终止读取并透传该错误。非 2xx 返回 *HTTPError；
 // 401 自动轮转语义同 Do。
-func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []byte) error) error {
-	_, err := c.streamIssued(ctx, payload, fn)
-	return err
+func (c *HTTPClient) Stream(ctx context.Context, payload []byte, id Identity, fn func(raw []byte) error) error {
+	return c.streamIssued(ctx, payload, id, fn)
 }
 
-// streamIssued 是 Stream 的实现体，额外返回**本次响应头**的 x-codex-turn-state
-// （"" = 本次未签发）。聚合臂（Responses）拿它当"新鲜签发值"回填
-// HTTPResponse.TurnState（S5 的 `!reused` 分支）。
-//
-// 为什么不读 HTTPClient.TurnState()：那是**池级**"最近签发值"——本次响应没带 ts
-// 时它仍是上一个响应的值，拿它回填就等于把旧 ts 当成本轮签发值（违反"ts 轮级"），
-// 并发复用同一个 client 时更不可控。Do 早就是 per-response 语义
-// （resp.Header.Get），聚合臂对齐它。
-func (c *HTTPClient) streamIssued(ctx context.Context, payload []byte, fn func(raw []byte) error) (string, error) {
+// streamIssued 是 Stream 的实现体：响应头签发的 ts 只回调 id.Sink。
+func (c *HTTPClient) streamIssued(ctx context.Context, payload []byte, id Identity, fn func(raw []byte) error) error {
 	payload, err := normalizeCodexHTTPPayload(payload)
 	if err != nil {
-		return "", err
+		return err
 	}
-	payload = c.injectResponsesClientMetadata(payload)
-	resp, err := c.do(ctx, payload)
+	payload = injectResponsesClientMetadata(payload, id)
+	resp, err := c.do(ctx, payload, id)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return "", &HTTPError{StatusCode: resp.StatusCode, Raw: body}
+		return &HTTPError{StatusCode: resp.StatusCode, Raw: body}
 	}
-	// 本次响应头的值先取下来（captureTurnState 只写池级缓存 + observer，不返回）。
-	issued := resp.Header.Get(HeaderTurnState)
-	c.captureTurnState(resp)
+	id.deliverTurnState(resp.Header.Get(HeaderTurnState))
 
 	done, err := scanSSE(resp.Body, c.opts.maxLineSize, fn)
 	if err != nil {
-		return "", err
+		return err
 	}
 	if done {
 		// [DONE]：流正常终止。排空残余 body——http.Transport 对未读完的
@@ -216,7 +203,7 @@ func (c *HTTPClient) streamIssued(ctx context.Context, payload []byte, fn func(r
 		// ctx 取消兜底（连接随 ctx 取消释放，与现状等价）。
 		_, _ = io.Copy(io.Discard, resp.Body)
 	}
-	return issued, nil // EOF 结束（是否截断由网关按终态事件判定）
+	return nil // EOF 结束（是否截断由网关按终态事件判定）
 }
 
 // scanSSE 逐 `data:` 行扫描 SSE 字节流并交付事件帧（原 Stream 内联循环的抽出）。
@@ -270,31 +257,30 @@ func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, er
 // 重试一次）。
 //
 // 接受状态 = **仅 200**（比 Stream 的 `>= 400` 判据更严，此为有意声明的行为）：
-//   - 200 → captureTurnState(resp)（turn-state 取自**本次响应头**，无响应体变换）
+//   - 200 → id.deliverTurnState（turn-state 取自**本次响应头**，无响应体变换）
 //     后返回**未关闭**的 *http.Response，body 归调用方、须**恰好关闭一次**；
 //   - 非 200（含 201/204/3xx/4xx/5xx）→ 在 SDK 内读尽并 Close body 后返回
 //     *HTTPError{StatusCode, Raw}（不泄漏未关闭的连接）。
 //
 // 读取沿用调用方 ctx（http 传输层）：调用方取消能终止后续对返回 body 的读取。
 //
-// TransportWS 时改走上游 Responses WS（见 streamBodyWS）：对外形状完全一致
-// （StatusCode=200 / Body=SSE 字节流 / Header 含 x-codex-turn-state），错误语义
-// 见 TRANSPORT.md。WithWSConnCache(n) 可开启默认关闭的连接复用：连接身份只含
-// readLimit（不含 turn-state），同一 client 上的连续请求——含跨轮——都可命中；
-// 读到终态后必须关闭 Body 才能归还。与 Responses 的聚合路径不共享连接，收益
-// 边界见 TRANSPORT.md 的连接复用段。
-func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte) (*http.Response, error) {
+// TransportWS 时改走上游 Responses WS（见 streamBodyWS）：对外形状一致
+// （StatusCode=200 / Body=SSE 字节流），ts 不进合成响应头——只走 Identity.Sink。
+// WithWSConnCache(n) 可开启默认关闭的连接复用：连接身份 = (threadKey, readLimit)，
+// 同一 thread 的连续请求——含跨轮跨窗口——都可命中；匿名不复用；读到终态后必须
+// 关闭 Body 才能归还。与 Responses 的聚合路径不共享连接，收益边界见 TRANSPORT.md。
+func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte, id Identity) (*http.Response, error) {
 	if c.opts.responsesTransport == TransportWS {
-		return c.streamBodyWS(ctx, payload, wsStreamReadLimit)
+		return c.streamBodyWS(ctx, payload, id, wsStreamReadLimit)
 	}
 	wire, err := normalizeCodexHTTPPayload(payload)
 	if err != nil {
 		return nil, err
 	}
-	wire = c.injectResponsesClientMetadata(wire)
+	wire = injectResponsesClientMetadata(wire, id)
 	// 仅本方法禁跟随重定向：3xx 原样返回 → 归为非 200 → *HTTPError（避免
 	// 自动跟随到 Location 目标后按 200 当成功）。
-	resp, err := c.doURL(ctx, c.clientNoRedirect(), DefaultResponsesURL, http.MethodPost, wire)
+	resp, err := c.doURL(ctx, c.clientNoRedirect(), DefaultResponsesURL, http.MethodPost, wire, id)
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +289,7 @@ func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte) (*http.Resp
 		_ = resp.Body.Close()
 		return nil, &HTTPError{StatusCode: resp.StatusCode, Raw: body}
 	}
-	c.captureTurnState(resp)
+	id.deliverTurnState(resp.Header.Get(HeaderTurnState))
 	return resp, nil
 }
 
@@ -323,7 +309,7 @@ func normalizeCodexHTTPPayload(raw []byte) ([]byte, error) {
 // responses_metadata.rs:255-288；生产模板 turn_metadata.rs:260-278
 // turn_id 恒带）：
 //   - 恒 4 key：x-codex-installation-id / session_id / thread_id /
-//     x-codex-window-id（CodexMeta 与 WithSession 同 key 时 CodexMeta 优先
+//     x-codex-window-id（Identity.Meta 与 Identity.Session 同 key 时 Meta 优先
 //     ——对齐 WS 组装优先级（frameCodec.metaEntries；空值跳过）；
 //   - 恒带 turn_id：CodexMeta.TurnID 静态值优先；否则每请求自动 UUIDv7
 //     （网关每请求即一轮，对齐真实"每轮新 sub_id"语义）；客户端自带 turn_id
@@ -332,8 +318,8 @@ func normalizeCodexHTTPPayload(raw []byte) ([]byte, error) {
 //     parent_turn_id / x-codex-turn-metadata；
 //   - 不注入：traceparent/tracestate（HTTP 体面真实不带——trace 仅 WS
 //     帧面）、turn-state（体键不存在，其请求头属 HTTP 头面不在本方法）；
-//   - 不做 metaPassthrough / turn_metadata 回调（WS 帧面扩展——真实 HTTP
-//     client_metadata() 是静态键集）。
+//   - 不做 turn_metadata 回调（WS 帧面扩展——真实 HTTP client_metadata() 是
+//     静态键集）。
 //
 // 整体替换：payload 顶层 client_metadata 由网关身份**整体重建**（单次
 // sjson.SetRawBytes）——codex 面客户端自带的 client_metadata **永不透传**，
@@ -343,7 +329,7 @@ func normalizeCodexHTTPPayload(raw []byte) ([]byte, error) {
 // 保持原样（对齐 responses.go Responses() 的 gjson.ValidBytes 前置校验先例——
 // 实测 sjson.SetRawBytes 对非法 JSON 静默产出损坏字节（err=nil），故须前置
 // gjson.ValidBytes）。
-func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
+func injectResponsesClientMetadata(payload []byte, id Identity) []byte {
 	payload = RewriteEnvironmentContextTime(payload, time.Now())
 	// codex 面客户端自带的 client_metadata **永不透传**：不做对象级短路、也不做
 	// 键级透传——下方 entries 由网关伪装身份构造，注入时覆盖请求体内已有同 key
@@ -357,28 +343,26 @@ func (c *HTTPClient) injectResponsesClientMetadata(payload []byte) []byte {
 	// turn_id（真实恒发）。
 	var entryBuf [8]metadataEntry
 	entries := metaEntries(entryBuf[:0])
-	entries = entries.withCodexMetaIdentity(c.opts.meta)
-	if m := c.opts.meta; m != nil {
-		entries = entries.add(codexMetaParentThreadKey, m.ParentThreadID)
-		entries = entries.add(codexMetaParentTurnKey, m.ParentTurnID)
-		entries = entries.add(codexMetaTurnMetadataKey, m.TurnMetadata)
-		// 注意：HTTP 体面不含 trace 键（真实 client_metadata() 无
-		// ws_request_header_trace* 注入——trace 仅 WS 帧面扩展）。
-	}
-	entries = entries.withSessionIdentity(c.opts.session)
+	entries = entries.withCodexMetaIdentity(id.Meta)
+	entries = entries.add(codexMetaParentThreadKey, id.Meta.ParentThreadID)
+	entries = entries.add(codexMetaParentTurnKey, id.Meta.ParentTurnID)
+	entries = entries.add(codexMetaTurnMetadataKey, id.Meta.TurnMetadata)
+	// 注意：HTTP 体面不含 trace 键（真实 client_metadata() 无
+	// ws_request_header_trace* 注入——trace 仅 WS 帧面扩展）。
+	entries = entries.withSessionIdentity(id.Session)
 	// turn_id 恒带且覆盖：无静态值 → 每请求自动 UUIDv7（客户端自带 turn_id
 	// 不参与透传——网关值恒为准，对齐 WS 组装条件）。
-	if c.opts.meta == nil || c.opts.meta.TurnID == "" {
+	if id.Meta.TurnID == "" {
 		entries = entries.add(codexMetaTurnKey, NewUUIDv7())
 	}
 	return injectClientMetadataKeys(payload, entries)
 }
 
-func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, error) {
+func (c *HTTPClient) do(ctx context.Context, payload []byte, id Identity) (*http.Response, error) {
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	return c.doURL(ctx, c.httpClient(), DefaultResponsesURL, http.MethodPost, payload)
+	return c.doURL(ctx, c.httpClient(), DefaultResponsesURL, http.MethodPost, payload, id)
 }
 
 // doURL 发送指定 method 请求到指定完整端点并应用 401 自动轮转（do 的 URL
@@ -386,11 +370,11 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte) (*http.Response, er
 // 同一传输层：判死分类 + 单飞 refresh + 自动重试一次，语义与 do 完全一致）。
 // hc 为本次使用的 http.Client——默认 httpClient()；StreamBody 传 no-redirect
 // client（仅影响重定向跟随，401 轮转语义不变）。
-func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte) (*http.Response, error) {
+func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte, id Identity) (*http.Response, error) {
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	resp, err := c.sendRequest(ctx, hc, targetURL, method, payload)
+	resp, err := c.sendRequest(ctx, hc, targetURL, method, payload, id)
 	if err != nil {
 		return nil, err
 	}
@@ -415,7 +399,7 @@ func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL strin
 		return respWithBody(resp, http.StatusUnauthorized, body), nil
 	}
 	// 自动重试一次（新 at）。
-	resp2, err := c.sendRequest(ctx, hc, targetURL, method, payload)
+	resp2, err := c.sendRequest(ctx, hc, targetURL, method, payload, id)
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +419,7 @@ func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL strin
 
 // sendRequest 构造指定 method 请求并执行（伪装层默认头 + 调用方 WithHeader 覆盖）。
 // hc 由调用方选定（默认/禁跟随重定向）。
-func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte) (*http.Response, error) {
+func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte, id Identity) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 构造请求失败: %w", err)
@@ -449,17 +433,13 @@ func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL
 	// 伪装层默认头（WithHeader 可覆盖）。HTTP 不发 OpenAI-Beta 与 trace 头
 	// （真实客户端行为）；需要 beta 时调用方以 WithHeader 显式注入。
 	applyDefaultHeaders(req.Header)
-	// 注意：默认**不**携带 x-codex-turn-state（真实客户端只在取得 ts 后才带）；
-	// 本次请求的 ts 由 provider / WithHeader 显式给出（见下方逐请求写入点）。
 	// 账号标识头（ChatGPT 系 auth 恒发；空 = 不发，向后兼容）。
 	applyAccountID(req.Header, c.auth)
 	// 调用方 WithHeader：逐请求应用（先删后加，同名多次调用为扩展）。
 	applyHeaderOverrides(req.Header, c.opts.headers)
-	// 逐请求 turn-state（S2）：provider > WithHeader > 空串。与上一行的区别是
-	// 优先级更高、且**每次请求重新求值**；它不进连接身份，也不回落到 TurnState()
-	// 缓存（缓存只作观测面）。
-	if ts := c.effectiveTurnState(); ts != "" {
-		req.Header.Set(HeaderTurnState, ts)
+	// 逐请求 turn-state 只来自 Identity（保留键已禁止经 WithHeader 注入）。
+	if id.TurnState != "" {
+		req.Header.Set(HeaderTurnState, id.TurnState)
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
@@ -491,60 +471,6 @@ func respWithBody(orig *http.Response, status int, body []byte) *http.Response {
 		Header:     orig.Header,
 		Body:       io.NopCloser(bytes.NewReader(body)),
 		Request:    orig.Request,
-	}
-}
-
-// TurnState 返回最近一次签发的 x-codex-turn-state（HTTP 响应头 / WS 握手响应头 /
-// WS response.metadata 事件三处捕获，非空才覆盖）。
-//
-// 它是**观测面**（"上次签发过什么"），不是下一次请求的默认值：请求侧的取值由
-// WithTurnStateProvider / WithHeader 决定，绝不回落本缓存（否则跨轮必重放旧 ts）。
-func (c *HTTPClient) TurnState() string {
-	v, _ := c.turnState.Load().(string)
-	return v
-}
-
-// syntheticTurnState 是合成响应头（以及非流式 HTTPResponse.TurnState）的回填判据
-// （S5，流式与聚合两臂共用这一条）：
-//
-//	backfill := !reused || (effective != "" && effective == c.TurnState())
-//	值：      !reused ⇒ issued；否则 effective
-//
-// 为什么"握手路径必须回填"：一次真实的握手响应头是 ts 的**唯一发现通道**——
-// 事件级 ts（response.metadata）是后到的，进不了已经定死的合成响应头；HTTP 请求
-// 的响应头也一样。所以只要本次 exchange 真的握手了，本次签发值（issued）就是
-// 新鲜值，永远该回显（issued 为空 = 上游没签发，那就不带）。
-//
-// 命中复用没有新握手：只有"本次请求带的 ts 仍等于最近签发值"（轮内复用）才回填；
-// 跨轮（未带 / 已被 provider 换成新值）一律不回填旧值——否则上一轮的值会被下游
-// 当成本轮的签发值再存一次，下一请求就会重放它。
-func (c *HTTPClient) syntheticTurnState(issued, effective string, reused bool) string {
-	if !reused {
-		return issued
-	}
-	if effective != "" && effective == c.TurnState() {
-		return effective
-	}
-	return ""
-}
-
-// captureTurnState 从响应头捕获 x-codex-turn-state（非空才覆盖）。
-func (c *HTTPClient) captureTurnState(resp *http.Response) {
-	if resp != nil {
-		c.captureTurnStateValue(resp.Header.Get(HeaderTurnState))
-	}
-}
-
-// captureTurnStateValue 直接捕获 turn-state 字面值（非空才覆盖），并同步调用
-// WithTurnStateObserver——三处捕获点（HTTP 响应头 / WS 握手响应头 / WS 事件）
-// 共用这一个写入口，观测者不会漏掉任何一条路径。
-func (c *HTTPClient) captureTurnStateValue(v string) {
-	if v == "" {
-		return
-	}
-	c.turnState.Store(v)
-	if fn := c.opts.turnStateObserver; fn != nil {
-		fn(v)
 	}
 }
 

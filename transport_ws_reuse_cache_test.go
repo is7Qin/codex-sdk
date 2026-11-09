@@ -114,10 +114,18 @@ func (u *reuseUpstream) client(t *testing.T, opts ...Option) *HTTPClient {
 	return NewHTTPClient(PAT("pat-reuse"), append(base, opts...)...)
 }
 
+// reuseIdentity 是该文件默认的稳定身份：连接复用键固定，window 固定。
+func reuseIdentity() Identity { return identityFor("thread-reuse", "thread-reuse:0", "", nil) }
+
 // doStreamBody 跑一次 StreamBody 并读尽 body（失败即 t.Fatal）。
 func doStreamBody(t *testing.T, hc *HTTPClient) string {
 	t.Helper()
-	body, err := streamBodyOnce(hc)
+	return doStreamBodyID(t, hc, reuseIdentity())
+}
+
+func doStreamBodyID(t *testing.T, hc *HTTPClient, id Identity) string {
+	t.Helper()
+	body, err := streamBodyOnceID(hc, id)
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -126,10 +134,12 @@ func doStreamBody(t *testing.T, hc *HTTPClient) string {
 
 // streamBodyOnce 跑一次 StreamBody 并读尽 body。**可在子 goroutine 里调**：
 // 它不碰 *testing.T，错误交给调用方决定怎么报（t.Fatalf 只能用在测试主 goroutine）。
-func streamBodyOnce(hc *HTTPClient) (string, error) {
+func streamBodyOnce(hc *HTTPClient) (string, error) { return streamBodyOnceID(hc, reuseIdentity()) }
+
+func streamBodyOnceID(hc *HTTPClient, id Identity) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), id)
 	if err != nil {
 		return "", err
 	}
@@ -187,7 +197,7 @@ func TestWSConnNotReusedAfterAbandon(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`))
+	resp, err := hc.StreamBody(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("StreamBody: %v", err)
 	}
@@ -219,24 +229,25 @@ func TestWSConnCacheClearedByCloseIdle(t *testing.T) {
 
 // ---- S1：turn-state 变化不影响连接身份 ----
 
-// TestWSConnReuseIgnoresTurnState（S1）：上游第一次握手签发 A；第二个请求不带 ts
-// （新的一轮）必须**复用同一条连接**——连接身份不含 turn-state，ts 变化不摧毁连接
-// （真实 codex：连接 thread 级、ts 轮级；换连接条件里没有 ts）。
+// TestWSConnReuseIgnoresTurnState：连接身份不含 ts——第二个请求带不同
+// Identity.TurnState 仍复用同一条连接；握手 ts 只进各自请求的 Sink。
 func TestWSConnReuseIgnoresTurnState(t *testing.T) {
 	up := newReuseUpstream(t)
 	up.setTurnSeq("A", "B")
 	hc := up.client(t, WithWSConnCache(2))
 
-	doStreamBody(t, hc)
-	if got := hc.TurnState(); got != "A" {
-		t.Fatalf("TurnState = %q，期望 A", got)
+	var sink1 turnStateSink
+	doStreamBodyID(t, hc, identityFor("thread-reuse", "thread-reuse:0", "", &sink1))
+	if got := sink1.values(); len(got) != 1 || got[0] != "A" {
+		t.Fatalf("Sink = %v，期望 [A]", got)
 	}
-	doStreamBody(t, hc) // 第二个请求不带 ts
+	var sink2 turnStateSink
+	doStreamBodyID(t, hc, identityFor("thread-reuse", "thread-reuse:1", "B", &sink2))
 	if got := up.accepts.Load(); got != 1 {
-		t.Fatalf("accepts = %d，期望 1（跨 ts 必须复用同一连接）", got)
+		t.Fatalf("accepts = %d，期望 1（跨 ts/window 必须复用同一连接）", got)
 	}
-	if got := hc.TurnState(); got != "A" {
-		t.Fatalf("TurnState = %q，期望仍为 A（复用没有新握手）", got)
+	if got := sink2.values(); len(got) != 0 {
+		t.Fatalf("复用没有新握手，Sink 应为空, got %v", got)
 	}
 }
 
@@ -254,10 +265,10 @@ func TestWSConnReusedFirstFrameDesynced(t *testing.T) {
 	defer cancel()
 	// 两次都走聚合臂（同一条取数路径 ⇒ 同一个 key，第二次才会命中）。
 	noop := func([]byte) error { return nil }
-	if _, err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), noop); err != nil {
+	if err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), reuseIdentity(), noop); err != nil {
 		t.Fatalf("第一次: %v", err)
 	}
-	_, err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), noop)
+	err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), reuseIdentity(), noop)
 	if !errors.Is(err, errConnDesynced) {
 		t.Fatalf("错误 = %v，期望 errConnDesynced", err)
 	}
@@ -274,15 +285,16 @@ func TestWSConnReusedFirstFrameErrorPassesThrough(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	noop := func([]byte) error { return nil }
-	if _, err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), noop); err != nil {
+	if err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), reuseIdentity(), noop); err != nil {
 		t.Fatalf("第一次: %v", err)
 	}
 
 	var seen []byte
-	_, err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), func(raw []byte) error {
+	err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), reuseIdentity(), func(raw []byte) error {
 		seen = append(seen, raw...)
 		return nil
 	})
+
 	if errors.Is(err, errConnDesynced) {
 		t.Fatalf("首帧 error 被误判成 errConnDesynced: %v", err)
 	}
@@ -453,7 +465,7 @@ func TestWSConnCacheSeparatesArms(t *testing.T) {
 	doStreamBody(t, hc)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := hc.Responses(ctx, []byte(`{"model":"gpt-5.6","input":[]}`)); err != nil {
+	if _, err := hc.Responses(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), reuseIdentity()); err != nil {
 		t.Fatalf("Responses: %v", err)
 	}
 	if got := up.accepts.Load(); got != 2 {
@@ -561,7 +573,7 @@ func TestWSConnCacheConcurrentMixed(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if _, err := hc.Responses(ctx, []byte(`{"model":"gpt-5.6","input":[]}`)); err != nil {
+			if _, err := hc.Responses(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), reuseIdentity()); err != nil {
 				t.Errorf("Responses: %v", err)
 			}
 		}()

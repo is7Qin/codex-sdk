@@ -29,13 +29,13 @@ var turnStateHeaderKey = []byte(HeaderTurnState)
 //     dropped+1（**只丢 ts 候选，不丢帧**）。这条防的是复用首帧白名单放行旧
 //     `*.metadata` 把旧 ts 覆盖成新值。fail-safe：`response.created` 到达前的
 //     任何 metadata 一律不捕获——漏掉一个 ts 远好于写进一个错误的值；
-//  4. 接受 ⇒ onTS（写 HTTPClient.TurnState() + observer），然后原样透传该帧。
+//  4. 接受 ⇒ 写入 id.Sink（nil = 忽略），然后原样透传该帧。
 //
 // 帧契约：一帧进、一帧出，不复制、不改写、不重排、不丢弃任何帧。三个方法必须
 // 全部转发——`Release` 是**唯一**把连接交回缓存的出口，漏了复用直接失效。
 type turnStateTap struct {
 	inner   frameStream
-	onTS    func(string)  // 捕获到本轮新值（非空）
+	sink    TurnStateSink // 捕获到本轮新值（非空）时的落点；nil = 忽略
 	seenID  string        // 从 response.created 记下的本轮 response_id
 	dropped *atomic.Int64 // 归属判定丢弃计数（跨 goroutine 读，必须原子）
 }
@@ -75,7 +75,9 @@ func (t *turnStateTap) observe(raw []byte) {
 		return
 	}
 	if t.seenID != "" && id == t.seenID {
-		t.onTS(ts)
+		if t.sink != nil {
+			t.sink.SetTurnState(ts)
+		}
 		return
 	}
 	if t.dropped != nil {
@@ -103,13 +105,14 @@ func metadataTurnState(raw []byte) (id, ts string) {
 }
 
 // turnStateTapFor 给一次 exchange 装观测装饰器（两条臂共用这一处构造）。
+// sink 是本次请求的 Identity.Sink（nil-safe）。
 //
 // dropped 挂在 HTTPClient 上：一次 exchange 的 tap 是短命的，观测计数要在
 // 请求结束后仍可读（测试与运维诊断都不必持有 exchange）。
-func (c *HTTPClient) turnStateTapFor(inner frameStream) *turnStateTap {
+func (c *HTTPClient) turnStateTapFor(inner frameStream, sink TurnStateSink) *turnStateTap {
 	return &turnStateTap{
 		inner:   inner,
-		onTS:    c.captureTurnStateValue,
+		sink:    sink,
 		dropped: &c.turnStateDropped,
 	}
 }
