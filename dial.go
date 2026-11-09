@@ -23,6 +23,8 @@ type dialSpec struct {
 	readLimit int64
 	mode      connMode
 	headers   http.Header
+	// cache 是空闲连接的退役入口（nil = 复用关闭）；连接拿它来自行 sweep。
+	cache *connCache
 }
 
 // handshake 是握手成功后从上游取到的东西。
@@ -158,6 +160,7 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 		pongTimeout:  defaultPongTimeout,
 		queueFrames:  defaultQueueFrames,
 		queueBytes:   defaultQueueBytes,
+		cache:        spec.cache,
 	}
 	return newConn(wsConn, cfg, connCtx, stop), hs, nil
 }

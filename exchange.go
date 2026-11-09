@@ -2,6 +2,8 @@ package codexsdk
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -123,44 +125,97 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, readLimit 
 		cancel()
 		return nil, err
 	}
-	cn, hs, err := dialConn(exchangeCtx, dialSpec{
+	key := connKey{turnState: effective, readLimit: readLimit}
+	// sink 是归还口：**必须**在 nil 时保持真正的 nil 接口（typed-nil 陷阱：
+	// 把 (*connCache)(nil) 装进接口后 e.sink == nil 为假，Release 会调进去）。
+	var sink connSink
+	if c.wsCache != nil {
+		sink = c.wsCache
+	}
+
+	// 取用：只有开启缓存才可能命中。token 必须在锁外取（OAuth 可能取锁/刷新），
+	// 报错就直接失败——不拿旧连接硬上。
+	if cache := c.wsCache; cache != nil {
+		if c.auth == nil { // 与 dialConn 同一道保护：缓存分支不能先崩在解引用上
+			cancel()
+			return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
+		}
+		token, terr := c.auth.Authorization(exchangeCtx)
+		if terr != nil {
+			cancel()
+			return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", terr)
+		}
+		if cc, ok := cache.get(key, token); ok {
+			e := c.activate(exchangeCtx, cancel, cc.cn, cc.key,
+				handshake{turnState: cc.issued, token: cc.token, bornAt: cc.bornAt}, true, sink)
+			// 复查 + 解栏。顺序是契约：解栏在写 create 帧**之前**——反过来的话，
+			// 一个响应极快的上游会在我们写完的几微秒内回帧，撞上 fenced 被判废。
+			if cc.cn.releasable() && cc.cn.inbox.unfence() {
+				cache.hits.Add(1)
+				if werr := cc.cn.write(exchangeCtx, frame); werr != nil {
+					e.teardown(werr) // 写失败不重试、不重拨（create 可能已进 socket）
+					return nil, werr
+				}
+				return e, nil
+			}
+			// 取用窗口失败（空闲期来过帧 / 连接已不可用）：帧尚未发出，重拨安全。
+			e.stopWatch()
+			cc.cn.terminate(io.EOF)
+			cache.misses.Add(1)
+		} else {
+			cache.misses.Add(1)
+		}
+	}
+
+	cn, hs, derr := dialConn(exchangeCtx, dialSpec{
 		auth:      c.auth,
 		opts:      c.opts,
 		readLimit: readLimit,
 		mode:      modePumped,
 		headers:   c.wsHeaders,
+		cache:     c.wsCache,
 	})
-	if err != nil {
+	if derr != nil {
 		cancel()
-		return nil, wsDialError(err)
+		return nil, wsDialError(derr)
 	}
 	// 本次握手签发值回写（HTTP 臂在这里读 resp.Header；WS 面只有这一个观测点）。
-	// 顺序不能反：帧已按 effective 编码，回写不会污染本轮帧。
+	// 顺序不能反：帧已按 effective 编码，回写不会污染本轮帧。命中路径没有握手，
+	// 所以不回写（合成的 x-codex-turn-state 头由 cache 条目里的 issued 提供）。
 	c.captureTurnStateValue(hs.turnState)
+	e := c.activate(exchangeCtx, cancel, cn, key, hs, false, sink)
+	if werr := cn.write(exchangeCtx, frame); werr != nil {
+		e.teardown(werr) // 写失败不重试、不重拨（response.create 可能已进 socket）
+		return nil, werr
+	}
+	return e, nil
+}
+
+// activate 把一条连接交给新的 exchange：先落租约，再装取消守卫。
+//
+// 次序是契约：lease 必须先 Store 再注册 AfterFunc。若注册时 ctx 已经取消，回调会
+// 立刻在新 goroutine 里跑；此时 lease 还没落地的话 CAS 必失败 ⇒ 没人终止这条连接，
+// 而 write 只查 err()/isClosing()，会把 response.create 照常写出去。
+func (c *HTTPClient) activate(ctx context.Context, cancel context.CancelFunc, cn *conn, key connKey, hs handshake, reused bool, sink connSink) *wsExchange {
 	e := &wsExchange{
 		cn:     cn,
-		key:    connKey{turnState: effective, readLimit: readLimit},
+		sink:   sink,
+		key:    key,
 		issued: hs.turnState,
 		token:  hs.token,
 		bornAt: hs.bornAt,
-		ctx:    exchangeCtx,
+		ctx:    ctx,
 		cancel: cancel,
+		reused: reused,
 		first:  true,
 	}
-	// lease 必须先落地再注册 AfterFunc：若注册时 ctx 已经取消，回调会立刻在新
-	// goroutine 里跑；此时 lease 还没 Store 的话 CAS 必失败 ⇒ 没人终止这条连接，
-	// 而 write 只查 err()/isClosing()，会把 response.create 照常写出去。
 	cn.lease.Store(e)
-	e.stopWatch = context.AfterFunc(exchangeCtx, func() {
+	e.stopWatch = context.AfterFunc(ctx, func() {
 		if cn.lease.CompareAndSwap(e, nil) {
-			cn.terminate(exchangeCtx.Err())
+			cn.terminate(ctx.Err())
 		}
 	})
-	if err := cn.write(exchangeCtx, frame); err != nil {
-		e.teardown(err) // 写失败不重试、不重拨（response.create 可能已进 socket）
-		return nil, err
-	}
-	return e, nil
+	return e
 }
 
 // exchangeContext 派生一次 exchange 的 ctx：timeout>0 用它封顶（含拨号/升级），

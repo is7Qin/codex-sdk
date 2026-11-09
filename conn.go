@@ -84,6 +84,9 @@ type connConfig struct {
 	pongTimeout  time.Duration // 探测预算（固定 2s，无 Option）
 	queueFrames  int           // pumped 帧数闸
 	queueBytes   int           // pumped 字节闸
+	// cache 是这条连接归还后的去处（nil = 复用关闭）。它只给 keepalive 用在
+	// 定期 sweep 上：连接自己不知道缓存的存在，只知道"找谁回收我"。
+	cache *connCache
 }
 
 // conn 是"一条连接 = 一个 socket 读点 + 一个写闸 + 一个终止入口"的内核。
@@ -106,6 +109,10 @@ type conn struct {
 	closeErr     error         // 关闭握手结果（mu 保护）
 
 	gate chan struct{} // cap=1 信号量：写与探测的唯一准入
+
+	// cache 是空闲连接的退役入口（构造期固定；nil = 复用关闭）。
+	// keepalive 每个 tick 调它的 sweep，因此不需要另开定时器。
+	cache *connCache
 
 	// lease 是这条连接的归属租约（仅 pumped，复用开启时才有意义）：
 	// 谁 CAS 成功谁拥有收尾权——归还要 CAS 成功才 put，取消回调要 CAS 成功才
@@ -143,6 +150,7 @@ func newConn(ws *coderws.Conn, cfg connConfig, ctx context.Context, stop context
 		pingStop:  make(chan struct{}),
 		closeDone: make(chan struct{}),
 		gate:      make(chan struct{}, 1),
+		cache:     cfg.cache,
 	}
 	if cfg.mode == modePumped {
 		c.inbox = newFrameInbox(cfg.queueFrames, cfg.queueBytes)
@@ -339,6 +347,10 @@ func (c *conn) keepalive() {
 		}
 		if c.isClosing() { // 关闭握手进行中：不得打断
 			return
+		}
+		if c.cache != nil {
+			// 空闲连接的退役入口（判定+摘除同锁；keepalive 不读任何时间戳）。
+			c.cache.sweep(time.Now())
 		}
 		err := c.tryProbe()
 		switch {

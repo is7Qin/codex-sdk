@@ -121,6 +121,9 @@ type options struct {
 	// 仅 HTTPClient 的 StreamBody / Responses 读该字段；Dial 与其它端点方法不看。
 	responsesTransport Transport
 	keepaliveInterval  time.Duration // GenerateImageStream 等待期间 keepalive 事件间隔
+
+	// wsConnCache 是 Responses WS 臂的空闲连接容量（0 = 不复用，默认）。
+	wsConnCache int
 }
 
 func defaultOptions() options {
