@@ -134,12 +134,22 @@ func (v *sseView) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Close 关闭上游（幂等）。wsExchange.Close 即终止连接（pump 随之退出），
-// 所以"取消"由 stream.Close 一并完成，本视图不需要额外的 cancel。
+// Close 收尾上游（幂等）。
+//
+//   - 已取出终态帧（`v.terminal`）⇒ **Release**：帧已整帧读出 socket，连接停在
+//     干净边界，可以交回缓存（这正是复用能生效的唯一出口）；
+//   - 其余情况 ⇒ Close：本次请求被放弃，连接不能留给下一个请求。
+//
+// 判据只看 `v.terminal`——本方法自己会把 `v.err` 改成 io.EOF，用 err 判断会把
+// "正常读完"与"中途放弃"混为一谈。
 func (v *sseView) Close() error {
 	v.done = true
 	if v.err == nil {
 		v.err = io.EOF
+	}
+	if v.terminal {
+		v.stream.Release()
+		return nil
 	}
 	return v.stream.Close()
 }

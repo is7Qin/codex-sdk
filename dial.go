@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	coderws "github.com/coder/websocket"
 )
@@ -24,20 +25,31 @@ type dialSpec struct {
 	headers   http.Header
 }
 
-// handshake 是握手成功后从上游取到的东西（目前只有 turn-state 签发值）。
+// handshake 是握手成功后从上游取到的东西。
+//
+// token 是本次升级头里实际使用的 Authorization（401 轮转后是新的那一份）：
+// 连接复用的取用判定要拿它跟当次请求的 Authorization 比对，OAuth 轮转后旧连接
+// 不能将就。bornAt 是拨号起始时刻，是本地寿命上限（connMaxAge）的起点——
+// 它随连接在缓存里逐次传递，命中不重置。
 type handshake struct {
 	turnState string
+	token     string
+	bornAt    time.Time
 }
 
 // dialConn 拨号 + 升级 + 401 轮转，返回连接内核与握手结果。
 //
-// ctx 只是**握手预算**；连接寿命 ctx 在这里定：pull = Background + 自身 cancel，
-// pumped = 请求 ctx（已按 WithTimeout 设好 deadline）+ 自身 cancel。
+// ctx 只是**握手预算**；连接寿命 ctx 在这里定（两支都是 Background + 自身 cancel）：
+// 连接要跨请求复用，不能再让请求结束时的 defer cancel() 杀掉 socket。单次请求的
+// 时限由 openWSExchange 的 exchangeCtx 负责（含拨号/升级）。
 func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 	if spec.auth == nil {
 		return nil, handshake{}, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
 	wsURL := DefaultResponsesWSURL
+	bornAt := time.Now()
+	// dialedToken 是最后一次成功升级所用的 Authorization（dialWS 填入）。
+	var dialedToken string
 
 	// 升级头组装（重连时以新 at 重取）。
 	buildHeaders := func(ctx context.Context) (http.Header, error) {
@@ -81,6 +93,7 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 		if err != nil {
 			return nil, nil, err
 		}
+		dialedToken = hdr.Get("Authorization")
 		dopts := &coderws.DialOptions{HTTPHeader: hdr}
 		if spec.opts.transport != nil {
 			dopts.HTTPClient = &http.Client{Transport: spec.opts.transport}
@@ -125,26 +138,18 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 	}
 	wsConn.SetReadLimit(spec.readLimit)
 
-	hs := handshake{}
+	hs := handshake{token: dialedToken, bornAt: bornAt}
 	if resp != nil {
 		hs.turnState = resp.Header.Get(HeaderTurnState)
 	}
 
 	// 连接寿命 ctx：
-	//   - pumped：请求 ctx，WithTimeout>0 时在同一处设 deadline（=0 时就是调用方 ctx）；
-	//   - pull：与调用方 ctx 解耦（今日语义：Dial 的 ctx 只约束握手）。
+	//   - pumped：**与请求 ctx 解耦**（T5 起）。连接要跨请求复用，所以不能再让
+	//     请求结束时的 defer cancel() 杀掉 socket；请求 ctx 只作握手预算。
+	//     单次请求的时限由 openWSExchange 的 exchangeCtx 负责（含拨号/升级）。
+	//   - pull：同今日语义（Dial 的 ctx 只约束握手）。
 	// handshake 用的是调用方 ctx：它就是握手预算。
-	baseCtx := ctx
-	if spec.mode == modePull {
-		baseCtx = context.Background()
-	}
-	var connCtx context.Context
-	var stop context.CancelFunc
-	if spec.mode == modePumped && spec.opts.timeout > 0 {
-		connCtx, stop = context.WithTimeout(baseCtx, spec.opts.timeout)
-	} else {
-		connCtx, stop = context.WithCancel(baseCtx)
-	}
+	connCtx, stop := context.WithCancel(context.Background())
 
 	cfg := connConfig{
 		mode:         spec.mode,

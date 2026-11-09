@@ -249,6 +249,9 @@ func (s *benchStaticStream) Next(context.Context) ([]byte, error) {
 
 func (s *benchStaticStream) Close() error { return nil }
 
+// Release 实现 frameStream：静态桩背后没有连接，无可归还。
+func (s *benchStaticStream) Release() bool { return false }
+
 // BenchmarkWSStreamBodyPerRequest：spec §7 P3 —— WS 每请求分配（整链路含握手）。
 //
 // 每轮 = 拨号 + 升级 + 发一帧 + 读尽 6 帧脚本（含末帧补的 [DONE]）+ 关闭，

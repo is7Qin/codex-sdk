@@ -45,6 +45,11 @@ var (
 	errProbeSkipped = errors.New("codexsdk: ws 心跳探测跳过")
 	// errGracefulCloseUnsupported pumped 模式调 closeGracefully：属实现错误。
 	errGracefulCloseUnsupported = errors.New("codexsdk: ws 传输臂不支持关闭握手")
+	// errIdleFrame 已归还、未被取用的连接收到帧：上游违约（空闲期不该有帧）。
+	// push 返回它 ⇒ readLoop 既有分支 terminate(perr)。
+	errIdleFrame = errors.New("codexsdk: ws 空闲连接收到帧")
+	// errConnDesynced 复用连接的首帧不是 response 起始事件：上一轮的残帧或串台。
+	errConnDesynced = errors.New("codexsdk: ws 复用连接首帧违约")
 )
 
 // connMode 是连接模式，构造期固定、互斥。
@@ -90,7 +95,7 @@ type conn struct {
 	cfg   connConfig
 	inbox *frameInbox // 仅 pumped
 
-	ctx  context.Context // 连接寿命 ctx（pumped = 请求 ctx；pull = Background）
+	ctx  context.Context // 连接寿命 ctx（恒为 Background + 自身 cancel，与请求解耦）
 	stop context.CancelFunc
 
 	pingOnce sync.Once
@@ -102,6 +107,12 @@ type conn struct {
 
 	gate chan struct{} // cap=1 信号量：写与探测的唯一准入
 
+	// lease 是这条连接的归属租约（仅 pumped，复用开启时才有意义）：
+	// 谁 CAS 成功谁拥有收尾权——归还要 CAS 成功才 put，取消回调要 CAS 成功才
+	// terminate。在表里的连接 lease == nil，下一次取出时再置为新 exchange。
+	// 用原子指针而不是布尔门：布尔门"先查后做"在查询与动作之间有抢占窗口。
+	lease atomic.Pointer[wsExchange]
+
 	mu    sync.Mutex
 	state connState
 
@@ -110,8 +121,8 @@ type conn struct {
 
 // newConn 构造连接内核并按模式启动常驻 goroutine（心跳 / pump）。
 //
-// ctx 与 stop 是连接寿命：pumped 传请求 ctx（含 WithTimeout），pull 传
-// Background + 自己的 cancel。所有通道在此初始化，零值不可用。
+// ctx 与 stop 是连接寿命：与请求 ctx 解耦（Background + 自身 cancel），由 dialConn
+// 构造。所有通道在此初始化，零值不可用。
 func newConn(ws *coderws.Conn, cfg connConfig, ctx context.Context, stop context.CancelFunc) *conn {
 	if cfg.pongTimeout <= 0 {
 		cfg.pongTimeout = defaultPongTimeout
@@ -255,6 +266,12 @@ func (c *conn) isClosing() bool {
 	return c.state != connOpen
 }
 
+// releasable 报告这条连接是否还能交回缓存：没有终止原因、而且不在关闭中。
+// 它是归还判定的第一道闸（"终态 + 队列空"之外的另一半）。
+func (c *conn) releasable() bool {
+	return c.err() == nil && !c.isClosing()
+}
+
 // write 发送一帧（取门前/后各查一次终止原因）。
 func (c *conn) write(ctx context.Context, wire []byte) error {
 	if cause := c.err(); cause != nil {
@@ -385,6 +402,12 @@ type frameInbox struct {
 	maxFrames int
 	maxBytes  int
 
+	// fenced 表示"这条连接已归还、还没被取用"：此期收到的任何帧都是上游违约
+	// （I3）。它和 push 同锁 ⇒ "查空 + 置栏"与"入队"天然互斥。
+	fenced bool
+	// poisoned 表示空闲期收到过帧：一旦置位，这条连接永不归还。
+	poisoned bool
+
 	cause  error
 	closed bool
 
@@ -422,6 +445,7 @@ func (q *frameInbox) signal() {
 }
 
 // push 入队一帧：满 ⇒ ErrWSBackpressure（不阻塞、不丢帧、不无限缓冲）。
+// 已置栏（连接已归还、未被取用）⇒ 置 poisoned 并返回 errIdleFrame。
 func (q *frameInbox) push(frame []byte) error {
 	q.mu.Lock()
 	if q.closed {
@@ -431,6 +455,11 @@ func (q *frameInbox) push(frame []byte) error {
 			cause = io.EOF
 		}
 		return cause
+	}
+	if q.fenced {
+		q.poisoned = true
+		q.mu.Unlock()
+		return errIdleFrame
 	}
 	if len(q.frames)-q.head >= q.maxFrames {
 		q.mu.Unlock()
@@ -446,6 +475,33 @@ func (q *frameInbox) push(frame []byte) error {
 	q.mu.Unlock()
 	q.signal()
 	return nil
+}
+
+// fence 置栏：只有队列为空时才能成功（"读到终态 + 队列空"是归还前提）。
+// 与 push 同锁 ⇒ 置栏之后到达的帧一定走 poisoned 分支，不会被静默缓存。
+func (q *frameInbox) fence() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed || q.fenced || q.head < len(q.frames) {
+		return false
+	}
+	q.fenced = true
+	return true
+}
+
+// unfence 解栏：取用已归还的连接时调用。空闲期收到过帧（poisoned）或已关闭
+// ⇒ 失败，调用方必须丢弃这条连接（不能拿残帧当新请求的首帧）。
+//
+// 顺序契约：解栏必须在写 create 帧**之前**。反过来的话，一个响应极快的上游
+// 会在我们写完的那几微秒内回帧，撞上 fenced 被判废（误杀合法响应）。
+func (q *frameInbox) unfence() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.fenced || q.poisoned || q.closed {
+		return false
+	}
+	q.fenced = false
+	return true
 }
 
 // tryPop 非阻塞取一帧（有帧才交付）。

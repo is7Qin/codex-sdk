@@ -138,6 +138,9 @@ func (s *blockingStream) Next(ctx context.Context) ([]byte, error) {
 
 func (s *blockingStream) Close() error { return nil }
 
+// Release 实现 frameStream：阻塞桩背后没有连接，无可归还。
+func (s *blockingStream) Release() bool { return false }
+
 // TestSSEViewReadDoesNotBlockForNextFrame：一帧的三段吐完且 p 仍有余量时，Read
 // 必须立刻返回已产出的字节，而不是转去 load() 等下一帧——否则 SSE 的逐事件时延
 // 会变成"等下一帧到达"（模型思考期间就是秒级空白）。
