@@ -172,25 +172,40 @@ func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, err
 // fn 返回错误立即终止读取并透传该错误。非 2xx 返回 *HTTPError；
 // 401 自动轮转语义同 Do。
 func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []byte) error) error {
+	_, err := c.streamIssued(ctx, payload, fn)
+	return err
+}
+
+// streamIssued 是 Stream 的实现体，额外返回**本次响应头**的 x-codex-turn-state
+// （"" = 本次未签发）。聚合臂（Responses）拿它当"新鲜签发值"回填
+// HTTPResponse.TurnState（S5 的 `!reused` 分支）。
+//
+// 为什么不读 HTTPClient.TurnState()：那是**池级**"最近签发值"——本次响应没带 ts
+// 时它仍是上一个响应的值，拿它回填就等于把旧 ts 当成本轮签发值（违反"ts 轮级"），
+// 并发复用同一个 client 时更不可控。Do 早就是 per-response 语义
+// （resp.Header.Get），聚合臂对齐它。
+func (c *HTTPClient) streamIssued(ctx context.Context, payload []byte, fn func(raw []byte) error) (string, error) {
 	payload, err := normalizeCodexHTTPPayload(payload)
 	if err != nil {
-		return err
+		return "", err
 	}
 	payload = c.injectResponsesClientMetadata(payload)
 	resp, err := c.do(ctx, payload)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return &HTTPError{StatusCode: resp.StatusCode, Raw: body}
+		return "", &HTTPError{StatusCode: resp.StatusCode, Raw: body}
 	}
+	// 本次响应头的值先取下来（captureTurnState 只写池级缓存 + observer，不返回）。
+	issued := resp.Header.Get(HeaderTurnState)
 	c.captureTurnState(resp)
 
 	done, err := scanSSE(resp.Body, c.opts.maxLineSize, fn)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if done {
 		// [DONE]：流正常终止。排空残余 body——http.Transport 对未读完的
@@ -201,7 +216,7 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, fn func(raw []b
 		// ctx 取消兜底（连接随 ctx 取消释放，与现状等价）。
 		_, _ = io.Copy(io.Discard, resp.Body)
 	}
-	return nil // EOF 结束（是否截断由网关按终态事件判定）
+	return issued, nil // EOF 结束（是否截断由网关按终态事件判定）
 }
 
 // scanSSE 逐 `data:` 行扫描 SSE 字节流并交付事件帧（原 Stream 内联循环的抽出）。

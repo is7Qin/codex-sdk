@@ -264,6 +264,55 @@ func TestResponsesAggregateWire(t *testing.T) {
 	}
 }
 
+// TestResponsesAggregateTurnStateIsPerResponse：HTTP 臂的 HTTPResponse.TurnState
+// 必须取**本次响应头**，不能拿池级最近签发值顶替（S5 的 `!reused` 分支含义就是
+// "本次响应 = 新鲜签发值"）。
+//
+// 场景：第一个响应签发 st-first，第二个响应**不带** ts。若实现读
+// c.TurnState()（池级最近值，仅非空才覆盖），第二次会回填 st-first——调用方把
+// 它当成本轮签发值再存一次，下一请求就重放一个旧 ts（跨轮重放，正是 S3 要杜绝
+// 的 bug）。Do 一直是 per-response 语义，聚合臂必须对齐。
+func TestResponsesAggregateTurnStateIsPerResponse(t *testing.T) {
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n.Add(1) == 1 {
+			w.Header().Set(HeaderTurnState, "st-first")
+		}
+		f := w.(http.Flusher)
+		for _, ev := range []string{respCreatedEvent, respItemMsgDoneEv, respCompletedEv} {
+			_, _ = io.WriteString(w, "data: "+ev+"\n\n")
+			f.Flush()
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		f.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t,
+		"https://chatgpt.com/backend-api/codex/responses", srv.URL+"/v1/responses")))
+
+	first, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("第一次 Responses: %v", err)
+	}
+	if first.TurnState != "st-first" {
+		t.Fatalf("第一次 HTTPResponse.TurnState = %q, 期望 st-first", first.TurnState)
+	}
+
+	second, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("第二次 Responses: %v", err)
+	}
+	if second.TurnState != "" {
+		t.Fatalf("第二次 HTTPResponse.TurnState = %q, 期望空（本次响应未签发，不得回填上次的值）", second.TurnState)
+	}
+	// 池级缓存是 "最近签发值"，不做清除：它只作观测面，不参与本方法的回填。
+	if got := hc.TurnState(); got != "st-first" {
+		t.Fatalf("TurnState() = %q, 期望 st-first（池级最近签发值不被空响应覆盖）", got)
+	}
+}
+
 // TestResponsesStreamFalseOverridden：payload 显式 stream:false → wire 请求
 // 无条件覆盖为 stream:true（网关非流式消费主场景——冲突 wire 断言）。
 func TestResponsesStreamFalseOverridden(t *testing.T) {

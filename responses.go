@@ -74,13 +74,17 @@ func (c *HTTPClient) Responses(ctx context.Context, payload []byte) (*HTTPRespon
 			}
 		}
 	} else {
-		snap.effective = c.effectiveTurnState()
-		if err := c.Stream(ctx, wire, agg.feed); err != nil {
+		// HTTP 臂每个请求都是一次全新的响应：**本次响应头**的值就是新鲜签发值
+		// （等价于"刚握手"），空 = 本次未签发。不读池级 c.TurnState()——那是
+		// "最近签发值"，本次没带 ts 时它仍是上一个响应的值，回填等于把旧 ts 当
+		// 本轮签发值（S5 要防的正是这个）；并发复用同一 client 时更不可控。
+		// 这里也不求值 effectiveTurnState()：reused == false 时判据用不到它，而
+		// sendRequest 已在发请求前求值过一次（一次请求只求值一次 provider）。
+		issued, err := c.streamIssued(ctx, wire, agg.feed)
+		if err != nil {
 			return nil, err // 上游错误（HTTPError/fatal 五类/401 轮转）/ response.failed 事件级错误透传
 		}
-		// HTTP 臂每个请求都是一次全新的响应：响应头（已在上面的 Stream 里捕获）
-		// 就是新鲜签发值，等价于"刚握手"。
-		snap.issued, snap.reused = c.TurnState(), false
+		snap.issued, snap.reused = issued, false
 	}
 	if !agg.completed {
 		// 截断：流结束（[DONE] 与 EOF 统一）未达 response.completed → 错误返回，

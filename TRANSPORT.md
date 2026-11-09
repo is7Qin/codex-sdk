@@ -71,7 +71,7 @@ func WithResponsesTransport(t Transport) Option
 | 面 | HTTP 臂 | WS 臂 |
 |---|---|---|
 | `StreamBody` | `*http.Response{200, 未读 SSE body, 上游头}` | `*http.Response{200, 帧渲染的 SSE body, Content-Type + x-codex-turn-state 合成头}` |
-| `Responses` | `Stream` → `responsesAggregator` → `HTTPResponse{200, Raw, TurnState}` | `responsesStreamWS` **直接从 exchange 取帧**喂同一个聚合器（不经 `sseView`/`scanSSE` 的渲染-回扫回路）→ 同形态、逐字段同构 |
+| `Responses` | `Stream` → `responsesAggregator` → `HTTPResponse{200, Raw, TurnState}`（TurnState = **本次响应头**，不读池级缓存） | `responsesStreamWS` **直接从 exchange 取帧**喂同一个聚合器（不经 `sseView`/`scanSSE` 的渲染-回扫回路）→ 同形态、逐字段同构 |
 | turn-state | 请求头 `x-codex-turn-state`（`WithTurnStateProvider` 逐请求求值，`WithHeader` 兼容）+ 响应头捕获 | 帧 `client_metadata."x-codex-turn-state"`（每请求取值）；握手响应头签发值回写 `TurnState()`；`response.metadata` 事件的 ts 由 `turnStateTap` 逐帧旁路捕获（created 先记 response_id、归属匹配才接受）；合成响应头按 S5 判据回填：真握手回填本次签发值（ts 的唯一发现通道），命中复用只在 `effective != "" && effective == TurnState()`（轮内）时回填，跨轮不回填旧值 |
 | 读上限 | 聚合器单行 16MiB；裸 body 由下游决定 | 按取数路径固定：聚合 16MiB / 流式 64MiB（`WithReadLimit` 只作用于公开 `Dial`，传输臂的上限由取数路径决定）；两条取数路径不共享连接（16MiB / 64MiB） |
 | 请求体归一 | `FilterCodexHTTPPayload` + `store:false` + HTTP `client_metadata` | `frameCodec.encode(encodeWSResponses)`：协议形状差（`type`/续接键/`stream`）+ 白名单 + `store:false` + WS `client_metadata` 由**单遍编码器**一次落地；非常规形态回退 `buildResponsesCreateFrame` → 归一链 |
