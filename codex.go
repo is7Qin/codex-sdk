@@ -124,8 +124,15 @@ func newCodexFieldSet(fields []string) map[string]struct{} {
 // （空结果帧不入网）。
 var ErrEmptyFrame = errors.New("codexsdk: 帧经白名单过滤后为空")
 
-// codexTopLevelNeedsFilter 报告 raw（经 gjson.ValidBytes 校验的 JSON）是否含
-// 非白名单顶层 key。零拷贝零分配（对象根且顶层 key 无转义的快路径）。
+// clientMetadataKey 是顶层身份键的规范拼写（解码后的名字）：白名单过滤、
+// 重复判定与注入/删除都以它为准。
+const clientMetadataKey = "client_metadata"
+
+// codexTopLevelNeedsFilter 报告 raw（经 gjson.ValidBytes 校验的 JSON）是否
+// 需要按白名单重建顶层对象：出现非白名单 key，或身份键 `client_metadata`
+// 出现**多次**。重复成员是 JSON 里的"后者生效"歧义，而覆写只写第一处——
+// 留着第二处等于把 payload 的旧身份原样送上游；重建按有序白名单逐键写一次，
+// 天然收敛成唯一成员。零拷贝零分配（对象根且顶层 key 无转义的快路径）。
 // 非对象根 / 顶层 key 含转义（\）→ 回退 gjsonTopLevelNeedsFilter（精确
 // gjson unescape 语义，罕见、可分配）。判定只看顶层，不深入嵌套。
 func codexTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
@@ -138,6 +145,7 @@ func codexTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
 		return gjsonTopLevelNeedsFilter(raw, set)
 	}
 	i++ // 越过 '{'
+	seenIdentity := false
 	for {
 		// 跳过空白与 ','；遇 '}' / 输入末即扫描完毕（无白名单外键）。
 		for i < len(raw) && (isJSONSpace(raw[i]) || raw[i] == ',') {
@@ -162,6 +170,12 @@ func codexTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
 		if _, ok := set[string(key)]; !ok {
 			return true
 		}
+		if string(key) == clientMetadataKey { // 同样走编译器的无分配比较
+			if seenIdentity {
+				return true // 重复身份键 ⇒ 重建（收敛成唯一成员）
+			}
+			seenIdentity = true
+		}
 		// 跳过空白与 ':' 后跳过整个值。
 		for i < len(raw) && (isJSONSpace(raw[i]) || raw[i] == ':') {
 			i++
@@ -177,10 +191,19 @@ func codexTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
 // 语义）；仅非对象根或顶层 key 含转义（罕见）时使用。
 func gjsonTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
 	needs := false
+	identity := 0
 	gjson.ParseBytes(raw).ForEach(func(key, _ gjson.Result) bool {
-		if _, ok := set[key.String()]; !ok {
+		k := key.String()
+		if _, ok := set[k]; !ok {
 			needs = true
 			return false
+		}
+		if k == clientMetadataKey {
+			identity++
+			if identity > 1 { // 重复（含转义拼写）⇒ 重建
+				needs = true
+				return false
+			}
 		}
 		return true
 	})
@@ -688,18 +711,23 @@ func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {
 // obj 为空（匿名且无任何自动字段）时**删除**该键：身份只来自 Identity，留着
 // payload 自带值等于把调用方的旧 session/thread/ts 透传给上游。
 //
-// 删除交给 sjson 按 JSON 键语义匹配，不做原始字节前缀判断：转义拼写
+// 前置条件：帧已过白名单过滤（filterCodexPayload）——它保证顶层身份键**至多
+// 一个**，无论输入是普通拼写、转义拼写还是重复成员（见
+// codexTopLevelNeedsFilter）。所以这里的删除/覆写只作用于唯一那个成员，不存在
+// "删了第一个、第二个漏网"。
+//
+// 删除/覆写都交给 sjson 按 JSON 键语义匹配，不做原始字节前缀判断：转义拼写
 // （`client_\u006detadata`）在上游会被 unescape 成同一个键，字节比较看不见它，
 // 但 sjson 看得见。键本来就不存在时 sjson 返回入参同一切片（零拷贝）。
 func injectClientMetadataObject(frame, obj []byte) []byte {
 	if len(obj) == 0 {
-		out, err := sjson.DeleteBytes(frame, "client_metadata")
+		out, err := sjson.DeleteBytes(frame, clientMetadataKey)
 		if err != nil {
 			return frame // 非法 JSON：放弃本次注入，保持帧原样
 		}
 		return out
 	}
-	out, err := sjson.SetRawBytes(frame, "client_metadata", obj)
+	out, err := sjson.SetRawBytes(frame, clientMetadataKey, obj)
 	if err != nil {
 		return frame // 非法 JSON：放弃本次注入，保持帧原样
 	}

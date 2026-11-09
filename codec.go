@@ -273,7 +273,7 @@ func wsKeySemanticsOf(field string) wsKeySemantics {
 		return wsKeyStream
 	case "store":
 		return wsKeyStore
-	case "client_metadata":
+	case clientMetadataKey:
 		return wsKeyClientMetadata
 	default:
 		return wsKeyPlain

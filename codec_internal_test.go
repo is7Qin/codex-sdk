@@ -335,6 +335,100 @@ func TestEncodeEmptyIdentityDropsPayloadMetadata(t *testing.T) {
 	}
 }
 
+// countDecodedTopLevelKey 按**解码后的键名**统计顶层成员个数。
+// 重复成员是"后者生效"的歧义，`gjson.Get` 只看首个匹配，量不出漏网的那个。
+func countDecodedTopLevelKey(raw []byte, key string) int {
+	n := 0
+	gjson.ParseBytes(raw).ForEach(func(k, _ gjson.Result) bool {
+		if k.String() == key {
+			n++
+		}
+		return true
+	})
+	return n
+}
+
+// TestEncodeDuplicateIdentityMembersCollapse：顶层身份键重复（普通与转义任意组合）
+// 必须收敛成唯一成员。覆写只写第一处，第二处在 JSON 里可能"后到生效"——留一个
+// payload 的旧身份给上游，等于身份不是只来自 Identity（oracle 评审 blocking）。
+//
+// 三种面（native WS / responses WS / HTTP）都断言：匿名 ⇒ 0 个成员；命名 ⇒
+// 恰好 1 个且是本次身份。
+func TestEncodeDuplicateIdentityMembersCollapse(t *testing.T) {
+	now := time.Date(2026, time.November, 9, 3, 30, 0, 0, time.UTC)
+	id := Identity{Meta: CodexMeta{
+		InstallationID: "inst", SessionID: "sess", ThreadID: "our-thread", WindowID: "our-thread:0",
+	}}
+	forms := []struct {
+		name  string
+		frame string
+	}{
+		{"普通+普通", `{"model":"m","store":false,"client_metadata":{"thread_id":"first"},"client_metadata":{"thread_id":"payload-thread","x-codex-turn-state":"payload-ts"}}`},
+		{"普通+转义", `{"model":"m","store":false,"client_metadata":{"thread_id":"first"},"client_\u006detadata":{"thread_id":"payload-thread","x-codex-turn-state":"payload-ts"}}`},
+		{"转义+普通", `{"model":"m","store":false,"client_\u006detadata":{"thread_id":"payload-thread"},"client_metadata":{"thread_id":"first"}}`},
+		{"转义+转义", `{"model":"m","store":false,"client_\u006detadata":{"thread_id":"payload-thread"},"client_metadat\u0061":{"thread_id":"payload-thread-2"}}`},
+	}
+	hasPayload := func(t *testing.T, got []byte, where string) {
+		t.Helper()
+		if bytes.Contains(got, []byte("payload")) || bytes.Contains(got, []byte("first")) {
+			t.Fatalf("%s: 残留 payload 身份: %s", where, got)
+		}
+	}
+	for _, c := range forms {
+		t.Run(c.name, func(t *testing.T) {
+			anon := newFrameCodec(&options{}) // turn/trace 自动关：本次身份对象为空
+			named := newFrameCodec(&options{})
+			for _, m := range []struct {
+				name string
+				mode encodeMode
+			}{{"native", encodeNativeWS}, {"responses", encodeWSResponses}} {
+				got, err := anon.encode([]byte(c.frame), m.mode, frameInput{Now: now})
+				if err != nil {
+					t.Fatalf("%s: encode: %v", m.name, err)
+				}
+				if n := countDecodedTopLevelKey(got, clientMetadataKey); n != 0 {
+					t.Fatalf("%s: 匿名帧留下 %d 个 client_metadata, 期望 0: %s", m.name, n, got)
+				}
+				hasPayload(t, got, m.name+" 匿名")
+
+				got, err = named.encode([]byte(c.frame), m.mode, frameInput{Identity: id, Now: now})
+				if err != nil {
+					t.Fatalf("%s: encode(named): %v", m.name, err)
+				}
+				if n := countDecodedTopLevelKey(got, clientMetadataKey); n != 1 {
+					t.Fatalf("%s: 命名帧 client_metadata = %d, 期望 1: %s", m.name, n, got)
+				}
+				if v := gjson.GetBytes(got, "client_metadata.thread_id").String(); v != "our-thread" {
+					t.Fatalf("%s: thread_id = %q, 期望 our-thread: %s", m.name, v, got)
+				}
+				hasPayload(t, got, m.name+" 命名")
+			}
+
+			// HTTP 面：先白名单归一（重复键在此收敛），再注入。
+			wire, err := normalizeCodexHTTPPayload([]byte(c.frame))
+			if err != nil {
+				t.Fatalf("normalize HTTP: %v", err)
+			}
+			if n := countDecodedTopLevelKey(wire, clientMetadataKey); n != 1 {
+				t.Fatalf("HTTP 归一后 client_metadata = %d, 期望 1: %s", n, wire)
+			}
+			anonHTTP := injectResponsesClientMetadata(wire, Identity{})
+			if n := countDecodedTopLevelKey(anonHTTP, clientMetadataKey); n != 1 {
+				t.Fatalf("HTTP 匿名注入后 client_metadata = %d, 期望 1（只留自动 turn_id）: %s", n, anonHTTP)
+			}
+			hasPayload(t, anonHTTP, "HTTP 匿名")
+			namedHTTP := injectResponsesClientMetadata(wire, id)
+			if n := countDecodedTopLevelKey(namedHTTP, clientMetadataKey); n != 1 {
+				t.Fatalf("HTTP 命名注入后 client_metadata = %d, 期望 1: %s", n, namedHTTP)
+			}
+			if v := gjson.GetBytes(namedHTTP, "client_metadata.thread_id").String(); v != "our-thread" {
+				t.Fatalf("HTTP thread_id = %q, 期望 our-thread: %s", v, namedHTTP)
+			}
+			hasPayload(t, namedHTTP, "HTTP 命名")
+		})
+	}
+}
+
 // TestEncodeZeroCopyAllocFree：已归一帧必须"原切片返回 + **零分配**"。
 //
 // 指针相等只看得见"有没有复制"，看不见"白分配一份再丢弃"——后者会让已归一帧
