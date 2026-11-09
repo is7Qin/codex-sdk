@@ -20,6 +20,10 @@ const (
 	responseEventFailed    = "response.failed"
 )
 
+// Responses 在 WS 臂可用 WithWSConnCache(n) 开启默认关闭的连接复用：仅同 ts、
+// 同 readLimit 的连续请求可命中，消费终态后自动归还；与 StreamBody 不共享连接。
+// 收益边界见 TRANSPORT.md 的连接复用段。
+//
 // Responses 合成非流式 responses 调用：内部无条件覆盖 stream:true（上游硬性
 // 要求——payload 任意 stream 值（含显式 false）均覆盖为 true，非流式语义由
 // 聚合保证），SSE 事件流聚合重组为完整响应体返回。

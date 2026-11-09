@@ -66,7 +66,7 @@ func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 }
 
 // CloseIdleConnections 关闭底层空闲连接（懒构建未使用时为零开销调用；
-// 与首个请求并发调用安全——内部加锁）。同时清空 WS 臂的空闲连接缓存。
+// 与首个请求并发调用安全——内部加锁）。同时清空 WS 臂的空闲连接缓存并终止其中连接，不中断在飞请求。
 func (c *HTTPClient) CloseIdleConnections() {
 	if c.wsCache != nil {
 		c.wsCache.clear()
@@ -247,7 +247,9 @@ func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, er
 //
 // TransportWS 时改走上游 Responses WS（见 streamBodyWS）：对外形状完全一致
 // （StatusCode=200 / Body=SSE 字节流 / Header 含 x-codex-turn-state），错误语义
-// 见 TRANSPORT.md。
+// 见 TRANSPORT.md。WithWSConnCache(n) 可开启默认关闭的连接复用，仅同 ts、
+// 同 readLimit 的连续请求可命中；读到终态后必须关闭 Body 才能归还。
+// 与 Responses 的聚合路径不共享连接，收益边界见 TRANSPORT.md 的连接复用段。
 func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte) (*http.Response, error) {
 	if c.opts.responsesTransport == TransportWS {
 		return c.streamBodyWS(ctx, payload, wsStreamReadLimit)

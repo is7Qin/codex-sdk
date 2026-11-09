@@ -201,8 +201,8 @@ func (c *connCache) clear() {
 // turn-state、同一条取数路径（流式 64MiB / 聚合 16MiB）的**连续**请求会复用
 // 上一条连接、不再付握手成本；跨 turn-state 不复用（服务端用它做 sticky routing）。
 //
-// 收益边界：命中从同一轮的第 2 个请求起（调用方自带 turn-state）或第 3 个请求起
-// （turn-state 靠上一轮响应捕获）——一轮只有 1–2 个请求时几乎没有收益。
+// 收益边界：默认从同轮第 3 个请求起（调用方自带 turn-state 时第 2 个起），
+// 收益 ∝ 命中次数；一轮 1–2 个请求时默认无收益。
 func WithWSConnCache(n int) Option {
 	return func(o *options) {
 		if n < 0 {

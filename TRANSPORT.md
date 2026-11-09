@@ -27,7 +27,7 @@ func WithResponsesTransport(t Transport) Option
 | socket | `conn.go` | `conn`：唯一 `ws.Read` 调用点（`readFrame`）、写/探测闸 `gate`、唯一心跳 `keepalive`、唯一终止入口 `terminate`（经 `finish` 发布） |
 | 队列 | `conn.go` | `frameInbox`：pumped 的有界入站队列（帧数 + 字节双闸） |
 | 拨号 | `dial.go` | `dialConn`：升级头组装 / 401 轮转 / 升级错误面 |
-| 请求 | `exchange.go` | `wsExchange`：一次请求 = 一条连接 + 一份 turn-state 快照 + `Next` 取帧 |
+| 请求 | `exchange.go` | `wsExchange`：一次请求 = 一次 exchange；连接可跨同 ts 请求复用（默认关），保留 turn-state 快照与 `Next` 取帧 |
 | wire 编码 | `codec.go` | `frameCodec`：无可变状态；`encode` = 单遍快路径（`encodeOnePass`）+ 回退链（非常规形态） |
 | SSE 表示 | `sse.go` | `sseView`：帧 → SSE 字节流（仅 `StreamBody`） |
 
@@ -36,7 +36,7 @@ func WithResponsesTransport(t Transport) Option
 | 模式 | 谁用 | 读 | pong 由谁服务 | 关闭 |
 |---|---|---|---|---|
 | `modePull` | 公开 `Dial` → `Client` | `Client.Recv` 直读 `readFrame`（无 pump、无队列） | 调用方的常驻 `Recv`（**既有契约不变**） | `closeGracefully`（coder 关闭握手，时延上界 ~10s） |
-| `modePumped` | 传输臂（`StreamBody` / `Responses`） | 常驻 `readLoop` + `frameInbox` | pump 恒在 Read（除入队临界区） | 只有 `terminate`：收尾为 TCP 层强断（不做关闭握手；上游此时已发过 close 帧，属预期） |
+| `modePumped` | 传输臂（`StreamBody` / `Responses`） | 常驻 `readLoop` + `frameInbox` | pump 恒在 Read（除入队临界区） | 归还路径不 terminate：`Release` 成功即交回缓存；放弃或归还失败时 `terminate` 强断 TCP（不做关闭握手） |
 
 为什么必须分两种：`coder/websocket` 的 `Read(ctx)` 被取消时会**关闭底层 socket**，
 所以"先取消读、再做关闭握手"不可能（关闭帧永远发不出去）。而传输臂又必须
@@ -72,8 +72,8 @@ func WithResponsesTransport(t Transport) Option
 |---|---|---|
 | `StreamBody` | `*http.Response{200, 未读 SSE body, 上游头}` | `*http.Response{200, 帧渲染的 SSE body, Content-Type + x-codex-turn-state 合成头}` |
 | `Responses` | `Stream` → `responsesAggregator` → `HTTPResponse{200, Raw, TurnState}` | `responsesStreamWS` **直接从 exchange 取帧**喂同一个聚合器（不经 `sseView`/`scanSSE` 的渲染-回扫回路）→ 同形态、逐字段同构 |
-| turn-state | 请求头 `x-codex-turn-state`（`WithHeader` 下发）+ 响应头捕获 | 帧 `client_metadata."x-codex-turn-state"`（同一份 `WithHeader` 值，或 SDK 缓存的最近签发值）；握手响应头的签发值回写 `TurnState()` 与合成响应头 |
-| 读上限 | 聚合器单行 16MiB；裸 body 由下游决定 | 按取数路径固定：聚合 16MiB / 流式 64MiB（`WithReadLimit` 只作用于公开 `Dial`，传输臂不读它） |
+| turn-state | 请求头 `x-codex-turn-state`（`WithHeader` 下发）+ 响应头捕获 | 帧 `client_metadata."x-codex-turn-state"`（同一份 `WithHeader` 值，或 SDK 缓存的最近签发值）；握手响应头的签发值回写 `TurnState()` 与合成响应头；复用命中时没有握手，签发值来自缓存条目回填 |
+| 读上限 | 聚合器单行 16MiB；裸 body 由下游决定 | 按取数路径固定：聚合 16MiB / 流式 64MiB（`WithReadLimit` 只作用于公开 `Dial`，传输臂的上限由取数路径决定）；两条取数路径不共享连接（16MiB / 64MiB） |
 | 请求体归一 | `FilterCodexHTTPPayload` + `store:false` + HTTP `client_metadata` | `frameCodec.encode(encodeWSResponses)`：协议形状差（`type`/续接键/`stream`）+ 白名单 + `store:false` + WS `client_metadata` 由**单遍编码器**一次落地；非常规形态回退 `buildResponsesCreateFrame` → 归一链 |
 | 401 轮转 | 判死分类 + 单飞 refresh + 重试一次 | 同（`dialConn` 内，`OAuthWithRotation`） |
 
@@ -130,9 +130,12 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 | pull 模式 `Recv` 的 ctx 取消 | — | 按 coder 语义**关闭连接**并返回 ctx 错误（不是"只影响本次取帧"） |
 | 下游消费过慢（队列饱和） | 无此形态（背压直接传到 TCP） | `ErrWSBackpressure`（传输层错误，触发即终止连接，不得当 EOF） |
 | 心跳探测超预算 | 无 | `ErrKeepaliveTimeout`（可 `errors.Is`） |
-| `Responses` 读错 | `读取响应流失败: %w`（`scanSSE` 内包） | 同文案（`responsesStreamWS` 包 `exchange.Next` 的原始错误）；**错误链不同**：WS 臂不经过 scanner |
+| `Responses` 读错 | `读取响应流失败: %w`（`scanSSE` 内包） | 同文案（`responsesStreamWS` 包 `exchange.Next` 的原始错误）；**错误链不同**：WS 臂不经过 scanner；复用路径上首帧违约另报 `errConnDesynced` |
 | `response.failed` | `*HTTPError{500, Raw: 事件 error 原始 JSON（缺失则整个事件）}` | 逐字相同（同一个 `failedError`） |
 | `response.incomplete` / 无终态 | 普通错误（"事件流截断"） | 同文案（普通错误，不是 5xx 信封） |
+| 复用连接写失败 | — | 原始错误链，终止连接，不重试、不轮转 |
+| 复用首帧违约 | — | `errConnDesynced`，终止连接 |
+| 服务端 60min 上限 | — | 本地 30min 在空闲时提前退役；若仍收到 `websocket_connection_limit_reached`，按普通 in-band error 透传，不重试 |
 | 坏请求体（坏 JSON / 非对象根） | 原样发上游，由上游 400 兜底 | 本地错误 `errResponsesFrameInvalid`：**不拨号、不发帧** |
 
 `errResponsesFrameInvalid` / `ErrEmptyFrame` 是本地输入错误（裸 error，不是
@@ -145,6 +148,30 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 `StatusCode`/`Raw` 形状的同时，让 `errors.As` 能回溯 `*DialError`、
 `errors.Is` 能回溯 ctx 错误——网关的判死/重试分类不必按臂分叉。
 
+## 连接复用
+
+默认关闭，`WithWSConnCache(n)`（n > 0，建议 2）开启每个 `HTTPClient` 的空闲连接缓存。
+连接身份是 `(turn-state, readLimit)`：同 ts、同取数路径才可复用；流式 64MiB 与聚合
+16MiB 不共享连接。Authorization token 必须仍一致，取出即独占，不做请求多路复用。
+
+归还资格是读到终态、队列空且连接可用；取消、读写错误、提前关闭均终止连接。
+`StreamBody` 须读到终态后关闭 body 才归还；`Responses` 消费终态后自动归还。空闲期收到任何帧
+即判废；取用前复查连接并解栏，失败则在发送前新拨，开始写 create 后不再重试。
+
+空闲 TTL 为 5min，寿命从最初拨号累计 30min，复用不重置寿命；仅清扫缓存中的
+空闲条目，不中断在飞请求。清扫发生在心跳 tick 与取还时；`WithPingInterval(0)`
+关掉心跳后**只剩取还时清扫**——被丢弃的 `HTTPClient`（网关每轮重建）若此后不再有
+请求，其空闲连接只能等对端断开（服务端 60min 上限）；默认 30s 心跳下最迟
+5min 加一个 tick。`CloseIdleConnections()` 同时清 WS 缓存。
+复用首帧只接受 `response.created`、`response.in_progress`、`error`、`*.metadata`
+或 `responsesapi.websocket_timing`，否则报 `errConnDesynced` 并终止。
+
+观测使用内部原子 `hits` / `misses`（不新增公开 API）：每次打开 exchange 计一次，
+只有实际移交成功才算 hit。bench 的 P6 验证一次 accept 与每个计时请求命中，R18
+验证 `accepts == misses` 且 `hits + misses == 请求数`。
+默认从同轮第 3 个请求起（调用方自带 turn-state 时第 2 个起），收益
+∝ 命中次数；一轮 1–2 个请求时默认无收益。若握手反复签发不同 ts，命中还会后移或为零。
+
 ## 已知限制
 
 - **`DialError` 的 body 有上限**：升级失败的响应体只保留前 1024B（够网关取
@@ -156,7 +183,8 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
   `client_metadata`）优先，否则用 `HTTPClient.TurnState()`（最近一次握手签发值）。
   首帧不带 turn-state（与 HTTP 臂首请求一致），之后回传上一次签发值。跨轮清除靠
   调用方的 client 生命周期（网关按 turn-state 值重建 `HTTPClient`；构造本身零
-  开销、懒建连接）——`HTTPClient` 未新增清除入口。
+  开销、懒建连接）——`HTTPClient` 未新增清除入口。连接身份含 ts，跨 ts 不复用；
+  复用不刷新 `TurnState()`，合成响应使用该连接最初握手签发值。
 - **真实上游 in-band 429 未验证**：真实上游在 WS 帧里以 `type:"error"` 表达 429
   语义的情况未实证。当前按"一律透传"处理（与 HTTP 臂的 200 流一致），因此这类
   错误在非流式臂上表现为"事件流截断"而不是 429 —— 若上游确有该形态，需要重新
@@ -167,12 +195,18 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
   读上来；纯拉模型下，下游一慢就没有 Read 在飞，心跳 2s 超时后会强断——那是
   只属于 WS 臂的截断源，且对端 ping 也无人应答。队列饱和 ⇒ `ErrWSBackpressure`
   （快速失败；单帧大于字节闸但队列为空时照常通过）。
-- **心跳的作用面**：传输臂的保活不依赖调用方读频率（常驻读者在服务 pong）；
+- **心跳的作用面**：传输臂的保活不依赖调用方读频率（常驻读者在服务 pong），空闲期同样生效；
   但 `WithPingInterval(0)` 会**关掉探测本身**——连接照样能服务 pong，只是半开
   连接不再由 `ErrKeepaliveTimeout` 判死，只能靠读写错误或调用方 ctx 兜底。pull
   面沿用既有契约：心跳依赖调用方的常驻 `Recv`。
-- **一次调用一条连接**：`StreamBody` 每次拨新连接，终态后由 `Body.Close()`
-  强断（不做关闭握手）；没有连接复用 / 池化（复用属后续独立任务）。
+- **连接可复用（默认关）**：默认关闭，`WithWSConnCache(n)` 开启；`StreamBody`
+  读到终态后由 `Body.Close()` 尝试归还，否则强断。单请求轮次无收益；
+  默认从同轮第 3 个请求起（调用方自带 turn-state 时第 2 个起），
+  收益 ∝ 命中次数；一轮 1–2 个请求时默认无收益。
+- **关闭心跳会削弱空闲连接的退役**：`WithPingInterval(0)` 下没有心跳 tick，只剩取还时清扫；
+  被丢弃的 `HTTPClient` 若此后不再有请求，其空闲连接最迟等到对端断开（服务端 60min 上限）。
+  默认 30s 心跳下最迟 5min 加一个 tick，不受此限。
+- **事件流 turn-state 不跟随（T6）**：目前不从 `response.metadata` 事件头刷新 turn-state。
 - **回退链的白名单扫描是两次**（`buildResponsesCreateFrame` 内一次 + `normalize`
   再一次，与 T3 完全一致）：只有形态不在单遍覆盖内（非紧凑 / 转义键 / 重复键 /
   白名单外键）才走到；真实 codex 帧恒走单遍，那是 1 次。代价是这类形态比 T3 多付
@@ -181,9 +215,8 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 - **转发到拨号的选项**：`WithTransport` / `WithSession` / `WithCodexMeta` /
   `WithHeader`（唯一例外：`x-codex-turn-state` 不进升级头，见上）/
   `WithClientMetadata` / trace / turn / compression / ping / beta。
-  `WithTimeout` 现在**对 WS 臂生效**：`>0` 时设在 pumped 连接的 ctx 上（`=0` 时
-  就是调用方 ctx），覆盖“连接使用期”而**不含拨号/升级**——升级本身只由调用方 ctx
-  约束，故无 deadline 的调用方 + 卡住的升级不受 `WithTimeout` 限制。
+  `WithTimeout` 现在**对 WS 臂生效**：`>0` 时设在请求 exchange 的 ctx 上，
+  覆盖请求使用期，含拨号/升级（T5 起）；`=0` 时沿用调用方的取消与 deadline。
   `WithMaxLineSize` 仍只作用于 HTTP SSE 行扫描。
 - **单消费者**：`Client.Recv` 与 `wsExchange.Next` 都不支持并发调用（未定义）；
   写与 ping 由内核写闸串行化。
@@ -217,8 +250,8 @@ metadata 组合）逐字节比对，另有两例分别钉住"运行期 3.7KB 形
 
 `transport_ws_test.go`（`httptest` + `websocket.Accept` 假上游）：帧→SSE 逐字节
 断言（含 in-band error 与 `[DONE]` 位置）、与 HTTP 臂合成体逐字段相等、
-`response.failed` 两臂同形、turn-state 三条路径（握手签发 → 回写 → 下一轮回传；
-`WithHeader` per-request 注入；升级头不携带）、帧构造五条规则 + 非对象根、关闭
+`response.failed` 两臂同形、turn-state 四条路径（握手签发 → 回写 → 下一轮回传；
+`WithHeader` per-request 注入；升级头不携带；连接身份：ts 进缓存键，跨 ts 不复用）、帧构造五条规则 + 非对象根、关闭
 语义（1011 / 1005 / 1000 / 无 close 帧）、默认路径零 WS 连接、并发（`-race`）。
 
 `transport_ws_contract_test.go`（连接内核验收面，W1–W16）：

@@ -100,9 +100,13 @@
 //     **常驻读者 + 有界队列**：读者除入队临界区外恒在 Read，所以下游再慢也不会
 //     让心跳误判成连接死亡；队列饱和（256 帧 / 8MiB，空队列允许单帧超预算）报
 //     ErrWSBackpressure（可归因，非静默截断、非无限缓冲），心跳探测未在 2s 预算内
-//     完成报 ErrKeepaliveTimeout；收尾一律强断（不做关闭握手），由 Body.Close 触发。
+//     完成报 ErrKeepaliveTimeout；终态后可归还缓存，放弃或归还失败则强断。
+//     StreamBody 由 Body.Close 触发归还；Responses 消费终态后自动归还。
 //     注意：WithPingInterval(0) 关闭心跳后，传输臂仍有常驻读者服务 pong，但不再
 //     探测"对端是否还活着"（半开连接只能靠读写错误或调用方 ctx 兜底）。
+//   - WithWSConnCache(n) 开启默认关闭的 WS 连接复用：同 ts 连续请求命中后不再付握手。
+//     默认从同轮第 3 个请求起（调用方自带 turn-state 时第 2 个起），
+//     收益 ∝ 命中次数；一轮 1–2 个请求时默认无收益。
 //   - HTTP 流式解析零拷贝：bufio.Scanner 复用缓冲 + 行切片提取 data: 帧内容，
 //     回调内的原始字节引用 scanner 缓冲（仅在回调执行期间有效）
 //   - HTTP 客户端懒构建：NewHTTPClient 不创建 http.Client（只做选项快照与升级头
@@ -129,6 +133,10 @@
 //     （frameCodec.encode 的 client_metadata 落地：单遍快路径直接写入，回退链经
 //     normalize → injectClientMetadataObject）逐点一致：升级响应头签发 → 帧内回传
 //     （Client.TurnState 缓存 + 网关 SetTurnState("") 清除，跨轮不得回传）。
+//
+// WS 传输臂的连接身份包含 turn-state 与 readLimit，跨 ts 或取数路径不复用；
+// 命中没有新握手，不刷新 HTTPClient.TurnState()，签发值从缓存条目回填合成响应。
+// 事件流 response.metadata 的 turn-state 尚未跟随（T6）。
 //
 // responses-lite 非独立端点：与 /responses 同端点同事件集，
 // 仅 internal 标记区分——HTTP 头 x-openai-internal-codex-responses-lite（WithHeader

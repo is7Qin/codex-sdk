@@ -352,7 +352,8 @@ func (c *Client) encodeFrame(frame []byte) ([]byte, error) {
 
 // SetTurnState 设置 x-codex-turn-state 回传值（服务端签发 → 后续 Send 帧
 // client_metadata 自动回传）。轮结束时传空串清除——跨轮不得回传。
-// 网关也可在别处观测到该值时显式设置。
+// 网关也可在别处观测到该值时显式设置。只影响 pull 面后续 Send 与 Client 的
+// turn-state 缓存值；不改变已建连接的身份，也不操作 HTTPClient 的 WS 连接缓存。
 func (c *Client) SetTurnState(state string) { c.setTurnState(state) }
 
 // setTurnState 是写入点（Dial 捕获握手响应头 + SetTurnState 共用）。
