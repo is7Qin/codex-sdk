@@ -22,7 +22,7 @@ import (
 //
 //	S1 跨窗口复用 / S2 跨 thread 不复用 / S3 退役只摘 idle / S4 ts 只走 Sink
 //	S5 请求级身份进帧 / S6 匿名不复用 / S7 并发 / S8 Dial 身份
-//	S9 tap 负向 / S10 Close 后在飞归还 / S12 回调时序
+//	S9 tap 负向 / S10 Close 后在飞归还 / S12 回调时序 / S13 聚合臂只走 Sink
 //
 // S11（保留键 panic）在 identity_reserved_test.go。
 
@@ -251,8 +251,9 @@ func TestS2NoReuseAcrossThreads(t *testing.T) {
 	}
 }
 
-// S3：RetireThread 只摘该 key 的 idle（锁外终止）；B 不受影响；Close 之后
-// RetireThread 为 no-op（无墓碑）。
+// S3：RetireThread 只摘该 key 的 idle（锁外终止）；B 不受影响。
+// Close 之后的归还侧语义由 S10 覆盖（那里有正控），此处不再重复断言——
+// Close 已经把 idle 清零，事后再查 idle 恒为 0，不具判别力。
 func TestS3RetireOnlyIdle(t *testing.T) {
 	up := newTSUpstream(t, func(i int, _ []byte) []string {
 		id := fmt.Sprintf("resp_s3_%d", i+1)
@@ -289,15 +290,6 @@ func TestS3RetireOnlyIdle(t *testing.T) {
 	hc.wsCache.mu.Unlock()
 	if len(idles) != 1 || idles[0].key.threadKey != idB.threadKey() {
 		t.Fatalf("退役后 idle = %+v, 期望只剩 B", idles)
-	}
-
-	hc.wsCache.Close()
-	hc.RetireThread(idB.threadKey()) // Close 之后 no-op（不 panic、不复活）
-	hc.wsCache.mu.Lock()
-	got := len(hc.wsCache.idles)
-	hc.wsCache.mu.Unlock()
-	if got != 0 {
-		t.Fatalf("Close 后 idle = %d, 期望 0", got)
 	}
 }
 
@@ -393,10 +385,13 @@ func TestS6AnonymousNeverReuses(t *testing.T) {
 		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
 	})
 	tr := &methodCountingTransport{base: newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)}
+	// 自动字段全关：身份对象为空，才走"删除 payload 身份"这条路（开着 turn_id
+	// 自动生成时对象恒非空，走的是覆写，测不到删除）。
 	hc := NewHTTPClient(PAT("pat-s6"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(tr),
 		WithWSConnCache(2),
+		WithTurnAuto(false),
 		WithTraceAuto(false),
 	)
 	// payload 自带旧身份：匿名请求必须把它整体抹掉（否则等于冒充调用方的老会话）。
@@ -417,6 +412,12 @@ func TestS6AnonymousNeverReuses(t *testing.T) {
 		t.Fatalf("上游收到 %d 帧, 期望 2 帧", len(frames))
 	}
 	for i, frame := range frames {
+		if gjson.GetBytes(frame, "client_metadata").Exists() {
+			t.Fatalf("第 %d 帧不应带 client_metadata（空身份 ⇒ 整键删除）: %s", i+1, frame)
+		}
+		if strings.Contains(string(frame), "old-") {
+			t.Fatalf("第 %d 帧残留 payload 旧身份: %s", i+1, frame)
+		}
 		for _, key := range []string{codexMetaInstallationKey, codexMetaSessionKey, codexMetaThreadKey, codexMetaWindowKey, codexMetaTurnStateKey} {
 			if gjson.GetBytes(frame, "client_metadata."+key).Exists() {
 				t.Fatalf("第 %d 帧不应出现身份键 %s: %s", i+1, key, frame)
@@ -530,38 +531,62 @@ func TestS9TapNegative(t *testing.T) {
 }
 
 // S10：Close 之后在飞 exchange 归还 ⇒ put=false、无 idle 残留（由 Release 终止）。
+//
+// 正控（不 Close）必须留下 1 条 idle：否则"读路径根本没走到终态、Release 从未被
+// 调用"也会让本例绿——那种绿证明的是上游写坏，不是 Close 语义。
 func TestS10CloseRejectsInFlightReturn(t *testing.T) {
-	up := newTSUpstream(t, func(i int, _ []byte) []string {
-		id := fmt.Sprintf("resp_s10_%d", i+1)
-		return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
-	})
-	hc := up.client(t, WithWSConnCache(2))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), identityFor("thread-s10", "thread-s10:0", "", nil))
-	if err != nil {
-		t.Fatalf("StreamBody: %v", err)
-	}
-	hc.wsCache.Close() // 关闭发生在 exchange 仍在飞时
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
+	for _, tc := range []struct {
+		name     string
+		closeMid bool
+		wantIdle int
+	}{
+		{"Close 在飞", true, 0},
+		{"不 Close（正控）", false, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newTSUpstream(t, func(i int, _ []byte) []string {
+				id := fmt.Sprintf("resp_s10_%d", i+1)
+				return []string{tsCreatedFrame(id), tsCompletedFrame(id)}
+			})
+			hc := up.client(t, WithWSConnCache(2))
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), identityFor("thread-s10", "thread-s10:0", "", nil))
+			if err != nil {
+				t.Fatalf("StreamBody: %v", err)
+			}
+			if tc.closeMid {
+				hc.wsCache.Close() // 关闭发生在 exchange 仍在飞时（在飞连接不受影响）
+			}
+			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+				t.Fatalf("读尽 body: %v（没读到终态就不会走到归还分支）", err)
+			}
+			_ = resp.Body.Close()
 
-	hc.wsCache.mu.Lock()
-	idle := len(hc.wsCache.idles)
-	hc.wsCache.mu.Unlock()
-	if idle != 0 {
-		t.Fatalf("Close 后在飞归还留下了 %d 条 idle，期望 0", idle)
+			hc.wsCache.mu.Lock()
+			idle := len(hc.wsCache.idles)
+			hc.wsCache.mu.Unlock()
+			if idle != tc.wantIdle {
+				t.Fatalf("idle = %d, 期望 %d", idle, tc.wantIdle)
+			}
+		})
 	}
 }
 
 // S12：Body.Close 之后 Sink 调用计数不再增长（提前 Close / 取消两种收尾）。
+//
+// 正控（不提前收尾、读完 body）必须捕获到迟到帧：否则"tap 压根没解析
+// response.metadata"也会让负控绿——负控证明的是"没回调"，而回调本就不存在。
 func TestS12NoSinkAfterClose(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		cancel bool
+		early  bool
+		want   int
 	}{
-		{"提前 Close", false},
-		{"取消", true},
+		{"提前 Close", false, true, 0},
+		{"取消", true, true, 0},
+		{"读完 body（正控）", false, false, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			release := make(chan struct{})
@@ -601,9 +626,21 @@ func TestS12NoSinkAfterClose(t *testing.T) {
 			if tc.cancel {
 				cancel()
 			}
+			if !tc.early {
+				close(release)
+				if _, err := io.ReadAll(resp.Body); err != nil {
+					t.Fatalf("读尽 body: %v", err)
+				}
+				_ = resp.Body.Close()
+				if got := sink.count(); got != tc.want {
+					t.Fatalf("读完 body 后 Sink 调用 %d 次, 期望 %d", got, tc.want)
+				}
+				cancel()
+				return
+			}
 			_ = resp.Body.Close()
-			if got := sink.count(); got != 0 {
-				t.Fatalf("Body.Close 返回时 Sink 已调用 %d 次，期望 0", got)
+			if got := sink.count(); got != tc.want {
+				t.Fatalf("Body.Close 返回时 Sink 已调用 %d 次，期望 %d", got, tc.want)
 			}
 			close(release)
 			select {
@@ -611,11 +648,55 @@ func TestS12NoSinkAfterClose(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("上游未在期限内尝试写入迟到帧")
 			}
-			if got := sink.count(); got != 0 {
-				t.Fatalf("迟到帧到达后 Sink 调用 %d 次，期望 0（Close 之后不得再回调）", got)
+			if got := sink.count(); got != tc.want {
+				t.Fatalf("迟到帧到达后 Sink 调用 %d 次，期望 %d（Close 之后不得再回调）", got, tc.want)
 			}
 			cancel()
 		})
+	}
+}
+
+// S13：Responses 的 ws 臂（直取帧喂聚合器，不经 sseView）与流式臂同源上报——
+// 握手 T1 + response.metadata T2 ⇒ Sink 收到 [T1 T2]；合成体里没有任何 ts
+// （HTTPResponse 无 ts 字段）；第二次请求命中复用连接且本次未签发时 Sink 为空，
+// 不得把上一轮的 T2 当默认值带进来。
+func TestS13AggregateArmReportsOnlyViaSink(t *testing.T) {
+	up := newTSUpstream(t, func(i int, _ []byte) []string {
+		rid := fmt.Sprintf("resp_s13_%d", i+1)
+		if i == 0 {
+			return []string{tsCreatedFrame(rid), tsMetadataFrame(rid, "T2"), tsCompletedFrame(rid)}
+		}
+		return []string{tsCreatedFrame(rid), tsCompletedFrame(rid)}
+	})
+	up.setHandshake("T1")
+	hc := up.client(t, WithWSConnCache(2))
+
+	var sink turnStateSink
+	resp, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":[]}`),
+		identityFor("thread-s13", "thread-s13:0", "", &sink))
+	if err != nil {
+		t.Fatalf("Responses(ws): %v", err)
+	}
+	if got := sink.values(); len(got) != 2 || got[0] != "T1" || got[1] != "T2" {
+		t.Fatalf("Sink = %v, 期望 [T1 T2]", got)
+	}
+	body := string(resp.Raw)
+	for _, leak := range []string{"T1", "T2", HeaderTurnState} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("合成体泄漏 %q: %s", leak, body)
+		}
+	}
+
+	var sink2 turnStateSink
+	if _, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":[]}`),
+		identityFor("thread-s13", "thread-s13:0", "", &sink2)); err != nil {
+		t.Fatalf("第二次 Responses(ws): %v", err)
+	}
+	if got := sink2.values(); len(got) != 0 {
+		t.Fatalf("第二次 Sink = %v, 期望空（本次未签发，且不回落缓存）", got)
+	}
+	if got := up.upgrades.Load(); got != 1 {
+		t.Fatalf("升级次数 = %d, 期望 1（同 thread 应复用连接）", got)
 	}
 }
 

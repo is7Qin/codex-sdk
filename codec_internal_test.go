@@ -286,29 +286,42 @@ func TestEncodeZeroCopyPreservedAcrossModes(t *testing.T) {
 // （且没有自动字段）时，payload 自带的 client_metadata 必须被**删除**——否则"匿名"
 // 会把调用方的旧 session/thread/ts 透传给上游（oracle 评审 blocking）。
 //
-// 两条编码路径都要覆盖：单遍（白名单紧凑对象）与回退链（sjson）。
+// 覆盖两条编码路径（单遍 / 回退链）与三种键形态（紧凑、含空白、转义拼写）：
+// 转义拼写 `client_\u006detadata` 在上游 unescape 后是同一个键，按原始字节前缀
+// 判断会漏掉它（momus 评审 blocking B3）。
 func TestEncodeEmptyIdentityDropsPayloadMetadata(t *testing.T) {
 	fc := newFrameCodec(&options{}) // turn/trace 自动关：本次身份对象为空
 	now := time.Date(2026, time.November, 9, 3, 30, 0, 0, time.UTC)
-	for _, c := range []struct {
+	forms := []struct {
 		name  string
 		frame string
 	}{
 		{"单遍", `{"type":"response.create","model":"m","store":false,"client_metadata":{"thread_id":"old","x-codex-turn-state":"old-ts"}}`},
 		{"回退", `{ "type":"response.create", "model":"m", "store":false, "client_metadata":{"thread_id":"old"} }`},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			got, err := fc.encode([]byte(c.frame), encodeNativeWS, frameInput{Now: now})
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			if gjson.GetBytes(got, "client_metadata").Exists() {
-				t.Fatalf("空身份时不得保留 payload 身份：%s", got)
-			}
-			if !gjson.GetBytes(got, "model").Exists() {
-				t.Fatalf("删除身份不得伤及其它字段：%s", got)
-			}
-		})
+		{"转义拼写", "{\"type\":\"response.create\",\"model\":\"m\",\"store\":false,\"client_\\u006detadata\":{\"thread_id\":\"old\"}}"},
+	}
+	modes := []struct {
+		name string
+		mode encodeMode
+	}{{"native", encodeNativeWS}, {"responses", encodeWSResponses}}
+	for _, m := range modes {
+		for _, c := range forms {
+			t.Run(m.name+"/"+c.name, func(t *testing.T) {
+				got, err := fc.encode([]byte(c.frame), m.mode, frameInput{Now: now})
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				if gjson.GetBytes(got, "client_metadata").Exists() {
+					t.Fatalf("空身份时不得保留 payload 身份：%s", got)
+				}
+				if strings.Contains(string(got), "thread_id") {
+					t.Fatalf("转义拼写未被删除：%s", got)
+				}
+				if !gjson.GetBytes(got, "model").Exists() {
+					t.Fatalf("删除身份不得伤及其它字段：%s", got)
+				}
+			})
+		}
 	}
 
 	// 反向：payload 本来没有身份字段 ⇒ 不新增、不复制（零拷贝）。

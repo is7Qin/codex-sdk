@@ -135,7 +135,7 @@ func (fc *frameCodec) metaEntries(buf []metadataEntry, in frameInput) metaEntrie
 
 // normalize 是回退路径的伪装层（与 T3 旧链逐字节同义）：白名单过滤 + 强制
 // store:false + client_metadata 整体替换。注入对象由 encode 组装后传入
-// （obj 为空 = 无有效项、不动帧）。
+// （obj 为空 = 无有效项 ⇒ 删除帧内该键，不是"不动帧"）。
 //
 // 只有 encodeOnePass 明确不覆盖的形态走到这里：白名单外顶层键（旧链按白名单
 // 顺序重建）、转义键（gjson unescape 语义）、重复键（sjson 首现语义）、

@@ -62,12 +62,15 @@ func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 	}
 }
 
-// CloseWSIdleConnections 只终止 WS 臂的空闲连接缓存，**不碰**底层 http.Transport。
+// CloseWSIdleConnections **关闭** WS 臂的连接缓存，**不碰**底层 http.Transport。
 //
-// 与 CloseIdleConnections 的区别：后者会对 `*http.Transport` 断言并清空其空闲池；
-// 网关出口通常是包装型 transport（如分片 h2 池），断言失败即静默 no-op，而一旦
-// 哪天是裸 `*http.Transport` 又会打掉全站 h2 连接。丢弃一个 HTTPClient 时只需要
-// 关掉它自己的 WS 连接。
+// 语义是"这个 client 要被丢弃了"：清空并终止现有 idle，此后归还一律拒收（由
+// Release 终止），**不可逆**——没有重新打开的入口，要复用只能新建 HTTPClient。
+// 与 CloseIdleConnections 的区别：后者只清空 idle（缓存仍可用，之后新建的连接
+// 照常复用），且会对 `*http.Transport` 断言并清空其空闲池；网关出口通常是包装型
+// transport（如分片 h2 池），断言失败即静默 no-op，而一旦哪天是裸
+// `*http.Transport` 又会打掉全站 h2 连接。丢弃一个 HTTPClient 时只需要关掉它
+// 自己的 WS 连接。
 func (c *HTTPClient) CloseWSIdleConnections() {
 	if c.wsCache != nil {
 		c.wsCache.Close()

@@ -566,7 +566,7 @@ func (e metaEntries) withSessionIdentity(s Session) metaEntries {
 // （entries 自身优先级：Identity.Meta > Identity.Session > turn-state > 自动机制）、
 // 空值跳过。键/值按 encoding/json 规则转义（含 `<`/`>`/`&` 的 HTML
 // 转义 \u003c/\u003e/\u0026 与 U+2028/U+2029——与 sjson 对已有字节的原样直写
-// 不同）。无有效 entry → nil（调用方不动帧）。
+// 不同）。无有效 entry → nil（调用方据此**删除**该键，见 injectClientMetadataObject）。
 func clientMetadataObject(entries []metadataEntry) []byte {
 	if len(entries) == 0 {
 		return nil
@@ -679,24 +679,20 @@ func hexDigit(b byte) byte {
 // codex 面客户端自带的 client_metadata **永不透传**（连同非网关键一并丢弃，网关
 // 身份恒为准）。整体替换实测优于逐键覆盖（逐键 N 次重序列化整份 body，整体替换
 // 1 次；256KB 体 ~0.73ms/25 allocs → ~0.29ms/11 allocs，内存 ~1.4MB → ~0.29MB）。
-// entries 无有效项 → 帧
-// 零改动返回。
+// entries 无有效项 ⇒ 删除帧内该键。
 func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {
 	return injectClientMetadataObject(frame, clientMetadataObject(entries))
 }
 
-// injectClientMetadataObject 用**已组装好**的 client_metadata 对象字节整体替换
-// 顶层 client_metadata（sjson.SetRawBytes 一次改写真，语义同
-// injectClientMetadataKeys）。拆出来给 WS 单遍编码器复用：那边对象只组装一次、
-// 直接写进输出缓冲，不再对整帧做第二次改写。obj 为空 → 帧零改动返回。
 // injectClientMetadataObject 用本次身份对象整体覆写 payload 的 client_metadata。
-// obj 为空（匿名且无任何自动字段）时**删除**该键：身份只来自 Identity，
-// 留着 payload 自带值等于把调用方的旧 session/thread/ts 透传给上游。
+// obj 为空（匿名且无任何自动字段）时**删除**该键：身份只来自 Identity，留着
+// payload 自带值等于把调用方的旧 session/thread/ts 透传给上游。
+//
+// 删除交给 sjson 按 JSON 键语义匹配，不做原始字节前缀判断：转义拼写
+// （`client_\u006detadata`）在上游会被 unescape 成同一个键，字节比较看不见它，
+// 但 sjson 看得见。键本来就不存在时 sjson 返回入参同一切片（零拷贝）。
 func injectClientMetadataObject(frame, obj []byte) []byte {
 	if len(obj) == 0 {
-		if !bytes.Contains(frame, []byte(`"client_metadata"`)) {
-			return frame // 本来就没有身份字段：保持零拷贝
-		}
 		out, err := sjson.DeleteBytes(frame, "client_metadata")
 		if err != nil {
 			return frame // 非法 JSON：放弃本次注入，保持帧原样
