@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -184,6 +185,159 @@ func TestWSReleaseAfterUpstreamCloseIsSafe(t *testing.T) {
 	}
 	if sink.got != nil {
 		t.Fatal("已终止的连接被交给了缓存")
+	}
+}
+
+// ---- R4/R9："不干净不归还"三条（EOF / 取消 / 队列非空）----
+//
+// Release 的四步合取是复用的全部安全性来源：租约 CAS → 连接可用 → 队列空（fence）
+// → 缓存收下。下面三条各自打断其中一步，钉住"报失败 + 连接被终止 + 缓存一帧都不收"。
+
+// TestWSReleaseRejectedOnEOF：上游发完终态就关连接 ⇒ 本次请求读到的是一条已死的
+// 连接（Next 以 io.EOF 收尾）⇒ 不归还。
+func TestWSReleaseRejectedOnEOF(t *testing.T) {
+	up := newContractUpstream(t, func(c *coderws.Conn, r *http.Request) {
+		if _, _, err := c.Read(r.Context()); err != nil {
+			return
+		}
+		if !writeFrames(c, r, wsCreatedEv, wsCompletedEv) {
+			return
+		}
+		_ = c.Close(coderws.StatusNormalClosure, "")
+	})
+	hc := contractClient(t, up.srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ex, err := hc.openWSExchange(ctx, []byte(contractPayload), Identity{}, wsStreamReadLimit)
+	if err != nil {
+		t.Fatalf("openWSExchange: %v", err)
+	}
+	for _, want := range []string{wsCreatedEv, wsCompletedEv} {
+		if _, nerr := ex.Next(ex.ctx); nerr != nil {
+			t.Fatalf("Next(%s): %v", want, nerr)
+		}
+	}
+	if _, nerr := ex.Next(ex.ctx); !errors.Is(nerr, io.EOF) {
+		t.Fatalf("流结束错误 = %v，期望 io.EOF（close frame 归一）", nerr)
+	}
+
+	sink := &recordingSink{}
+	ex.sink = sink
+	if ex.Release() {
+		t.Fatal("读到 EOF 之后 Release 报成功")
+	}
+	if sink.got != nil {
+		t.Fatal("读到 EOF 的连接被交给了缓存")
+	}
+	if ex.cn.err() == nil {
+		t.Fatal("被拒绝归还的连接没有被终止")
+	}
+}
+
+// TestWSReleaseRejectedOnCancel：读到一半被取消（队列空）⇒ 本次请求已放弃 ⇒ 不归还。
+func TestWSReleaseRejectedOnCancel(t *testing.T) {
+	up := newContractUpstream(t, func(c *coderws.Conn, r *http.Request) {
+		serveAndStall(c, r, wsCreatedEv) // 一帧后挂住：保证取消发生在流中途
+	})
+	hc := contractClient(t, up.srv.URL)
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	ex, err := hc.openWSExchange(parent, []byte(contractPayload), Identity{}, wsStreamReadLimit)
+	if err != nil {
+		t.Fatalf("openWSExchange: %v", err)
+	}
+	if _, nerr := ex.Next(ex.ctx); nerr != nil {
+		t.Fatalf("Next(created): %v", nerr)
+	}
+
+	cancelParent() // 消费侧放弃本次请求
+	select {
+	case <-ex.ctx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("取消没有传导到 exchangeCtx")
+	}
+	// 队列空 ⇒ Next 直接认输（把取消当作本次请求的放弃）。
+	if _, nerr := ex.Next(ex.ctx); !errors.Is(nerr, context.Canceled) {
+		t.Fatalf("取消后 Next = %v，期望 context.Canceled", nerr)
+	}
+
+	sink := &recordingSink{}
+	ex.sink = sink
+	if ex.Release() {
+		t.Fatal("被取消的请求 Release 报成功")
+	}
+	if sink.got != nil {
+		t.Fatal("被取消的连接被交给了缓存")
+	}
+	if ex.cn.err() == nil {
+		t.Fatal("被取消的连接没有被终止")
+	}
+}
+
+// TestWSReleaseRejectedOnNonEmptyQueue：终态之后队列里还有残帧（上一轮的尾巴）⇒
+// fence 失败 ⇒ 不归还。这条正是"把旧终态记到新请求头上是账目错误"的兜底。
+func TestWSReleaseRejectedOnNonEmptyQueue(t *testing.T) {
+	up := newContractUpstream(t, func(c *coderws.Conn, r *http.Request) {
+		serveAndStall(c, r, wsCreatedEv, wsCompletedEv)
+	})
+	hc := contractClient(t, up.srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ex, err := hc.openWSExchange(ctx, []byte(contractPayload), Identity{}, wsStreamReadLimit)
+	if err != nil {
+		t.Fatalf("openWSExchange: %v", err)
+	}
+	defer ex.cn.terminate(io.EOF) // 兜底：连接不该活过本用例
+	for _, want := range []string{wsCreatedEv, wsCompletedEv} {
+		if _, nerr := ex.Next(ex.ctx); nerr != nil {
+			t.Fatalf("Next(%s): %v", want, nerr)
+		}
+	}
+	// 模拟"终态之后又来了一帧"：直接入队（真实链路上是 readLoop 干的）。
+	if perr := ex.cn.inbox.push([]byte(wsDeltaEv)); perr != nil {
+		t.Fatalf("push 残帧: %v", perr)
+	}
+
+	sink := &recordingSink{}
+	ex.sink = sink
+	if ex.Release() {
+		t.Fatal("队列非空时 Release 报成功")
+	}
+	if sink.got != nil {
+		t.Fatal("队列非空的连接被交给了缓存")
+	}
+	if ex.cn.err() == nil {
+		t.Fatal("队列非空的连接没有被终止")
+	}
+}
+
+// TestWriteFailureCarriesReuseDiagnostics：复用连接的写失败必须带「连接年龄 + 本轮已
+// 交付帧数」，且**不改错误分类**（errors.Is 依旧命中原错误）。
+//
+// 只测诊断文本（不造真实 socket）：线上要区分"写前就死"与"写后才 EOF"——前者 create
+// 一定没发出去，后者可能已被上游执行，绝不能重试。
+func TestWriteFailureCarriesReuseDiagnostics(t *testing.T) {
+	base := errors.New("socket closed")
+	ex := &wsExchange{reused: true, bornAt: time.Now().Add(-3 * time.Minute)}
+	ex.delivered.Add(3)
+
+	got := ex.writeFailure(base)
+	if !errors.Is(got, base) {
+		t.Fatalf("诊断包装丢了原错误链: %v", got)
+	}
+	for _, want := range []string{"连接年龄", "3m", "已交付 3 帧"} {
+		if !strings.Contains(got.Error(), want) {
+			t.Fatalf("诊断缺少 %q: %v", want, got)
+		}
+	}
+
+	// 新拨连接不加诊断（年龄≈0、交付 0 帧，只是噪音）。
+	fresh := &wsExchange{bornAt: time.Now()}
+	if got := fresh.writeFailure(base); got != base { //nolint:errorlint // 要的就是同一个值
+		t.Fatalf("新拨连接的写失败被改写了: %v", got)
 	}
 }
 

@@ -2,7 +2,6 @@ package codexsdk
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +15,7 @@ import (
 )
 
 // 本文件是 T5.2（连接缓存）的验收用例：R1/R4/R6/R7/R8/R9/R10/R11/R12/R13/R19/R21/R24/R25。
-// R22 在下面两组（首帧违约/首帧 error）；R5（复用连接上的**只写**失败）没有独立用例——
+// R22 在下面两组（旧尾帧 = 普通帧 / error 帧透传）；R5（复用连接上的**只写**失败）没有独立用例——
 // 要确定性制造“socket 只坏在读不到”的窗口不现实，见实现报告 §5。
 
 // reuseUpstream 是"一条连接上循环服务多次请求"的假上游：
@@ -153,20 +152,27 @@ func streamBodyOnceID(hc *HTTPClient, id Identity) (string, error) {
 
 // ---- R1 / R12：命中与默认关闭 ----
 
-// TestWSConnReuseHits（R1）：同 ts 两次 StreamBody ⇒ 只拨一次号，两次都读到 [DONE]。
+// TestWSConnReuseHits（R1）：同一 thread 的 3 次 StreamBody ⇒ 只拨一次号、每次都读到
+// [DONE]，且假上游收到的 response.create 条数 == 请求数（**没有隐式重试**）。
 func TestWSConnReuseHits(t *testing.T) {
 	up := newReuseUpstream(t)
 	hc := up.client(t, WithWSConnCache(2))
 
-	first := doStreamBody(t, hc)
-	second := doStreamBody(t, hc)
-	for i, body := range []string{first, second} {
+	const requests = 3
+	bodies := make([]string, 0, requests)
+	for i := 0; i < requests; i++ {
+		bodies = append(bodies, doStreamBody(t, hc))
+	}
+	for i, body := range bodies {
 		if !strings.Contains(body, "[DONE]") {
 			t.Fatalf("第 %d 次响应缺少 [DONE]: %q", i+1, body)
 		}
 	}
 	if got := up.accepts.Load(); got != 1 {
-		t.Fatalf("accepts = %d，期望 1（第二次应命中缓存）", got)
+		t.Fatalf("accepts = %d，期望 1（第二/三次应命中缓存）", got)
+	}
+	if got := up.requests.Load(); got != requests {
+		t.Fatalf("上游收到 %d 条 response.create，期望 %d（不得隐式重试）", got, requests)
 	}
 	if hits := hc.wsCache.hits.Load(); hits < 1 {
 		t.Fatalf("hits = %d，期望 ≥1", hits)
@@ -251,14 +257,19 @@ func TestWSConnReuseIgnoresTurnState(t *testing.T) {
 	}
 }
 
-// ---- R22：复用连接的首帧违约 ----
+// ---- R22（改写）：旧尾帧就是普通帧，由消费者自己忽略 ----
 
-// TestWSConnReusedFirstFrameDesynced（R22）：第二次请求在复用连接上收到的首帧是
-// delta ⇒ errConnDesynced + 终止。
-func TestWSConnReusedFirstFrameDesynced(t *testing.T) {
+// TestWSConnReusedStaleFrameIsOrdinary（R22 改写）：第二次请求在复用连接上收到的
+// **首帧**是上一轮的残留 delta ⇒ 不再做任何协议判定，它作为普通事件交付，本轮照常
+// 读到终态并成功结束。
+//
+// 这就是真实 codex 客户端的行为：没有首帧白名单、没有 created 门槛、没有
+// response_id 过滤，不认识的事件由各自消费者忽略。SDK 只负责"复用准入干净"
+// （空闲期收到帧 ⇒ 该连接作废，见 frameInbox.fence）。
+func TestWSConnReusedStaleFrameIsOrdinary(t *testing.T) {
 	up := newReuseUpstream(t,
 		[]string{wsCreatedEv, wsCompletedEv},
-		[]string{wsDeltaEv, wsCompletedEv}, // 第二个请求的首帧违约
+		[]string{wsDeltaEv, wsCompletedEv}, // 第二个请求的首帧是上一轮的残留 delta
 	)
 	hc := up.client(t, WithWSConnCache(2))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -268,18 +279,29 @@ func TestWSConnReusedFirstFrameDesynced(t *testing.T) {
 	if err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), reuseIdentity(), noop); err != nil {
 		t.Fatalf("第一次: %v", err)
 	}
-	err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), reuseIdentity(), noop)
-	if !errors.Is(err, errConnDesynced) {
-		t.Fatalf("错误 = %v，期望 errConnDesynced", err)
+
+	var seen []string
+	err := hc.responsesStreamWS(ctx, []byte(`{"model":"gpt-5.6","input":[]}`), reuseIdentity(), func(raw []byte) error {
+		seen = append(seen, string(raw))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("第二次: %v（旧帧必须当普通事件交付，不能报错）", err)
+	}
+	if len(seen) != 2 || !strings.Contains(seen[0], `"type":"response.output_text.delta"`) {
+		t.Fatalf("交付序列 = %v，期望 [旧 delta, completed]（帧既不能被吞掉，也不能被特判）", seen)
+	}
+	if got := up.accepts.Load(); got != 1 {
+		t.Fatalf("accepts = %d，期望 1（第二次必须命中复用连接）", got)
 	}
 }
 
-// TestWSConnReusedFirstFrameErrorPassesThrough（R22 反向）：首帧是 error 时按普通
-// in-band error 透传，**不**报 errConnDesynced。
-func TestWSConnReusedFirstFrameErrorPassesThrough(t *testing.T) {
+// TestWSConnReusedErrorFramePassesThrough（R22 反向）：首帧是 error ⇒ 按普通
+// in-band error 透传给消费者，本轮随后照常读到终态。
+func TestWSConnReusedErrorFramePassesThrough(t *testing.T) {
 	up := newReuseUpstream(t,
 		[]string{wsCreatedEv, wsCompletedEv},
-		[]string{`{"type":"error","error":{"type":"server_error","message":"boom"}}`},
+		[]string{`{"type":"error","error":{"type":"server_error","message":"boom"}}`, wsCompletedEv},
 	)
 	hc := up.client(t, WithWSConnCache(2))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -294,12 +316,11 @@ func TestWSConnReusedFirstFrameErrorPassesThrough(t *testing.T) {
 		seen = append(seen, raw...)
 		return nil
 	})
-
-	if errors.Is(err, errConnDesynced) {
-		t.Fatalf("首帧 error 被误判成 errConnDesynced: %v", err)
+	if err != nil {
+		t.Fatalf("第二次: %v（error 帧是普通事件，不该变成传输/协议错误）", err)
 	}
-	if len(seen) == 0 {
-		t.Fatal("error 帧没有被透传给下游")
+	if !strings.Contains(string(seen), `"type":"error"`) {
+		t.Fatalf("error 帧没有被透传给下游: %q", seen)
 	}
 }
 
@@ -309,7 +330,7 @@ func TestWSConnReusedFirstFrameErrorPassesThrough(t *testing.T) {
 // 下一个请求新拨。
 func TestWSConnCacheTTLExpires(t *testing.T) {
 	up := newReuseUpstream(t)
-	hc := up.client(t, WithWSConnCache(2), WithPingInterval(10*time.Millisecond))
+	hc := up.client(t, WithWSConnCache(2), withConnSweepInterval(5*time.Millisecond))
 	doStreamBody(t, hc)
 	hc.wsCache.mu.Lock()
 	cc := hc.wsCache.idles[0].cn
@@ -336,7 +357,7 @@ func TestWSConnCacheTTLExpires(t *testing.T) {
 // TestWSConnCacheMaxAge（R21/R25）：命中不重置 bornAt；到点后必须退役。
 func TestWSConnCacheMaxAge(t *testing.T) {
 	up := newReuseUpstream(t)
-	hc := up.client(t, WithWSConnCache(2), WithPingInterval(10*time.Millisecond))
+	hc := up.client(t, WithWSConnCache(2), withConnSweepInterval(5*time.Millisecond))
 	hc.wsCache.maxAge = 60 * time.Millisecond
 	hc.wsCache.ttl = time.Minute // 只看 maxAge
 

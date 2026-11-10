@@ -24,7 +24,7 @@ func WithResponsesTransport(t Transport) Option
 
 | 层 | 文件 | 职责 |
 |---|---|---|
-| socket | `conn.go` | `conn`：唯一 `ws.Read` 调用点（`readFrame`）、写/探测闸 `gate`、唯一心跳 `keepalive`、唯一终止入口 `terminate`（经 `finish` 发布） |
+| socket | `conn.go` | `conn`：唯一 `ws.Read` 调用点（`readFrame`）、写/公开 Ping 闸 `gate`、唯一终止入口 `terminate`（经 `finish` 发布）；**无任何主动心跳**（只在对端发 Ping 时回 Pong） |
 | 队列 | `conn.go` | `frameInbox`：pumped 的有界入站队列（帧数 + 字节双闸） |
 | 拨号 | `dial.go` | `dialConn`：升级头组装 / 401 轮转 / 升级错误面 |
 | 请求 | `exchange.go` | `wsExchange`：一次请求 = 一次 exchange；连接可跨请求（含跨轮）复用（默认关）；**不驻留 turn-state**（ts 每请求随 `Identity` 进帧，签发值只经 `Identity.Sink` 出去）；`Next` 取帧 / `Release` 归还 |
@@ -56,15 +56,20 @@ func WithResponsesTransport(t Transport) Option
 `pop` 的顺序是契约：① ctx 已结束 → 立即返回 ctx 错误（不 pop）；② 有帧 → 交付
 （不再查 ctx）；③ 已关闭且空 → 返回终止 cause；④ 等 `notify` / ctx。
 
-### 心跳与终止
+### 终止（无心跳）
 
-- 唯一心跳：`conn.keepalive`（默认 30s ping / 2s 探测预算）。探测抢不到写闸
-  （有写在飞 = 活性已证）就跳过本轮；**只有**探测超预算才 `terminate(ErrKeepaliveTimeout)`，
-  其它错误（写失败等）不判活死。
-- 探测的 ctx 派生自 `context.Background()`（固定 2s）：心跳不该被连接 ctx 的取消
-  二次污染。公开 `Client.Ping` 则**完全沿用调用方 ctx**，不加内部封顶。
+- **没有主动心跳探测**：连接只在收到对端 Ping 时就地回 Pong（由 coder 在读循环里
+  完成）。依据是真实 codex 客户端：它的 Responses WS pump 没有 ticker、没有 pong
+  deadline；空闲 EOF/Close 由常驻读者观测，复用前用 `releasable()` 复查。
+- 代价：半开连接不再由本地 ping 判死，只能靠读写错误或调用方 ctx 兜底。公开
+  `Client.Ping` 仍可用（完全沿用调用方 ctx，不加内部封顶），要不要探活由调用方
+  决定；`WithPingInterval` 已变成无效果的兼容面。
+- `ErrKeepaliveTimeout` 保留为**已退役**的错误值（无产生点），只为不破坏调用方
+  的 `errors.Is` 编译面。
 - `finish` 是唯一的状态/结果发布点：裁决 + 首因选择 + 发布在同一个 `mu` 临界区内
-  完成；首个 cause 生效，心跳不覆盖首因。
+  完成；首个 cause 生效，后续终止不覆盖首因。
+- 缓存 TTL/maxAge 的退役改由 `connCache` 自持的维护 ticker（只 sweep、不探测）：
+  连接不再知道缓存存在，也不为它开定时器。
 
 ## 等价面（对外形状与语义）
 
@@ -134,12 +139,12 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 | close frame | 无此形态 | pumped：`io.EOF`；pull：`Client.Recv` 返回 `*CloseError` |
 | pull 模式 `Recv` 的 ctx 取消 | — | 按 coder 语义**关闭连接**并返回 ctx 错误（不是"只影响本次取帧"） |
 | 下游消费过慢（队列饱和） | 无此形态（背压直接传到 TCP） | `ErrWSBackpressure`（传输层错误，触发即终止连接，不得当 EOF） |
-| 心跳探测超预算 | 无 | `ErrKeepaliveTimeout`（可 `errors.Is`） |
-| `Responses` 读错 | `读取响应流失败: %w`（`scanSSE` 内包） | 同文案（`responsesStreamWS` 包 `exchange.Next` 的原始错误）；**错误链不同**：WS 臂不经过 scanner；复用路径上首帧违约另报 `errConnDesynced` |
+| 心跳探测超预算 | 无 | **无此形态**（主动探测已删除；`ErrKeepaliveTimeout` 仅保留为无产生点的已退役值） |
+| `Responses` 读错 | `读取响应流失败: %w`（`scanSSE` 内包） | 同文案（`responsesStreamWS` 包 `exchange.Next` 的原始错误）；**错误链不同**：WS 臂不经过 scanner |
 | `response.failed` | `*HTTPError{500, Raw: 事件 error 原始 JSON（缺失则整个事件）}` | 逐字相同（同一个 `failedError`） |
 | `response.incomplete` / 无终态 | 普通错误（"事件流截断"） | 同文案（普通错误，不是 5xx 信封） |
-| 复用连接写失败 | — | 原始错误链，终止连接，不重试、不轮转 |
-| 复用首帧违约 | — | `errConnDesynced`，终止连接 |
+| 复用连接写失败 | — | 原始错误链（终止连接，不重试、不轮转）；**复用命中**时错误文案额外带「连接年龄 + 本轮已交付帧数」诊断（`%w` 包装，分类不变） |
+| 复用连接的首帧 | — | **不做任何判定**：首帧就是普通帧，不认识的事件由消费者忽略（旧尾帧也一样） |
 | 服务端 60min 上限 | — | 本地 30min 在空闲时提前退役；若仍收到 `websocket_connection_limit_reached`，按普通 in-band error 透传，不重试 |
 | 坏请求体（坏 JSON / 非对象根） | 原样发上游，由上游 400 兜底 | 本地错误 `errResponsesFrameInvalid`：**不拨号、不发帧** |
 
@@ -165,21 +170,26 @@ Authorization token 必须仍一致，取出即独占，不做请求多路复用
 
 归还资格是读到终态、队列空且连接可用；取消、读写错误、提前关闭均终止连接。
 `StreamBody` 须读到终态后关闭 body 才归还；`Responses` 消费终态后自动归还。空闲期收到任何帧
-即判废；取用前复查连接并解栏，失败则在发送前新拨，开始写 create 后不再重试。
+即判废（fence/poisoned，见下）；取用前复查连接并解栏，失败则在发送前新拨，开始写 create 后不再重试。
+
+**帧不做任何类型判定**：首帧就是普通帧，旧尾帧/未知事件由消费者（聚合器 / relay）自己忽略。
+依据是真实 codex 客户端：它没有首帧白名单、没有 `created` 门槛、没有 `response_id` 归属过滤。
+明确不做：响应 ID 过滤、created 门槛、归还后静默窗、写后自动重试（create 非幂等 ⇒ 重复计费）。
+
+**唯一有意偏差**：`errIdleFrame` / `fence` / `poisoned` 保留——空闲期（已归还、未取用）收到帧
+仍终止该连接、不交给下一个请求。理由：网关从 `response.completed` 嗅探 usage 计费，
+把上一轮终态记到新请求上是账目错误；客户端不承担这个职责。这是**复用准入**的保守，不是协议判定。
 
 空闲 TTL 为 5min，寿命从最初拨号累计 30min，复用不重置寿命；仅清扫缓存中的
-空闲条目，不中断在飞请求。清扫发生在心跳 tick 与取还时；`WithPingInterval(0)`
-关掉心跳后**只剩取还时清扫**——被丢弃的 `HTTPClient`（网关每轮重建）若此后不再有
-请求，其空闲连接只能等对端断开（服务端 60min 上限）；默认 30s 心跳下最迟
-5min 加一个 tick。
+空闲条目，不中断在飞请求。清扫由 `connCache` 自持的维护 ticker（默认 30s）驱动，
+外加 get/put 的惰性清理：不再搭载心跳（主动探测已删除），所以被丢弃的 `HTTPClient`
+的空闲连接也会最迟在 TTL+一个 tick 内退役。
 `CloseIdleConnections()` 清空 WS 缓存里的空闲连接（缓存本身仍可用，之后新建的连接照常复用），
 **并**对底层 `*http.Transport` 断言后清空其空闲池（包装型 transport 断言失败即静默 no-op）；
-`CloseWSIdleConnections()` 只**关闭** WS 缓存、不碰 `*http.Transport`：清空现有 idle，此后取用也
+`CloseWSIdleConnections()` 只**关闭** WS 缓存（含维护 ticker）、不碰 `*http.Transport`：清空现有 idle，此后取用也
 直接未命中、归还一律拒收（由 `Release` 终止）——用于"这个 client 要被丢弃了"的场景，**不可逆**。
 线程退休用 `RetireThread(threadKey)`：只摘该 thread 的 idle（前置条件：该 thread 无在飞 exchange，
 由会话独占租借保证），不设墓碑；`Close` 之后 idles 已空，本调用自然 no-op。
-复用首帧只接受 `response.created`、`response.in_progress`、`error`、`*.metadata`
-或 `responsesapi.websocket_timing`，否则报 `errConnDesynced` 并终止。
 
 观测使用内部原子 `hits` / `misses`（不新增公开 API）：开启缓存且非匿名时，每次打开 exchange 计一次
 （未开缓存 / 匿名请求不入统计），只有连接真的被移交（`releasable` 复查 + `unfence` 通过）才算 hit。
@@ -206,20 +216,17 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   裁定分类策略。
 - **读模型（传输臂）：常驻读者 + 有界队列**。拨号成功后 SDK 起一个 goroutine
   持续读 socket，把帧压进队列（256 帧 / 8MiB）；`Read` 只从队列取。**为什么不能
-  纯拉**：`coder/websocket` 的 `Ping` 自己不读连接，它等某次 Reader 调用把 pong
-  读上来；纯拉模型下，下游一慢就没有 Read 在飞，心跳 2s 超时后会强断——那是
-  只属于 WS 臂的截断源，且对端 ping 也无人应答。队列饱和 ⇒ `ErrWSBackpressure`
+  纯拉**：对端 ping / pong 等控制帧只在有 Read 在飞时才被服务，纯拉模型下
+  下游一慢就无人应答——那是只属于 WS 臂的截断源。队列饱和 ⇒ `ErrWSBackpressure`
   （快速失败；单帧大于字节闸但队列为空时照常通过）。
-- **心跳的作用面**：传输臂的保活不依赖调用方读频率（常驻读者在服务 pong），空闲期同样生效；
-  但 `WithPingInterval(0)` 会**关掉探测本身**——连接照样能服务 pong，只是半开
-  连接不再由 `ErrKeepaliveTimeout` 判死，只能靠读写错误或调用方 ctx 兜底。pull
-  面沿用既有契约：心跳依赖调用方的常驻 `Recv`。
+- **无主动心跳的作用面**：没有本地探针 ⇒ 半开连接不会被本地判死（客户端也如此）；
+  存活只能靠读写错误、对端 close、或调用方 ctx / 自行 `Client.Ping` 兜底。
+  这是对齐客户端后接受的代价，不是遗漏。
 - **连接可复用（默认关）**：默认关闭，`WithWSConnCache(n)` 开启；`StreamBody`
   读到终态后由 `Body.Close()` 尝试归还，否则强断。从同一 thread 的第 2 个请求起
   就有收益（跨轮同样命中），收益 ∝ 命中次数；每实例、每条取数路径各一条空闲连接。
-- **关闭心跳会削弱空闲连接的退役**：`WithPingInterval(0)` 下没有心跳 tick，只剩取还时清扫；
-  被丢弃的 `HTTPClient` 若此后不再有请求，其空闲连接最迟等到对端断开（服务端 60min 上限）。
-  默认 30s 心跳下最迟 5min 加一个 tick，不受此限。
+- **空闲连接的退役不依赖心跳**：`connCache` 自带维护 ticker（默认 30s，只 sweep）
+  与 get/put 惰性清理；`WithPingInterval` 已无效果，不再影响退役时延。
 - **事件流 turn-state**：`response.metadata` 的 `headers` 里带 ts 时，`turnStateTap`
   在取帧旁路捕获（不复制/不改写/不重排/不丢帧）。判定顺序：每帧先取事件类型 →
   `response.created` 记 `response_id` → `*.metadata` 做子串快筛 → 归属匹配
@@ -280,17 +287,17 @@ metadata 组合）逐字节比对，另有两例分别钉住"运行期 3.7KB 形
 
 `transport_ws_contract_test.go`（连接内核验收面，W1–W16）：
 
-- 队列饱和报 `ErrWSBackpressure`（不是心跳误判的网络错误）、消费侧取消报 ctx 错误、
+- 队列饱和报 `ErrWSBackpressure`（不是传输层被误关的网络错误）、消费侧取消报 ctx 错误、
   拨号被拒/预取消不产生 `*HTTPError`、升级失败保留 body 与 cause；
 - 连续巨帧背压 / 单巨帧放行、停读 + `WithTimeout` 报 `DeadlineExceeded` 且
   goroutine 回落、close frame = `io.EOF`、终止先排空队列、帧数/字节双闸、
-  首因唯一、终态后取消不改写、已入队终态帧优先于 deadline、半开连接报
-  `ErrKeepaliveTimeout`、帧形状全量 golden、`Close` 幂等不 panic、空队列
+  首因唯一、终态后取消不改写、已入队终态帧优先于 deadline、**无主动 ping**
+  （假上游 `OnPingReceived` 计数为 0）、帧形状全量 golden、`Close` 幂等不 panic、空队列
   `pop` 被 `close` 唤醒。
 
 `transport_ws_resident_test.go`（常驻读 / 错误面 / 传输前提）：
 
-- 消费者**故意空闲 3s**（> 2s 探测预算）后仍能读尽全部帧——纯拉模型在此用例下必红；
+- 消费者**故意空闲 3s** 后仍能读尽全部帧——纯拉模型在此用例下必红；
 - `Close` 及时返回且幂等；
 - 升级 400 的 body 进 `*HTTPError.Raw`——两臂 `error_message_contains` 面对称；
 - **h2 能力 transport 回归**：`ForceAttemptHTTP2: true` 的出口 transport 下普通请求走

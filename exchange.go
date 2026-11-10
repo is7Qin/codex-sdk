@@ -65,8 +65,12 @@ type wsExchange struct {
 	cancel    context.CancelFunc
 	stopWatch func() bool
 
-	reused bool // 连接取自缓存（T5.2 置位；T5.1 恒 false）
-	first  bool // 尚未交付过帧（首帧白名单只查这一次）
+	// reused 只用于诊断：这条连接取自缓存。它**不参与任何协议判定**（客户端没有
+	// 首帧白名单，admit 已删除）；留着是为了写失败时能区分"新拨"与"复用已死连接"。
+	reused bool
+	// delivered 是本轮已交付给消费者的帧数：仅诊断用（复用连接写失败时要回答
+	// "上游是否已经回过任何帧"）。Next 里更新、错误包装里跨路径读取，因此原子。
+	delivered atomic.Int64
 
 	// nextMu 串行化"取帧"与"移交"：Next 全程持它，Release 在 cancel 之后等它。
 	// 没有它的话，一个在飞的 Next 会（a）拿到旧 ctx 的取消后 terminate 掉刚
@@ -152,11 +156,13 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 				cache.hits.Add(1)
 				if werr := cc.cn.write(exchangeCtx, frame); werr != nil {
 					e.teardown(werr) // 写失败不重试、不重拨（create 可能已进 socket）
-					return nil, werr
+					return nil, e.writeFailure(werr)
 				}
 				return e, nil
 			}
 			// 取用窗口失败（空闲期来过帧 / 连接已不可用）：帧尚未发出，重拨安全。
+			// 这条"扫到死连接"的路径不产生错误（本次请求会成功），可观测性靠
+			// cache.misses 计数；真正需要定因的是下面的写失败，它带复用诊断。
 			e.stopWatch()
 			cc.cn.terminate(io.EOF)
 			cache.misses.Add(1)
@@ -171,7 +177,6 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 		readLimit: readLimit,
 		mode:      modePumped,
 		headers:   c.opts.headers,
-		cache:     c.wsCache,
 		identity:  id,
 	})
 	if derr != nil {
@@ -204,7 +209,6 @@ func (c *HTTPClient) activate(ctx context.Context, cancel context.CancelFunc, cn
 		ctx:    ctx,
 		cancel: cancel,
 		reused: reused,
-		first:  true,
 	}
 	cn.lease.Store(e)
 	e.stopWatch = context.AfterFunc(ctx, func() {
@@ -235,23 +239,30 @@ func (e *wsExchange) terminateOwned(cause error) {
 	}
 }
 
-// admit 做复用连接的首帧检查（I8）：只有"另一个请求的响应起始事件"才能被当成本
-// 次请求的第一帧。迟到的中间事件/终态事件一律判废（继续喂下去会静默算错 usage）。
+// writeFailure 给"写 create 帧失败"补上复用诊断：**只改错误文案，不改分类**
+// （%w 保留原错误链，errors.Is/As 全部照旧），也不触发任何重试。
 //
-// 成本：只在"复用到的第一帧"走一次 frameEventType（零分配）。
-func (e *wsExchange) admit(raw []byte) error {
-	if !e.first {
-		return nil
+// 为什么需要：线上必须能把两种失败分开——
+//   - 写前就死（write 入口看到 readLoop 早已登记的 io.EOF）：连接空闲期已经被
+//     上游关掉，create 一定没发出去；
+//   - 写后才 EOF（ws.Write 自己返回错误）：create 可能已进 socket、上游可能已
+//     开始执行——这正是"绝不能自动重试"的情形（create 非幂等 ⇒ 重复计费）。
+//
+// 连接年龄（= 拨号到现在的时长，命中不重置）+ 本轮已交付帧数就够区分：新拨的
+// 连接年龄≈0、交付数恒 0，对它们不加这段文案（只是噪音，且会动新拨路径的错误面）。
+func (e *wsExchange) writeFailure(werr error) error {
+	if !e.reused {
+		return werr
 	}
-	e.first = false
-	if !e.reused || frameStartsResponse(raw) {
-		return nil
-	}
-	e.terminateOwned(errConnDesynced)
-	return errConnDesynced
+	return fmt.Errorf("codexsdk: ws 复用连接写入失败（连接年龄 %s，本轮已交付 %d 帧）: %w",
+		time.Since(e.bornAt).Truncate(time.Millisecond), e.delivered.Load(), werr)
 }
 
 // Next 交付下一帧。
+//
+// 帧**不做任何类型判定**：首帧就是普通帧，不认识的事件由消费者（聚合器 / relay）
+// 自己忽略。真实 codex 客户端一模一样——它没有 response_id 过滤、没有 created
+// 门槛、没有首帧白名单，只靠"干净归还的连接 + 只认自己那一轮的语义"。
 //
 //   - 入口 ctx 已结束：先尝试交付**已入队**的帧（上游已完成的结果不能被消费侧
 //     超时改写），队列空才把取消当作本次请求的放弃；
@@ -259,7 +270,6 @@ func (e *wsExchange) admit(raw []byte) error {
 //     deadline 到点"这个次序（消费者已卡在 pop 里）会把已完成的终态帧丢掉，
 //     把上游成功的请求报成 DeadlineExceeded；
 //   - 有帧立即返回（取帧即提交：已取出的帧不再受 ctx 影响）；
-//   - 复用连接的首帧先过 I8 白名单（违约 ⇒ errConnDesynced + 终止）；
 //   - 流结束：close frame 归一为 io.EOF，其它终止原因原样返回。
 func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
 	e.nextMu.Lock()
@@ -269,9 +279,7 @@ func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
 	}
 	if ctx.Err() != nil {
 		if data, ok := e.cn.inbox.tryPop(); ok {
-			if aerr := e.admit(data); aerr != nil {
-				return nil, aerr
-			}
+			e.delivered.Add(1)
 			return data, nil
 		}
 		e.terminateOwned(ctx.Err())
@@ -279,16 +287,12 @@ func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
 	}
 	data, err := e.cn.inbox.pop(ctx)
 	if err == nil {
-		if aerr := e.admit(data); aerr != nil {
-			return nil, aerr
-		}
+		e.delivered.Add(1)
 		return data, nil
 	}
 	if cerr := ctx.Err(); cerr != nil {
 		if data, ok := e.cn.inbox.tryPop(); ok { // 取消与入队并发：已入队的帧优先
-			if aerr := e.admit(data); aerr != nil {
-				return nil, aerr
-			}
+			e.delivered.Add(1)
 			return data, nil
 		}
 		e.terminateOwned(cerr) // 队列确实空：请求已放弃
@@ -305,6 +309,9 @@ func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
 //
 // 归还判定是四步合取：租约 CAS 成功 → 连接可用 → 队列空（置栏）→ 缓存收下。
 // 任何一步失败都终止连接——绝不允许"报成功但没进表"。
+//
+// 这条"不干净不归还"是复用的全部安全性来源（客户端也一样：错误/早退的 socket
+// 直接丢，不放回）。它不靠帧级判定，所以不要为了"更安全"再往这里加逐帧检查。
 func (e *wsExchange) Release() bool {
 	if !e.beginFinish() {
 		return false

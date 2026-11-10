@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,9 +131,9 @@ func itoa(i int) string {
 
 // ---- W1 ----
 
-// TestWSQueueSaturationIsBackpressure：读到首帧后停 4s（远大于 2s 探测预算），
-// 上游持续灌 400 个小帧 → 传输层必须报**可归因的背压**（ErrWSBackpressure），
-// 而不是心跳误判导致的 "use of closed network connection"。
+// TestWSQueueSaturationIsBackpressure：读到首帧后停 4s，上游持续灌 400 个小帧
+// → 传输层必须报**可归因的背压**（ErrWSBackpressure），而不是任何被误读成
+// "use of closed network connection" 的传输错误（常驻读者保证没人中途放弃读）。
 func TestWSQueueSaturationIsBackpressure(t *testing.T) {
 	const total = 400
 	frames := make([]string, 0, total)
@@ -146,7 +147,7 @@ func TestWSQueueSaturationIsBackpressure(t *testing.T) {
 		}
 		serveAndStall(c, r, frames...)
 	})
-	hc := contractClient(t, up.srv.URL, WithPingInterval(500*time.Millisecond))
+	hc := contractClient(t, up.srv.URL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -165,7 +166,7 @@ func TestWSQueueSaturationIsBackpressure(t *testing.T) {
 		t.Fatalf("读尽后错误 = %v，想要 ErrWSBackpressure", err)
 	}
 	if strings.Contains(strings.ToLower(err.Error()), "use of closed network connection") {
-		t.Fatalf("错误不应是心跳误判的网络错误: %v", err)
+		t.Fatalf("错误应是可归因的背压，而不是传输层关闭: %v", err)
 	}
 }
 
@@ -445,9 +446,6 @@ func newTestConn(t *testing.T, cfg connConfig) *conn {
 		t.Fatalf("拨号测试连接: %v", err)
 	}
 	cfg.mode = modePumped
-	if cfg.pingInterval == 0 {
-		cfg.pingInterval = -1 // 关心跳：模型用例不需要第二份活体探测
-	}
 	return newConn(c, cfg, ctx, cancel)
 }
 
@@ -460,7 +458,9 @@ func TestWSTerminateDrainsQueue(t *testing.T) {
 			t.Fatalf("push: %v", err)
 		}
 	}
-	cn.terminate(ErrKeepaliveTimeout)
+	// 用任意终止原因：本用例只关心"终止后先排空队列"，与具体原因无关。
+	cause := errors.New("terminate-cause")
+	cn.terminate(cause)
 
 	ctx := context.Background()
 	for i, want := range frames {
@@ -472,7 +472,7 @@ func TestWSTerminateDrainsQueue(t *testing.T) {
 			t.Fatalf("第 %d 帧 = %s，想要 %s", i, got, want)
 		}
 	}
-	if _, err := cn.inbox.pop(ctx); !errors.Is(err, ErrKeepaliveTimeout) {
+	if _, err := cn.inbox.pop(ctx); !errors.Is(err, cause) {
 		t.Fatalf("排空后错误 = %v，想要终止 cause", err)
 	}
 }
@@ -699,27 +699,61 @@ func TestWSNextDeliversQueuedFrameOnCancelRace(t *testing.T) {
 
 // ---- W13 ----
 
-// TestWSKeepaliveDetectsHalfOpen：假上游停读（不回 pong）→ ≤ ping+pong 内
-// 以 ErrKeepaliveTimeout 判死（删心跳必红）。
-func TestWSKeepaliveDetectsHalfOpen(t *testing.T) {
-	up := newContractUpstream(t, func(c *coderws.Conn, r *http.Request) {
-		// 读掉 create 帧后**不再读**：控制帧无人服务 ⇒ ping 等不到 pong。
-		_, _, _ = c.Read(r.Context())
-		<-r.Context().Done() // 不写、不读、不关：挂着等客户端判死
-	})
-	hc := contractClient(t, up.srv.URL, WithPingInterval(100*time.Millisecond))
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+// TestWSNoActivePing：**客户端不主动发 WS 层 ping**（对齐真实 codex 客户端）。
+//
+// 假上游在升级选项中挂 OnPingReceived/OnPongReceived 计数（coder 只在读循环在飞
+// 时派发控制帧回调，所以假上游必须同时有常驻读）。客户端用 20ms 的
+// WithPingInterval —— 旧实现下这段时间会打出十几条 ping；现在该选项是纯兼容面。
+//
+// 断言：整段观察窗内**一个** ping 都收不到，且响应照常完成（没有"因为没判活而
+// 被误杀"的迹象）。
+func TestWSNoActivePing(t *testing.T) {
+	var pings, pongs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := coderws.Accept(w, r, &coderws.AcceptOptions{
+			OnPingReceived: func(context.Context, []byte) bool { pings.Add(1); return true },
+			OnPongReceived: func(context.Context, []byte) { pongs.Add(1) },
+		})
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		go func() { // 常驻读：既是控制帧回调的前提，也在服务客户端可能的 ping
+			for {
+				if _, _, rerr := c.Read(r.Context()); rerr != nil {
+					return
+				}
+			}
+		}()
+		// 观察窗 400ms（20ms 间隔的旧心跳会打 ~20 条 ping），再回一组正常帧。
+		select {
+		case <-time.After(400 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		_ = writeFrames(c, r, wsCreatedEv, wsCompletedEv)
+		_ = c.Close(coderws.StatusNormalClosure, "")
+	}))
+	t.Cleanup(func() { srv.CloseClientConnections(); srv.Close() })
+
+	hc := contractClient(t, srv.URL, WithPingInterval(20*time.Millisecond))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	body := contractResponseBody(t, hc, ctx)
 	defer func() { _ = body.Close() }()
 
-	start := time.Now()
-	_, err := io.Copy(io.Discard, body)
-	if !errors.Is(err, ErrKeepaliveTimeout) {
-		t.Fatalf("错误 = %v，想要 ErrKeepaliveTimeout", err)
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("读 body: %v", err)
 	}
-	if d := time.Since(start); d > 8*time.Second {
-		t.Fatalf("判死耗时 %v 超出 ping+pong 预算（100ms+2s）", d)
+	if !strings.Contains(string(got), "data: [DONE]") {
+		t.Fatalf("响应未正常完成（无主动 ping 不该影响取帧）:\n%s", string(got))
+	}
+	if n := pings.Load(); n != 0 {
+		t.Fatalf("客户端发出了 %d 个主动 ping，期望 0（WithPingInterval 已无效果）", n)
+	}
+	if n := pongs.Load(); n != 0 {
+		t.Fatalf("客户端回了 %d 个 pong，但上游从未发 ping（不该有无端控制帧）", n)
 	}
 }
 

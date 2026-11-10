@@ -120,10 +120,10 @@ func (u *benchWSUpstream) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// **常驻读循环**（不是可选的收尾）：coder/websocket 的 Ping 自己不读连接，
-	// 只等"某次 Reader 调用把 pong 读上来"。没有在飞的 Read，心跳就会在 ping
-	// 超时后 CloseNow——那是 bench 环境造出来的假故障，会把 P3 的数字污染成
-	// "连接被提前掐断"。客户端 CloseNow 时读返回错误 → 退出，httptest 收尾不挂。
+	// **常驻读循环**（不是可选的收尾）：对端 ping/pong 等控制帧只在有 Read 在飞时
+	// 才被服务。没有在飞的 Read，控制帧无人应答——那是 bench 环境造出来的假故障，
+	// 会把 P3 的数字污染成"连接被掐断"。客户端 CloseNow 时读返回错误 → 退出，
+	// httptest 收尾不挂。
 	for {
 		if _, _, rerr := c.Read(r.Context()); rerr != nil {
 			return

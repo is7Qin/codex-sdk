@@ -17,9 +17,11 @@ const (
 	// defaultReadLimit 单帧读取上限。coder/websocket 默认 32KB 过小——
 	// Codex 事件（rate_limits / 大 delta）可超阈值，对齐 sub2api 的 16MiB。
 	defaultReadLimit = 16 * 1024 * 1024
-	// defaultPingInterval 心跳间隔。Responses WS 空闲连接会被上游断链，
-	// 需要 keepalive：上游客户端同时发送 type:"ping" 应用事件，本库选择
-	// WS 层 ping 以不进入业务事件流。
+	// defaultPingInterval 是 WithPingInterval 的默认值。
+	//
+	// 注意：**主动心跳探测已删除**（对齐真实 codex 客户端：它只在收到 Ping 时回
+	// Pong，从不主动周期 Ping）。这个默认值现在只用于让 WithPingInterval(0) 这类
+	// 现有调用照旧编译；内核不再读它。
 	defaultPingInterval = 30 * time.Second
 	// defaultCompressionThreshold 压缩开启时仅压缩超过该大小的消息。
 	defaultCompressionThreshold = 512
@@ -99,8 +101,8 @@ func (e *DialError) Unwrap() error { return e.Err }
 type options struct {
 	compression  CompressionMode
 	readLimit    int64
-	pingInterval time.Duration
-	beta         string // Responses WS beta 版本（默认 DefaultBetaWS=2026-02-06，现役唯一真实值）
+	pingInterval time.Duration // 仅 API 兼容（WithPingInterval）；内核不再读
+	beta         string        // Responses WS beta 版本（默认 DefaultBetaWS=2026-02-06，现役唯一真实值）
 	headers      http.Header
 
 	// 伪装层（Send 帧 / 升级与请求头）。身份（Session/Meta/turn-state）是请求
@@ -123,6 +125,9 @@ type options struct {
 
 	// wsConnCache 是 Responses WS 臂的空闲连接容量（0 = 不复用，默认）。
 	wsConnCache int
+	// wsSweepInterval 是空闲表维护 ticker 的节拍（0 = defaultConnSweepInterval）。
+	// 包内私有（测试 seam）：它只控制 sweep 频率，不影响任何探测行为（已无探测）。
+	wsSweepInterval time.Duration
 }
 
 func defaultOptions() options {
@@ -186,7 +191,16 @@ func WithReadLimit(n int64) Option {
 	return func(o *options) { o.readLimit = n }
 }
 
-// WithPingInterval 设置 WS 心跳间隔（默认 30s；0 或负值禁用心跳）。
+// WithPingInterval 是**保留的 API 兼容面**：主动心跳探测已删除。
+//
+// 这里只记下该值，连接内核不再读它——SDK 不会主动发 WS 层 ping。依据是真实
+// codex 客户端：它的 Responses WS pump 只有"收到 Ping 就地回 Pong"，没有 ticker、
+// 没有 pong deadline；空闲连接的 EOF/Close 由常驻读者观测，复用前由 releasable
+// 复查。公开的 Client.Ping 仍在（调用方可自行决定何时探活）。
+//
+// 保留而不删的原因：现有调用方（如网关的 WithPingInterval(0)）要照旧编译。
+//
+// Deprecated: 无效果；传任何值都不再改变行为。
 func WithPingInterval(d time.Duration) Option {
 	return func(o *options) { o.pingInterval = d }
 }
@@ -265,6 +279,12 @@ func withKeepaliveInterval(d time.Duration) Option {
 	return func(o *options) { o.keepaliveInterval = d }
 }
 
+// withConnSweepInterval 设置空闲表维护 ticker 的节拍（仅测试 seam，不导出）。
+// 它**只**影响 TTL/maxAge 的清扫频率：没有探针、没有 ping。
+func withConnSweepInterval(d time.Duration) Option {
+	return func(o *options) { o.wsSweepInterval = d }
+}
+
 // Client 是 Responses WebSocket 连接（Dial 创建），是连接内核的 pull 模式门面。
 //
 // 读模型：**纯拉**——Recv 直读 socket（无常驻读协程、无队列）。因此
@@ -274,8 +294,10 @@ func withKeepaliveInterval(d time.Duration) Option {
 //   - Recv 的 ctx 不是"可取消的一次取帧"：按 coder 语义，取消会**关闭连接**
 //     并返回 ctx 错误。
 //
-// 心跳（默认 30s ping / 2s 探测预算）依赖上述常驻 Recv；心跳失败视为连接已死，
-// 立即强断以解除阻塞中的 Recv（返回错误），网关据此触发重连。
+// 心跳：**没有主动探测**（对齐真实 codex 客户端）。连接只在对端发 Ping 时就地
+// 回 Pong，这个服务由编码器/解码器（coder）在读循环里完成，不依赖调用方读频率
+// 以外的任何定时器。半开连接只能靠读写错误或调用方 ctx 兜底——需要主动活体检测
+// 的调用方自己发 `Client.Ping`（沿用调用方 ctx）。
 //
 // 并发语义：至多一个 goroutine 同时执行 Recv；Send / Ping 由连接内核的写闸
 // 串行化（coder/websocket 禁止并发写）。关闭握手时延上界约 10s（coder 写关闭帧
@@ -377,15 +399,15 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // Close 发起关闭握手（关闭码透传，如 StatusNormalClosure；reason ≤125 字节）。
 // 注意：关闭握手可能阻塞最多 ~10s（coder 写关闭帧 5s + 等对端关闭帧 5s），
-// 等不起时用 CloseNow。停用心跳。重复/并发调用返回首次结果（幂等；
-// 对端已断开时返回 nil）。
+// 等不起时用 CloseNow。重复/并发调用返回首次结果（幂等；对端已断开时返回 nil）。
 func (c *Client) Close(status StatusCode, reason string) error {
 	c.closed.Store(true)
 	return c.cn.closeGracefully(status, reason)
 }
 
 // CloseNow 立即终止连接（跳过关闭握手，不等待对端），用于等不起 Close 阻塞的
-// 场景——如网关快速 failover、心跳死亡兜底。幂等；与 Close 互斥，先调用者生效。
+// 场景——如网关快速 failover、调用方自判死后的兜底强断。幂等；与 Close 互斥，
+// 先调用者生效。
 // 若 Close 的关闭握手已在飞，本调用只登记首因并立即返回，socket 由握手收尾
 // （时延上界同 Close，~10s；与基线行为等价）。
 // 之后 Close 返回既有结果（通常 nil，与今天一致）。

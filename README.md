@@ -32,10 +32,11 @@ channel API.
   call; the SDK keeps no identity state and reports issued turn-state only
   through `Identity.Sink`. Identity headers are reserved: `WithHeader` panics at
   construction time if they are used.
-- **Protocol-aware transport**: the SDK owns framing, keepalive and the SSE
-  representation, and reports attributable transport errors
-  (`ErrWSBackpressure` / `ErrKeepaliveTimeout` / `*HTTPError` with an
-  `Unwrap`-able cause). Business semantics (types / usage / events) still live
+- **Protocol-aware transport**: the SDK owns framing and the SSE representation
+  (no active heartbeat — aligned with the real Codex client, which only answers
+  pings), and reports attributable transport errors
+  (`ErrWSBackpressure` / `*HTTPError` with an `Unwrap`-able cause). Business
+  semantics (types / usage / events) still live
   in the gateway ([go-proxy-mini](https://github.com/is7Qin/go-proxy-mini)).
 
 ## Installation

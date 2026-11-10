@@ -26,9 +26,10 @@ var turnStateHeaderKey = []byte(HeaderTurnState)
 //     原样透传（v1.2 的"先看子串"会永远记不到 id，事件 ts 全被丢）；
 //  2. `*.metadata` 才做 `x-codex-turn-state` 子串快筛，未命中透传；
 //  3. 归属判定：`metadata.response_id == seenID && seenID != ""` ⇒ 接受；否则
-//     dropped+1（**只丢 ts 候选，不丢帧**）。这条防的是复用首帧白名单放行旧
-//     `*.metadata` 把旧 ts 覆盖成新值。fail-safe：`response.created` 到达前的
-//     任何 metadata 一律不捕获——漏掉一个 ts 远好于写进一个错误的值；
+//     dropped+1（**只丢 ts 候选，不丢帧**）。这条防的是复用连接上残留下来的旧
+//     `*.metadata` 把旧 ts 覆盖成新值（exchange 不再做首帧判定，所以这里必须自己
+//     持有归属条件）。fail-safe：`response.created` 到达前的任何 metadata 一律不
+//     捕获——漏掉一个 ts 远好于写进一个错误的值；
 //  4. 接受 ⇒ 写入 id.Sink（nil = 忽略），然后原样透传该帧。
 //
 // 帧契约：一帧进、一帧出，不复制、不改写、不重排、不丢弃任何帧。三个方法必须

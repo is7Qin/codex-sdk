@@ -1,7 +1,6 @@
 package codexsdk
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -26,36 +25,21 @@ const (
 // 供 SSE 视图判定流已终结（不再取帧、也不补 [DONE]）。
 const responseEventIncomplete = "response.incomplete"
 
-// 复用连接首帧白名单（I8）用到的其余事件名。
-const (
-	responseEventInProgress = "response.in_progress"
-	responseEventError      = "error"
-	// responsesTimingEvent 是上游的观测事件（codex-api/src/sse/responses.rs 的
-	// "responsesapi.websocket_timing"）。它可能作为某次响应的最后一帧出现，
-	// 因此必须能合法地当"下一请求的第一个帧"。
-	responsesTimingEvent = "responsesapi.websocket_timing"
-)
-
-// frameStartsResponse 报告 raw 能不能作为一条复用连接上"新请求的第一帧"。
+// 复用连接上的帧**不做任何类型准入**（这里原本有一套首帧白名单，已删除）。
 //
-// 白名单：response.created / response.in_progress / error / 任何 *.metadata /
-// responsesapi.websocket_timing。白名单外的一切（.delta / .completed / .failed …）
-// 都是上一个请求的残留或串台，拿它们当新请求的事件会静默算错 usage。
+// 依据是真实 codex 客户端的源码：它在复用连接上从 response.created 开始按普通
+// 事件循环消费，没有 response_id 过滤、没有 created 门槛、也没有白名单——不认识
+// 的事件由各自消费者忽略。SDK 照抄这个模型：旧的尾帧交付后就是普通帧。
 //
-// 零分配：frameEventType 只扫顶层 type 值，bytes.HasSuffix 不复制。
-func frameStartsResponse(raw []byte) bool {
-	typ := frameEventType(raw)
-	switch {
-	case bytesAre(typ, responseEventCreated),
-		bytesAre(typ, responseEventInProgress),
-		bytesAre(typ, responseEventError),
-		bytesAre(typ, responsesTimingEvent):
-		return true
-	case bytes.HasSuffix(typ, []byte(".metadata")):
-		return true
-	}
-	return false
-}
+// 明确不做（写在这里防后人再加）：
+//   - 不加 response_id 归属过滤（客户端没有；协议字段覆盖面也无证据）；
+//   - 不加 created 门槛（metadata / rate_limits / error 都可能在 created 前到）；
+//   - 不加归还后静默窗 / 预读 drain；
+//   - 不加写后自动重试（create 非幂等 ⇒ 重复计费）。
+//
+// 唯一的保留偏差在 frameInbox.fence：空闲期（已归还、未取用）收到帧仍然终止连接，
+// 因为网关靠 response.completed 嗅探 usage 计费，不能把上一轮的终态记到新请求上。
+// 那是**复用准入**的保守，不是协议判定。
 
 // streamBodyWS 是 StreamBody 的 ws 臂：帧构造 → 拨号 → 发一帧 → 合成 200
 // 响应。对外形状与 HTTP 臂一致（StatusCode / Body / Header 三项——网关侧

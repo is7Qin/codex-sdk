@@ -25,8 +25,8 @@ import (
 // wsResidentUpstream 假 Responses WS 上游：升级成功后**保持一条常驻 Read**
 // （coder/websocket 只在读循环在途时自动回 pong），并按 interval 持续写帧。
 //
-// 常驻读是这类用例的前提：只写不读的上游收不到 ping、也不会回 pong，客户端
-// 心跳必然超时——那测的就不是客户端读模型了。
+// 常驻读是这类用例的前提：只写不读的上游既不服务客户端 ping，也读不到对端关闭
+// 意图——那测的就不是客户端读模型了。
 type wsResidentUpstream struct {
 	srv      *httptest.Server
 	frames   []string
@@ -100,16 +100,16 @@ func newWSClient(t *testing.T, up *wsResidentUpstream, opts ...Option) *HTTPClie
 	return NewHTTPClient(PAT("pat-resident"), append(base, opts...)...)
 }
 
-// TestWSReaderKeepsPongsWhileConsumerIdle（spec §7-8 / momus I1）：
-// 消费者**故意 3s 不 Read**（> 2s pong 超时），心跳期间连接必须存活、帧不得丢。
+// TestWSReaderKeepsFramesWhileConsumerIdle（spec §7-8 / momus I1）：
+// 消费者**故意 3s 不 Read**，常驻读者期间连接必须存活、帧不得丢（无背压、无截断）。
 //
-// 旧实现（纯拉模型）在本用例下必红：没有 Read 在飞 ⇒ pong 没人读 ⇒ 200ms 的 ping
-// 在 2s 超时后 CloseNow ⇒ ReadAll 拿到传输错误 / 帧缺失。
-func TestWSReaderKeepsPongsWhileConsumerIdle(t *testing.T) {
+// 旧实现（纯拉模型）在本用例下必红：没有 Read 在飞 ⇒ 对端 ping 与控制帧无人服务，
+// 长空闲后 ReadAll 拿到传输错误 / 帧缺失。现在帧先由 pump 入队，消费者停多久都不丢。
+func TestWSReaderKeepsFramesWhileConsumerIdle(t *testing.T) {
 	frames := []string{wsCreatedEv, wsDeltaEv, wsDeltaEv, wsDeltaEv, wsDeltaEv, wsCompletedEv}
 	// 3s 的空闲窗口由生产侧 pacing 产生（600ms × 5 段），用例只等屏障。
 	up := newWSResidentUpstream(t, frames, 600*time.Millisecond)
-	hc := newWSClient(t, up, WithPingInterval(200*time.Millisecond))
+	hc := newWSClient(t, up)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

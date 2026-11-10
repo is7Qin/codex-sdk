@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// 连接复用的两个寿命参数。
+// 连接复用的寿命参数与维护节拍。
 const (
 	// defaultConnIdleTTL 是空闲多久后退役：超过它，连接不再值得复用（上游可能已经
 	// 悄悄关掉，而我们还不知道）。
@@ -16,6 +16,10 @@ const (
 	// defaultConnMaxAge 是连接寿命上限。服务端硬上限是 60 分钟，本地提前一半退役——
 	// 与其等上游甩一个 websocket_connection_limit_reached 给真实请求，不如自己换新的。
 	defaultConnMaxAge = 30 * time.Minute
+	// defaultConnSweepInterval 是空闲表的维护节拍：**只摘 TTL/maxAge 到期条目，
+	// 不探测任何连接**。它取代了已删除的"心跳 tick 顺带 sweep"——否则被丢弃的
+	// HTTPClient（网关每轮重建）的空闲连接会永久占位到对端断开。
+	defaultConnSweepInterval = 30 * time.Second
 )
 
 // errConnExpired 是 sweep 退役连接时登记的终止原因。
@@ -39,12 +43,17 @@ type cachedConn struct {
 //
 // 它同时是 wsExchange 的归还口（实现 connSink）：Release 只需要知道"收下了没有"。
 type connCache struct {
-	mu     sync.Mutex
-	cap    int
-	ttl    time.Duration // 默认 defaultConnIdleTTL（测试可注入）
-	maxAge time.Duration // 默认 defaultConnMaxAge（测试可注入）
-	closed bool          // Close 之后 put 拒收（由 Release 终止），idle 已清空
-	idles  []cachedConn
+	mu         sync.Mutex
+	cap        int
+	ttl        time.Duration // 默认 defaultConnIdleTTL（测试可注入）
+	maxAge     time.Duration // 默认 defaultConnMaxAge（测试可注入）
+	sweepEvery time.Duration // 维护 ticker 节拍（构造期固定；测试可注入）
+	closed     bool          // Close 之后 put 拒收（由 Release 终止），idle 已清空
+	idles      []cachedConn
+
+	// stop 关闭维护 ticker（仅 Close）；closeOnce 保证幂等。
+	stop      chan struct{}
+	closeOnce sync.Once
 
 	// hits/misses 只服务 bench 与测试（不导出）：hit 仅在连接真的被移交
 	// （unfence 通过）时计；misses 覆盖“候选被 drop 后重拨”与“根本没找到候选”。
@@ -53,25 +62,54 @@ type connCache struct {
 	misses atomic.Int64
 }
 
-func newConnCache(capacity int) *connCache {
+// newConnCache 构造空闲表并启动它自己的维护 ticker。
+//
+// sweepEvery ≤ 0 ⇒ defaultConnSweepInterval。ticker 由缓存持有（而不是挂在连接上）：
+// 连接不该知道缓存存在，也不该为缓存开定时器。
+func newConnCache(capacity int, sweepEvery time.Duration) *connCache {
 	if capacity < 1 {
 		// 内部构造器也不允许非正容量：put 的“满则驱逐”分支会去读 idles[0]。
 		// 公开面（WithWSConnCache）本来就用 newConnCacheIf 过滤过，这里只是加一道防线。
 		capacity = 1
 	}
-	return &connCache{
-		cap:    capacity,
-		ttl:    defaultConnIdleTTL,
-		maxAge: defaultConnMaxAge,
+	if sweepEvery <= 0 {
+		sweepEvery = defaultConnSweepInterval
 	}
+	c := &connCache{
+		cap:        capacity,
+		ttl:        defaultConnIdleTTL,
+		maxAge:     defaultConnMaxAge,
+		sweepEvery: sweepEvery,
+		stop:       make(chan struct{}),
+	}
+	go c.maintain()
+	return c
 }
 
 // newConnCacheIf 按容量决定是否开启复用：n≤0 返回 nil（零行为变化）。
-func newConnCacheIf(n int) *connCache {
+func newConnCacheIf(n int, sweepEvery time.Duration) *connCache {
 	if n <= 0 {
 		return nil
 	}
-	return newConnCache(n)
+	return newConnCache(n, sweepEvery)
+}
+
+// maintain 是空闲表唯一的周期维护者：到点只做 sweep（摘 TTL/maxAge 到期条目），
+// **不做任何探测**——主动心跳已删除（对齐真实 codex 客户端）。空闲连接的死活由
+// 常驻读者（readLoop）与取用前的 releasable 复查发现，不靠本地 ping。
+//
+// 只有 Close 会停它；clear（CloseIdleConnections）不清 ticker——缓存仍可复用。
+func (c *connCache) maintain() {
+	t := time.NewTicker(c.sweepEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.stop:
+			return
+		case now := <-t.C:
+			c.sweep(now)
+		}
+	}
 }
 
 // expired 报告条目是否已过 TTL 或超过寿命上限（调用方持锁）。
@@ -82,7 +120,8 @@ func (c *connCache) expired(cc cachedConn, now time.Time) bool {
 // sweep 摘除过期/超龄条目并在锁外 terminate。
 //
 // 这是**唯一**的退役入口：判定与摘除在同一把锁内完成，所以被 get 摘走的连接
-// 它再也看不到——不可能误杀一个正在跑的请求。多个连接的 keepalive 都会调它，幂等。
+// 它再也看不到——不可能误杀一个正在跑的请求。它只由 connCache.maintain 周期调
+// （外加 get/put 的惰性清理与测试直调），幂等。
 func (c *connCache) sweep(now time.Time) {
 	var dead []*conn
 	c.mu.Lock()
@@ -218,9 +257,18 @@ func (c *connCache) RetireThread(threadKey string) {
 	}
 }
 
-// Close 关闭缓存：置 closed（此后 put 返回 false，由 Release 终止归还中的
-// 连接）+ 清空并终止全部 idle。幂等；Close 之后 RetireThread 为 no-op。
-func (c *connCache) Close() { c.dropIdle(true) }
+// Close 关闭缓存：停维护 ticker + 置 closed（此后 put 返回 false，由 Release 终止
+// 归还中的连接）+ 清空并终止全部 idle。幂等；Close 之后 RetireThread 为 no-op。
+//
+// 这是**唯一**停 ticker 的地方：clear（CloseIdleConnections）只清空 idle，缓存本身
+// 仍可用，维护节拍必须跟着继续跑。
+func (c *connCache) Close() {
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() { close(c.stop) })
+	c.dropIdle(true)
+}
 
 // clear 只清空 idle、不置 closed（CloseIdleConnections 用）：随后新建的连接
 // 仍可正常复用。

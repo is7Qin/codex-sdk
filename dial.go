@@ -24,8 +24,6 @@ type dialSpec struct {
 	mode      connMode
 	headers   http.Header
 	identity  Identity // 握手头来源（帧内身份由编码器直接取）
-	// cache 是空闲连接的退役入口（nil = 复用关闭）；连接拿它来自行 sweep。
-	cache *connCache
 }
 
 // handshake 是握手成功后从上游取到的东西。
@@ -155,13 +153,10 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 	connCtx, stop := context.WithCancel(context.Background())
 
 	cfg := connConfig{
-		mode:         spec.mode,
-		readLimit:    spec.readLimit,
-		pingInterval: spec.opts.pingInterval,
-		pongTimeout:  defaultPongTimeout,
-		queueFrames:  defaultQueueFrames,
-		queueBytes:   defaultQueueBytes,
-		cache:        spec.cache,
+		mode:        spec.mode,
+		readLimit:   spec.readLimit,
+		queueFrames: defaultQueueFrames,
+		queueBytes:  defaultQueueBytes,
 	}
 	return newConn(wsConn, cfg, connCtx, stop), hs, nil
 }

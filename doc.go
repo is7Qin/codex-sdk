@@ -4,8 +4,9 @@
 // # 边界
 //
 // 本库只负责协议 / 传输 / 鉴权 / 伪装：
-//   - Responses WebSocket：Dial / 帧字节收发（文本与二进制帧原样透传）/ 心跳保活 /
-//     关闭码透传（Close(status, reason)，急断 CloseNow）
+//   - Responses WebSocket：Dial / 帧字节收发（文本与二进制帧原样透传）/ 关闭码
+//     透传（Close(status, reason)，急断 CloseNow）；**不主动发心跳**（对齐真实
+//     codex 客户端：只在收到 Ping 时回 Pong）
 //   - Responses HTTP：POST 请求构造 / 非流式响应 / 流式 SSE 事件帧提取；
 //     HTTPClient 的 StreamBody / Responses 可经 WithResponsesTransport 改走上游
 //     Responses WS（对外形状不变，帧构造 / 错误语义 / 等价面见 TRANSPORT.md）
@@ -99,7 +100,8 @@
 //
 // # 性能语义（性能优先：懒构建 + 热路径低分配）
 //
-//   - 无全局可变状态：连接/客户端均按需构建，心跳 goroutine 仅连接存活期间存在
+//   - 无全局可变状态：连接/客户端均按需构建，唯一的常驻 goroutine 是 pumped 读者
+//     （以及每个 WS 缓存一个维护 ticker），都只在所属对象存活期间存在
 //   - WS 帧编码是**单遍**：一次顶层扫描、一份输出缓冲，把协议形状差（type/续接键/
 //     stream）、白名单过滤、store:false 与 client_metadata 注入合并落地；只在
 //     "紧凑 / 无转义键 / 无重复键 / 顶层键全在白名单内"时走快路径，其余形态回退旧链
@@ -116,12 +118,12 @@
 //     编排天然满足该前提，这是既有契约；Close 走 coder 关闭握手。传输臂
 //     （WithResponsesTransport(TransportWS) 的 StreamBody / Responses）是
 //     **常驻读者 + 有界队列**：读者除入队临界区外恒在 Read，所以下游再慢也不会
-//     让心跳误判成连接死亡；队列饱和（256 帧 / 8MiB，空队列允许单帧超预算）报
-//     ErrWSBackpressure（可归因，非静默截断、非无限缓冲），心跳探测未在 2s 预算内
-//     完成报 ErrKeepaliveTimeout；终态后可归还缓存，放弃或归还失败则强断。
+//     丢失对端控制帧（已无任何心跳探测：与真实 codex 客户端一致，半开连接只能靠
+//     读写错误或调用方 ctx 兜底）；队列饱和（256 帧 / 8MiB，空队列允许单帧超预算）报
+//     ErrWSBackpressure（可归因，非静默截断、非无限缓冲）；终态后可归还缓存，
+//     放弃或归还失败则强断。
 //     StreamBody 由 Body.Close 触发归还；Responses 消费终态后自动归还。
-//     注意：WithPingInterval(0) 关闭心跳后，传输臂仍有常驻读者服务 pong，但不再
-//     探测"对端是否还活着"（半开连接只能靠读写错误或调用方 ctx 兜底）。
+//     注意：WithPingInterval 已无效果（纯兼容面）；需要主动探活的调用方自己做。
 //   - WithWSConnCache(n) 开启默认关闭的 WS 连接复用：同一个 HTTPClient 上同一
 //     thread 的连续请求——含跨轮跨窗口——命中后不再付握手（连接身份 =
 //     (threadKey, readLimit)）；匿名（Identity{}）不参与复用。线程退休走
@@ -163,8 +165,8 @@
 // ——HTTP 头 x-openai-internal-codex-responses-lite 可用 WithHeader 透传；S4 起
 // 不再提供任意 WS client_metadata 透传入口。
 // 传输常量对齐参考实现：16MiB ReadLimit（coder 默认 32KB 过小）、
-// CompressionContextTakeover 压缩、WS 层 ping 心跳（30s 间隔 + 2s 超时）、
-// data: SSE 行提取与 [DONE] 终止、response.create 19 字段白名单、
+// CompressionContextTakeover 压缩、data: SSE 行提取与 [DONE] 终止、
+// response.create 19 字段白名单、
 // client_metadata 恒发 8 key 集合（session_id/thread_id/turn_id 为 snake_case，
 // trace 的 metadata key 名与头名不同）。HTTP /responses 面注入（Stream
 // 发送前统一执行）恒 4 key（x-codex-installation-id/session_id/thread_id/

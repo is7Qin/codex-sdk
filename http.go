@@ -58,11 +58,12 @@ func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 		auth:    auth,
 		opts:    cfg,
 		codec:   newFrameCodec(&cfg),
-		wsCache: newConnCacheIf(cfg.wsConnCache),
+		wsCache: newConnCacheIf(cfg.wsConnCache, cfg.wsSweepInterval),
 	}
 }
 
-// CloseWSIdleConnections **关闭** WS 臂的连接缓存，**不碰**底层 http.Transport。
+// CloseWSIdleConnections **关闭** WS 臂的连接缓存（含它自己的维护 ticker），
+// **不碰**底层 http.Transport。
 //
 // 语义是"这个 client 要被丢弃了"：清空并终止现有 idle，此后归还一律拒收（由
 // Release 终止），**不可逆**——没有重新打开的入口，要复用只能新建 HTTPClient。

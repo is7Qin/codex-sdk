@@ -318,58 +318,60 @@ func TestPing(t *testing.T) {
 	}
 }
 
-// TestHeartbeatKeepalive：短间隔心跳下连接保持存活（常驻读循环处理 pong）。
-func TestHeartbeatKeepalive(t *testing.T) {
-	url, _ := startEchoServer(t, "")
-	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)), WithPingInterval(50*time.Millisecond))
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer c.Close(StatusGoingAway, "")
-	startReader(t, c)
-
-	time.Sleep(250 * time.Millisecond) // 覆盖多个心跳周期
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := c.Ping(ctx); err != nil {
-		t.Fatalf("心跳期间连接应存活: %v", err)
-	}
-}
-
-// TestHeartbeatDeathPath：心跳失败（对端不响应 ping）→ CloseNow →
-// 阻塞中的 Recv 返回错误。
-func TestHeartbeatDeathPath(t *testing.T) {
+// TestNoProactiveHeartbeat：客户端**不主动**发 ping（对齐真实 codex 客户端）。
+//
+// 旧实现在 WithPingInterval(50ms) 下会周期 ping，并在 2s 等不到 pong 时
+// terminate(ErrKeepaliveTimeout)。本用例用"对端挂住不读不写"的形态把这一点变成
+// 确定性断言：整个观察窗（2.5s > 50ms 间隔 + 2s 预算）内连接不得被判死，阻塞中的
+// Recv 也不得返回。
+//
+// WithPingInterval 现在是纯兼容面（见其注释）；公开的 Client.Ping 仍在，
+// 要不要探活由调用方决定。
+func TestNoProactiveHeartbeat(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
-		// 挂住不读不写：不处理控制帧 → 不响应 ping。
+		// 挂住不读不写：旧心跳会在这里等不到 pong 而自杀。
 		<-release
 		_ = c.CloseNow()
 	}))
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { close(release) }) // LIFO：先释放 handler，再关 server
 
-	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)), WithPingInterval(50*time.Millisecond))
+	c, err := Dial(context.Background(), PAT("t"), Identity{},
+		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
+		WithPingInterval(50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer c.Close(StatusGoingAway, "")
+	defer c.CloseNow()
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := c.Recv(context.Background())
-		errCh <- err
+		_, rerr := c.Recv(context.Background())
+		errCh <- rerr
 	}()
 	select {
-	case err := <-errCh:
-		if err == nil {
-			t.Fatal("心跳死亡后 Recv 应返回错误")
+	case rerr := <-errCh:
+		t.Fatalf("对端静默时连接自己被判死（不该有主动探测）: %v", rerr)
+	case <-time.After(2500 * time.Millisecond):
+	}
+	if c.Closed() {
+		t.Fatal("连接被本地判死（旧心跳路径未彻底删除？）")
+	}
+
+	// 收尾：pull 面的强断出口只有 CloseNow，它必须能唤醒阻塞中的 Recv。
+	c.CloseNow()
+	select {
+	case rerr := <-errCh:
+		if rerr == nil {
+			t.Fatal("CloseNow 之后 Recv 应返回错误")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("心跳失败后 Recv 未在时限内返回")
+		t.Fatal("CloseNow 未唤醒阻塞的 Recv")
 	}
 }
 
