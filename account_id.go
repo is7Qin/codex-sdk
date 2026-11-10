@@ -71,12 +71,8 @@ func hasControlByte(s string) bool {
 // 值经 TrimSpace 后非空才算命中。refresh_token 为不透明串（无 claims），
 // 传它只会得到 ("", false)。
 func AccountIDFromToken(token string) (string, bool) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return "", false
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
+	raw, ok := jwtPayload(token)
+	if !ok {
 		return "", false
 	}
 	var payload struct {
@@ -92,4 +88,18 @@ func AccountIDFromToken(token string) (string, bool) {
 		return "", false
 	}
 	return id, true
+}
+
+// jwtPayload 解出 JWT payload 原始字节（三段式校验 + base64url 无填充解码；
+// 不验签、不校验 exp）。畸形 token → ("", false)，不 panic。
+func jwtPayload(token string) ([]byte, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
 }

@@ -20,6 +20,12 @@ channel API.
 - **Authentication**: static PAT, OAuth with refresh callback, and
   `OAuthWithRotation` (rotating state machine with single-flight refresh,
   fatal-account detection, and 401 auto-rotation).
+- **Device-code login** (`DeviceAuthClient`): ChatGPT OAuth device
+  authorization grant — `StartDeviceFlow` (user code, verification URL, always
+  positive expiry) and a single-shot `PollDeviceFlow` that either reports
+  pending/expired/denied through sentinel errors or exchanges the code and
+  returns tokens. Stateless by design: the caller keeps the pending session, and
+  there is no blocking loop in the library.
 - **Fingerprint alignment**: headers, send-frame top-level key whitelist, and
   `client_metadata` assembly aligned with the real Codex client.
 - **Request-scoped identity**: `Identity` carries session/meta/turn-state per

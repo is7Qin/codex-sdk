@@ -57,6 +57,22 @@
 // （completed / failed / incomplete）才能提交并收尾。这层解析限于"顶层 type 字符串"
 // （零分配扫描，见 frameEventType），不展开 usage、不解释事件负载。
 //
+// 设备码登录（DeviceAuthClient）：StartDeviceFlow / PollDeviceFlow——ChatGPT
+// OAuth device authorization grant，逐点对齐真客户端 codex-rs/login/src/
+// device_code_auth.rs + server.rs::exchange_code_for_tokens（usercode JSON →
+// 轮询 403/404=pending → 表单编码换码，redirect_uri={issuer}/deviceauth/callback）。
+// **SDK 不持有登录状态、不做阻塞轮询**：待授权会话由调用方保存（网关把它交给
+// 发起者本人），每次 PollDeviceFlow 只轮询一次，pending 由调用方决定何时重试。
+// PollDeviceFlow 在授权完成后**自动换码**并返回 DeviceTokens；三个哨兵错误
+// 区分 pending / expired / denied（denied 认 access_denied、authorization_denied
+// 与真客户端实测的 401 authorization_declined），其余非 2xx → *DeviceAuthError
+// （状态码 + 错误体，供调用方诊断）。DeviceCode.ExpiresIn 恒为正：服务端未下发
+// 时按真客户端的 15 分钟上限补齐，调用方可以据此维护截止时间。issuer 默认
+// DefaultIssuer，WithIssuer 可覆盖（测试/自托管）；client_id 与 refresh 路径
+// **同源**（CODEX_APP_SERVER_LOGIN_CLIENT_ID），否则登录签发的 refresh token
+// 与后续刷新请求的 client_id 不一致会 invalid_client。令牌刷新沿用既有
+// OAuthWithRotation，DeviceTokens 只交付首登凭据束。
+//
 // OAuthWithRotation 边界：refresh 轮转协议 / 响应解析 / 判死分类 / 退避重试
 // 属鉴权面，SDK 自包含（"不解析业务协议"的纪律指 responses 的业务
 // 语义——usage / 事件构造 / 计费不解析，鉴权错误分类不在此列）。RefreshResponse 仅非空覆盖
