@@ -168,9 +168,18 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 互相污染路由状态。
 Authorization token 必须仍一致，取出即独占，不做请求多路复用。
 
-归还资格是读到终态、队列空且连接可用；取消、读写错误、提前关闭均终止连接。
-`StreamBody` 须读到终态后关闭 body 才归还；`Responses` 消费终态后自动归还。空闲期收到任何帧
+归还资格是读到**正常**终态（`response.completed`）、队列空且连接可用；**失败终态
+（`response.failed` / `response.incomplete`）、取消、读写错误、提前关闭均终止连接**
+（客户端语义：错误即退役）。
+判定发生在**已经解析事件**的地方（聚合器 / `sseView`）：它们看到失败终态就调
+`frameStream.MarkFailed()`，`Release` 见到标记一律拒绝并终止——传输层仍然不做任何帧类型判定。
+`StreamBody` 须读到终态后关闭 body 才归还（failed/incomplete 已自动标记）；`Responses`
+消费终态后自动归还。空闲期收到任何帧
 即判废（fence/poisoned，见下）；取用前复查连接并解栏，失败则在发送前新拨，开始写 create 后不再重试。
+
+**字节透传调用方的契约**：若自己消费帧而不经过上述两层（如网关 relay），看到失败终态必须
+调 `MarkFailed()` 或直接 `Close()` 再收尾，否则连接会被当成干净结束而复用（内置 `sseView`
+已自动标记，所以走 `StreamBody` 的 relay 无需自改）。
 
 **帧不做任何类型判定**：首帧就是普通帧，旧尾帧/未知事件由消费者（聚合器 / relay）自己忽略。
 依据是真实 codex 客户端：它没有首帧白名单、没有 `created` 门槛、没有 `response_id` 归属过滤。
@@ -182,8 +191,9 @@ Authorization token 必须仍一致，取出即独占，不做请求多路复用
 
 空闲 TTL 为 5min，寿命从最初拨号累计 30min，复用不重置寿命；仅清扫缓存中的
 空闲条目，不中断在飞请求。清扫由 `connCache` 自持的维护 ticker（默认 30s）驱动，
-外加 get/put 的惰性清理：不再搭载心跳（主动探测已删除），所以被丢弃的 `HTTPClient`
-的空闲连接也会最迟在 TTL+一个 tick 内退役。
+外加 get/put 的惰性清理：不再搭载心跳（主动探测已删除）。ticker 的生命周期与
+"表里有没有东西"绑定（首次 `put` 惰性启动、表空即停、`Close` 停），不再存在
+"表永远空、ticker 永远转"的残留。
 `CloseIdleConnections()` 清空 WS 缓存里的空闲连接（缓存本身仍可用，之后新建的连接照常复用），
 **并**对底层 `*http.Transport` 断言后清空其空闲池（包装型 transport 断言失败即静默 no-op）；
 `CloseWSIdleConnections()` 只**关闭** WS 缓存（含维护 ticker）、不碰 `*http.Transport`：清空现有 idle，此后取用也

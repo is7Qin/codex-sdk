@@ -576,11 +576,12 @@ func TestWSReleaseWaitsForInFlightNext(t *testing.T) {
 	}
 }
 
-// recordingStream 是 frameStream 桩：记录 Release/Close 各被调了几次。
+// recordingStream 是 frameStream 桩：记录 Release/Close/MarkFailed 各被调了几次。
 type recordingStream struct {
 	frames   [][]byte
 	releases int
 	closes   int
+	failed   int
 }
 
 func (s *recordingStream) Next(context.Context) ([]byte, error) {
@@ -594,6 +595,7 @@ func (s *recordingStream) Next(context.Context) ([]byte, error) {
 
 func (s *recordingStream) Release() bool { s.releases++; return true }
 func (s *recordingStream) Close() error  { s.closes++; return nil }
+func (s *recordingStream) MarkFailed()   { s.failed++ }
 
 // TestSSEViewCloseReleasesOnTerminal（R4b）：已经取出终态帧（terminal=true），
 // 哪怕只读了一部分就 Close，也必须走 Release（连接停在干净帧边界）。
@@ -636,5 +638,29 @@ func TestSSEViewCloseAbandonsWithoutTerminal(t *testing.T) {
 	}
 	if st.closes != 1 || st.releases != 0 {
 		t.Fatalf("releases=%d closes=%d，期望 0/1（非终态必须放弃）", st.releases, st.closes)
+	}
+}
+
+// TestSSEViewMarksFailureTerminal（B1 字节面）：渲染层看到 failed / incomplete 就调
+// MarkFailed——这就是"纯字节透传的调用方不必自己判事件类型"的机制点。
+func TestSSEViewMarksFailureTerminal(t *testing.T) {
+	for _, raw := range []string{wsFailedEv, `{"type":"response.incomplete","response":{"id":"resp_ws","status":"incomplete"}}`} {
+		st := &recordingStream{frames: [][]byte{[]byte(wsCreatedEv), []byte(raw)}}
+		v := newSSEView(context.Background(), st, 0)
+		if _, err := io.ReadAll(v); err != nil {
+			t.Fatalf("读尽 %q: %v", raw, err)
+		}
+		if err := v.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if st.failed != 1 {
+			t.Fatalf("%q: MarkFailed 调用 %d 次，期望 1", raw, st.failed)
+		}
+		if st.releases != 1 { // 仍然走 Release，由真实 exchange 按失败标记拒绝
+			t.Fatalf("%q: releases = %d，期望 1", raw, st.releases)
+		}
+		if st.closes != 0 {
+			t.Fatalf("%q: closes = %d，期望 0（终态帧已读出，不放弃）", raw, st.closes)
+		}
 	}
 }

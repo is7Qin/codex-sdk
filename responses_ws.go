@@ -88,8 +88,11 @@ func (c *HTTPClient) streamBodyWS(ctx context.Context, payload []byte, id Identi
 //
 // 终态一成立就 Release（T5 起）：连接停在干净帧边界，可以交回缓存给同一个
 // HTTPClient 的下一个请求（跨轮同样复用——连接身份不含 ts）。feed 报错但帧本身
-// 是终态时 **照样** Release——连接状态与下游解析失败无关，杀掉它只会让下一个
-// 请求多付一次握手。
+// 是终态时 **照样** Release——回不回得去由帧流自己的失败标记决定，不需要两套判断。
+//
+// 失败终态（response.failed / response.incomplete）先 MarkFailed 再 Release：
+// 这类结束的交换不归还连接（客户端语义：错误即退役）。判定发生在这里——本来就要
+// 读 type 判终态——所以传输层仍然不认识任何事件类型。
 func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, id Identity, feed func(raw []byte) error) error {
 	ex, err := c.openWSExchange(ctx, payload, id, wsResponsesReadLimit)
 	if err != nil {
@@ -107,7 +110,12 @@ func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, id I
 		if nextErr != nil {
 			return fmt.Errorf("codexsdk: 读取响应流失败: %w", nextErr)
 		}
-		term := isTerminalEvent(raw)
+		typ := frameEventType(raw)
+		term := isTerminalType(typ)
+		if isFailureTerminal(typ) {
+			// 失败终态：声明本轮以错误结束 ⇒ Release 一定拒绝归还并终止连接。
+			tap.MarkFailed()
+		}
 		if ferr := feed(raw); ferr != nil {
 			if term {
 				tap.Release()
@@ -121,15 +129,21 @@ func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, id I
 	}
 }
 
-// isTerminalEvent 报告 raw 是否为本次请求的终态事件（completed / failed /
+// isTerminalType 报告顶层 type 是否为本次请求的终态事件（completed / failed /
 // incomplete）。与 sseView 的渲染判定共用同一套零分配 type 扫描与同一组常量，
 // 两条路径不会对"什么算终结"产生分歧；协议解析仍只在这里与 sseView，conn /
 // exchange 的取帧路径不认识事件类型。
-func isTerminalEvent(raw []byte) bool {
-	typ := frameEventType(raw)
+func isTerminalType(typ []byte) bool {
 	return bytesAre(typ, responseEventCompleted) ||
 		bytesAre(typ, responseEventFailed) ||
 		bytesAre(typ, responseEventIncomplete)
+}
+
+// isFailureTerminal 报告顶层 type 是否为"失败终态"（failed / incomplete）：
+// 这类结束的交换**不得**把连接交回缓存（客户端语义：错误即退役）。
+// 注意它只被已经解析事件的那一层调（聚合器 / SSE 视图），不是传输层判定。
+func isFailureTerminal(typ []byte) bool {
+	return bytesAre(typ, responseEventFailed) || bytesAre(typ, responseEventIncomplete)
 }
 
 // wsDialError 把 WS 升级失败翻译成 HTTP 面同形的错误信封：状态码沿用升级

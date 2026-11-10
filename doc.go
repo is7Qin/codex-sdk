@@ -120,9 +120,10 @@
 //     **常驻读者 + 有界队列**：读者除入队临界区外恒在 Read，所以下游再慢也不会
 //     丢失对端控制帧（已无任何心跳探测：与真实 codex 客户端一致，半开连接只能靠
 //     读写错误或调用方 ctx 兜底）；队列饱和（256 帧 / 8MiB，空队列允许单帧超预算）报
-//     ErrWSBackpressure（可归因，非静默截断、非无限缓冲）；终态后可归还缓存，
-//     放弃或归还失败则强断。
-//     StreamBody 由 Body.Close 触发归还；Responses 消费终态后自动归还。
+//     ErrWSBackpressure（可归因，非静默截断、非无限缓冲）；**正常**终态后可归还缓存，
+//     失败终态（failed/incomplete）即退役，放弃或归还失败则强断。
+//     StreamBody 由 Body.Close 触发归还（failed/incomplete 已在渲染层标记，不会归还）；
+//     Responses 消费终态后自动归还。
 //     注意：WithPingInterval 已无效果（纯兼容面）；需要主动探活的调用方自己做。
 //   - WithWSConnCache(n) 开启默认关闭的 WS 连接复用：同一个 HTTPClient 上同一
 //     thread 的连续请求——含跨轮跨窗口——命中后不再付握手（连接身份 =

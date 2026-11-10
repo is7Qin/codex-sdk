@@ -2,9 +2,11 @@ package codexsdk
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -601,4 +603,197 @@ func TestWSConnCacheConcurrentMixed(t *testing.T) {
 	}
 	wg.Wait()
 	hc.CloseIdleConnections()
+}
+
+// ---- B1：失败终态不得归还（客户端语义：错误即退役）----
+
+// cacheIdleCount 读缓存里的空闲条目数（测试直读，不导出）。
+func cacheIdleCount(hc *HTTPClient) int {
+	hc.wsCache.mu.Lock()
+	defer hc.wsCache.mu.Unlock()
+	return len(hc.wsCache.idles)
+}
+
+// TestWSConnFailedTerminalNotCached（B1）：以 `response.failed` 结束的交换，连接
+// **不进缓存**，且下一个请求必须新拨。判定发生在聚合器（本来就知道事件类型），
+// 由 exchange 的 MarkFailed 记录，Release 见到它一律拒绝并终止连接。
+func TestWSConnFailedTerminalNotCached(t *testing.T) {
+	up := newReuseUpstream(t, []string{wsCreatedEv, wsFailedEv})
+	hc := up.client(t, WithWSConnCache(2))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	payload := []byte(`{"model":"gpt-5.6","input":[]}`)
+
+	_, err := hc.Responses(ctx, payload, reuseIdentity())
+	var he *HTTPError
+	if !errors.As(err, &he) || he.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("response.failed 的错误 = %v，期望 *HTTPError{500}", err)
+	}
+	if n := cacheIdleCount(hc); n != 0 {
+		t.Fatalf("失败终态之后缓存仍有 %d 条连接（错误即退役）", n)
+	}
+
+	// 下一个请求必须新拨（失败终态的连接不能复用）。
+	if _, err := hc.Responses(ctx, payload, reuseIdentity()); !errors.As(err, &he) {
+		t.Fatalf("第二次错误 = %v，期望 *HTTPError{500}", err)
+	}
+	if got := up.accepts.Load(); got != 2 {
+		t.Fatalf("accepts = %d，期望 2（失败终态的连接必须退役）", got)
+	}
+}
+
+// TestWSConnIncompleteTerminalNotCached（B1）：`response.incomplete` 同样是失败终态
+// ——聚合器按"事件流截断"报错，连接不得归还。
+func TestWSConnIncompleteTerminalNotCached(t *testing.T) {
+	const incompleteEv = `{"type":"response.incomplete","response":{"id":"resp_ws","status":"incomplete"}}`
+	up := newReuseUpstream(t, []string{wsCreatedEv, incompleteEv})
+	hc := up.client(t, WithWSConnCache(2))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	payload := []byte(`{"model":"gpt-5.6","input":[]}`)
+
+	if _, err := hc.Responses(ctx, payload, reuseIdentity()); err == nil {
+		t.Fatal("response.incomplete 应当报错")
+	}
+	if n := cacheIdleCount(hc); n != 0 {
+		t.Fatalf("incomplete 终态之后缓存仍有 %d 条连接", n)
+	}
+	if _, err := hc.Responses(ctx, payload, reuseIdentity()); err == nil {
+		t.Fatal("第二次 response.incomplete 也应当报错")
+	}
+	if got := up.accepts.Load(); got != 2 {
+		t.Fatalf("accepts = %d，期望 2（incomplete 终态的连接必须退役）", got)
+	}
+}
+
+// TestWSConnCompletedTerminalStillReused（B1 对照组）：正常终态**照旧归还**——
+// 防止"一刀切不归还"把复用的收益打死。
+func TestWSConnCompletedTerminalStillReused(t *testing.T) {
+	up := newReuseUpstream(t)
+	hc := up.client(t, WithWSConnCache(2))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	payload := []byte(`{"model":"gpt-5.6","input":[]}`)
+
+	if _, err := hc.Responses(ctx, payload, reuseIdentity()); err != nil {
+		t.Fatalf("Responses: %v", err)
+	}
+	if n := cacheIdleCount(hc); n != 1 {
+		t.Fatalf("completed 之后缓存 = %d 条，期望 1", n)
+	}
+	if _, err := hc.Responses(ctx, payload, reuseIdentity()); err != nil {
+		t.Fatalf("Responses(第二次): %v", err)
+	}
+	if got := up.accepts.Load(); got != 1 {
+		t.Fatalf("accepts = %d，期望 1（正常终态必须命中复用）", got)
+	}
+}
+
+// TestWSStreamBodyFailedTerminalNotCached（B1 字节透传路径）：网关 relay 走的是
+// `StreamBody` 的原始 SSE 字节——sseView 在渲染时已解析 type，看到 failed 就调
+// MarkFailed，所以调用方只调 `Body.Close()` 也不会让连接被复用。
+func TestWSStreamBodyFailedTerminalNotCached(t *testing.T) {
+	up := newReuseUpstream(t, []string{wsCreatedEv, wsFailedEv})
+	hc := up.client(t, WithWSConnCache(2))
+
+	body := doStreamBody(t, hc)
+	if !strings.Contains(body, `"type":"response.failed"`) {
+		t.Fatalf("SSE 体里没有 failed 帧:\n%s", body)
+	}
+	if n := cacheIdleCount(hc); n != 0 {
+		t.Fatalf("失败终态之后缓存仍有 %d 条连接（字节透传路径也必须退役）", n)
+	}
+	_ = doStreamBody(t, hc) // 第二次：必须新拨
+	if got := up.accepts.Load(); got != 2 {
+		t.Fatalf("accepts = %d，期望 2", got)
+	}
+}
+
+// ---- B2：维护协程的生命周期与"表里有没有东西"绑定 ----
+
+// cacheMaintainRunning 报告缓存当前是否有维护协程在跑（测试直读，不导出）。
+func cacheMaintainRunning(c *connCache) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sweepStop != nil
+}
+
+// TestWSConnCacheMaintainIdleBound（B2）：维护协程惰性启动、表空即停、再 put 可重启、
+// Close 后回落到基线。不这么做的话，未显式 Close 的短命客户端会留下永久 ticker。
+//
+// 用**一个共享**假上游 + 显式关服务器：goroutine 计数才可判（每个 httptest.Server
+// 自身都占 goroutine，多次 NewServer 会把基线搅乱）。
+func TestWSConnCacheMaintainIdleBound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := coderws.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		for { // 只读：连接被客户端终止时退出
+			if _, _, rerr := c.Read(r.Context()); rerr != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	base := runtime.NumGoroutine() // 已含服务器自身的 goroutine（后续对比都在同一基线上）
+	c := newConnCache(2, 5*time.Millisecond)
+
+	// 1) 构造后不 put：不得有维护协程，也不得有 goroutine 增长。
+	time.Sleep(30 * time.Millisecond)
+	if cacheMaintainRunning(c) {
+		t.Fatal("空缓存就起了维护协程")
+	}
+	if n := runtime.NumGoroutine(); n > base {
+		t.Fatalf("空缓存让 goroutine 从 %d 涨到 %d", base, n)
+	}
+
+	// 2) put 一条真连接 ⇒ 惰性启动。
+	dialPumped := func() *conn {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		t.Cleanup(cancel)
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+		wsConn, _, derr := coderws.Dial(ctx, wsURL, nil)
+		if derr != nil {
+			t.Fatalf("拨号测试连接: %v", derr)
+		}
+		return newConn(wsConn, connConfig{mode: modePumped, readLimit: defaultReadLimit}, ctx, cancel)
+	}
+	cn := dialPumped()
+	if !c.put(&wsExchange{cn: cn, token: "t", bornAt: time.Now()}) {
+		t.Fatal("put 失败")
+	}
+	if !cacheMaintainRunning(c) {
+		t.Fatal("put 之后维护协程没有启动")
+	}
+
+	// 3) 到点 sweep 清空 ⇒ 自行停止（不需要任何人调 Close）。
+	c.mu.Lock()
+	c.ttl = time.Millisecond
+	c.mu.Unlock()
+	waitFor(t, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return len(c.idles) == 0 && c.sweepStop == nil
+	})
+	waitFor(t, func() bool { return runtime.NumGoroutine() <= base })
+
+	// 4) 再 put ⇒ 能重启（生命周期是"每次入表一轮"，不是一次性开关）。
+	cn2 := dialPumped()
+	if !c.put(&wsExchange{cn: cn2, token: "t", bornAt: time.Now()}) {
+		t.Fatal("第二次 put 失败")
+	}
+	if !cacheMaintainRunning(c) {
+		t.Fatal("清空后再次 put 没有重启维护协程")
+	}
+
+	// 5) Close 停协程，goroutine 回落基线。
+	c.Close()
+	if cacheMaintainRunning(c) {
+		t.Fatal("Close 之后维护协程仍在")
+	}
+	waitFor(t, func() bool { return runtime.NumGoroutine() <= base })
 }

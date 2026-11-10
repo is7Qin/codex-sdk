@@ -53,6 +53,9 @@ func (t *turnStateTap) Next(ctx context.Context) ([]byte, error) {
 	return raw, nil
 }
 
+// MarkFailed 转发"失败终态"标记（Release 的归还准入，判定由外层做）。
+func (t *turnStateTap) MarkFailed() { t.inner.MarkFailed() }
+
 // Release 转发归还（唯一归还出口）。
 func (t *turnStateTap) Release() bool { return t.inner.Release() }
 

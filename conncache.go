@@ -51,9 +51,9 @@ type connCache struct {
 	closed     bool          // Close 之后 put 拒收（由 Release 终止），idle 已清空
 	idles      []cachedConn
 
-	// stop 关闭维护 ticker（仅 Close）；closeOnce 保证幂等。
-	stop      chan struct{}
-	closeOnce sync.Once
+	// sweepStop 是当前这轮维护的停止信号（nil = 没有维护协程在跑）。
+	// 生命周期与"表里有没有东西"绑定：非空才跑、空即停（见 syncMaintainLocked）。
+	sweepStop chan struct{}
 
 	// hits/misses 只服务 bench 与测试（不导出）：hit 仅在连接真的被移交
 	// （unfence 通过）时计；misses 覆盖“候选被 drop 后重拨”与“根本没找到候选”。
@@ -62,7 +62,9 @@ type connCache struct {
 	misses atomic.Int64
 }
 
-// newConnCache 构造空闲表并启动它自己的维护 ticker。
+// newConnCache 构造空闲表。**不启动任何 goroutine**：维护 ticker 惰性启动，只在
+// 表非空时运行（见 syncMaintainLocked）。这样不用显式 Close 的短命客户端不会
+// 留下"表永远空、ticker 永远转"的残留。
 //
 // sweepEvery ≤ 0 ⇒ defaultConnSweepInterval。ticker 由缓存持有（而不是挂在连接上）：
 // 连接不该知道缓存存在，也不该为缓存开定时器。
@@ -75,15 +77,12 @@ func newConnCache(capacity int, sweepEvery time.Duration) *connCache {
 	if sweepEvery <= 0 {
 		sweepEvery = defaultConnSweepInterval
 	}
-	c := &connCache{
+	return &connCache{
 		cap:        capacity,
 		ttl:        defaultConnIdleTTL,
 		maxAge:     defaultConnMaxAge,
 		sweepEvery: sweepEvery,
-		stop:       make(chan struct{}),
 	}
-	go c.maintain()
-	return c
 }
 
 // newConnCacheIf 按容量决定是否开启复用：n≤0 返回 nil（零行为变化）。
@@ -98,18 +97,48 @@ func newConnCacheIf(n int, sweepEvery time.Duration) *connCache {
 // **不做任何探测**——主动心跳已删除（对齐真实 codex 客户端）。空闲连接的死活由
 // 常驻读者（readLoop）与取用前的 releasable 复查发现，不靠本地 ping。
 //
-// 只有 Close 会停它；clear（CloseIdleConnections）不清 ticker——缓存仍可复用。
-func (c *connCache) maintain() {
+// stop 由 syncMaintainLocked 在"表变空"或 Close 时关闭；关掉后本 goroutine 在
+// 最多一个 tick 内退出（select 同时监听 stop，不必等 ticker）。
+func (c *connCache) maintain(stop <-chan struct{}) {
 	t := time.NewTicker(c.sweepEvery)
 	defer t.Stop()
 	for {
 		select {
-		case <-c.stop:
+		case <-stop:
 			return
 		case now := <-t.C:
 			c.sweep(now)
 		}
 	}
+}
+
+// syncMaintainLocked 让维护协程的生命周期与"表里有没有东西"绑定（调用方持锁）：
+// 空表（或已 Close）就停，非空就启。重复调用幂等；再 put 时自然重启。
+func (c *connCache) syncMaintainLocked() {
+	if c.closed || len(c.idles) == 0 {
+		c.stopMaintainLocked()
+		return
+	}
+	c.startMaintainLocked()
+}
+
+// startMaintainLocked 在尚无维护协程时启动一轮（调用方持锁）。
+func (c *connCache) startMaintainLocked() {
+	if c.sweepStop != nil || c.closed {
+		return
+	}
+	stop := make(chan struct{})
+	c.sweepStop = stop
+	go c.maintain(stop)
+}
+
+// stopMaintainLocked 停掉当前这轮维护（幂等；调用方持锁）。
+func (c *connCache) stopMaintainLocked() {
+	if c.sweepStop == nil {
+		return
+	}
+	close(c.sweepStop)
+	c.sweepStop = nil
 }
 
 // expired 报告条目是否已过 TTL 或超过寿命上限（调用方持锁）。
@@ -121,7 +150,7 @@ func (c *connCache) expired(cc cachedConn, now time.Time) bool {
 //
 // 这是**唯一**的退役入口：判定与摘除在同一把锁内完成，所以被 get 摘走的连接
 // 它再也看不到——不可能误杀一个正在跑的请求。它只由 connCache.maintain 周期调
-// （外加 get/put 的惰性清理与测试直调），幂等。
+// （外加 get/put 的惰性清理与测试直调），幂等。摘空之后本轮维护自行停止。
 func (c *connCache) sweep(now time.Time) {
 	var dead []*conn
 	c.mu.Lock()
@@ -134,6 +163,7 @@ func (c *connCache) sweep(now time.Time) {
 		kept = append(kept, cc)
 	}
 	c.idles = kept
+	c.syncMaintainLocked()
 	c.mu.Unlock()
 	for _, cn := range dead {
 		cn.terminate(errConnExpired)
@@ -176,6 +206,7 @@ func (c *connCache) get(key connKey, token string) (*cachedConn, bool) {
 		}
 	}
 	c.idles = kept
+	c.syncMaintainLocked()
 	c.mu.Unlock()
 	for _, cn := range dead {
 		cn.terminate(io.EOF)
@@ -224,6 +255,7 @@ func (c *connCache) put(e *wsExchange) bool {
 		idleSince: now,
 		bornAt:    e.bornAt, // 不重置
 	})
+	c.syncMaintainLocked() // 表从空变非空 ⇒ 惰性启动维护
 	c.mu.Unlock()
 	for _, cn := range dead {
 		cn.terminate(io.EOF)
@@ -251,22 +283,19 @@ func (c *connCache) RetireThread(threadKey string) {
 		kept = append(kept, cc)
 	}
 	c.idles = kept
+	c.syncMaintainLocked()
 	c.mu.Unlock()
 	for _, cn := range dead {
 		cn.terminate(io.EOF)
 	}
 }
 
-// Close 关闭缓存：停维护 ticker + 置 closed（此后 put 返回 false，由 Release 终止
-// 归还中的连接）+ 清空并终止全部 idle。幂等；Close 之后 RetireThread 为 no-op。
-//
-// 这是**唯一**停 ticker 的地方：clear（CloseIdleConnections）只清空 idle，缓存本身
-// 仍可用，维护节拍必须跟着继续跑。
+// Close 关闭缓存：置 closed + 停维护协程 + 清空并终止全部 idle。
+// 幂等；Close 之后 RetireThread 为 no-op、put 一律拒收。
 func (c *connCache) Close() {
 	if c == nil {
 		return
 	}
-	c.closeOnce.Do(func() { close(c.stop) })
 	c.dropIdle(true)
 }
 
@@ -274,7 +303,8 @@ func (c *connCache) Close() {
 // 仍可正常复用。
 func (c *connCache) clear() { c.dropIdle(false) }
 
-// dropIdle 是 Close / clear 的共同实现：锁内摘表、锁外 terminate。
+// dropIdle 是 Close / clear 的共同实现：锁内摘表并停维护协程、锁外 terminate。
+// 两者都会让表变空，而维护协程的生命周期就绑在"表非空"上。
 func (c *connCache) dropIdle(markClosed bool) {
 	if c == nil {
 		return
@@ -285,6 +315,7 @@ func (c *connCache) dropIdle(markClosed bool) {
 	}
 	idles := c.idles
 	c.idles = nil
+	c.syncMaintainLocked()
 	c.mu.Unlock()
 	for _, cc := range idles {
 		cc.cn.terminate(io.EOF)

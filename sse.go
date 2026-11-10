@@ -51,14 +51,18 @@ const sseViewPrefixCap = 128
 //     （不再序列化：字段名集合与顺序与上游逐字节一致）；
 //   - `response.completed` → 本帧后补 `data: [DONE]\n\n` 并结束；
 //   - `response.failed` / `response.incomplete` → 作为**帧**透传后结束（不补
-//     [DONE]：失败终态不该被读成"正常收尾"）；
+//     [DONE]：失败终态不该被读成"正常收尾"），同时调 `frameStream.MarkFailed()`
+//     ——失败结束的交换不得把连接交回缓存（客户端语义：错误即退役）。
+//     这就是"网关 relay 纯字节透传也不必自己标记"的原因：判定发生在渲染层，
+//     本来就已解析 `type`；传输层仍然不做任何帧类型判定；
 //   - 其余帧（含 `type:"error"`——**不分** created 前后）原样透传继续读：
 //     HTTP 臂的 200 流里 in-band error 也是普通帧，由下游按终态事件判定；
 //   - 无 type 的帧只出 data 行（不写空的 `event:` 名）。
 //
 // 终态即提交：终态帧一旦从流里取出，本视图就不再取帧（吐完三段后 EOF），此后
 // 的取消与超时不会改写已交付的结果；帧自身的事件语义（failed / incomplete）
-// 仍由下游聚合器解释。
+// 仍由下游聚合器解释。归还准入只分两类：completed = 可归还；failed / incomplete
+// = 已标记失败，Release 自动失败并终止连接。
 //
 // 消费者只剩 StreamBody 的 ws 臂（需要"原始 SSE 字节"的外部调用方）；
 // HTTPClient.Responses 自 T3 起直接从 wsExchange 取帧聚合，不再经过本视图。
@@ -136,12 +140,14 @@ func (v *sseView) Read(p []byte) (int, error) {
 
 // Close 收尾上游（幂等）。
 //
-//   - 已取出终态帧（`v.terminal`）⇒ **Release**：帧已整帧读出 socket，连接停在
-//     干净边界，可以交回缓存（这正是复用能生效的唯一出口）；
+//   - 已取出**正常**终态帧（`v.terminal` 且未标记失败）⇒ **Release**：帧已整帧
+//     读出 socket，连接停在干净边界，可以交回缓存（这正是复用能生效的唯一出口）；
+//   - 已取出**失败**终态（load 已调 MarkFailed）⇒ 仍走 Release 调用，但内层一定
+//     拒绝并终止连接（调用方不必自己判事件类型）；
 //   - 其余情况 ⇒ Close：本次请求被放弃，连接不能留给下一个请求。
 //
 // 判据只看 `v.terminal`——本方法自己会把 `v.err` 改成 io.EOF，用 err 判断会把
-// "正常读完"与"中途放弃"混为一谈。
+// "正常读完"与"中途放弃"混为一谈。"能不能归还"由帧流自己的失败标记决定。
 func (v *sseView) Close() error {
 	v.done = true
 	if v.err == nil {
@@ -177,7 +183,8 @@ func (v *sseView) load() error {
 		v.segs[sseSegSuffix] = sseSuffixDone // 正常终态：本帧后补 [DONE]
 		v.terminal = true
 	case bytesAre(typ, responseEventFailed), bytesAre(typ, responseEventIncomplete):
-		v.terminal = true // 失败终态：帧照原样透传，不补 [DONE]
+		v.terminal = true     // 失败终态：帧照原样透传，不补 [DONE]
+		v.stream.MarkFailed() // 错误即退役：这条连接不得交回缓存（客户端语义）
 	}
 	v.seg = sseSegPrefix
 	return nil

@@ -17,10 +17,23 @@ import (
 type frameStream interface {
 	// Next 交付下一帧；流结束后返回 EOF 或终止原因。
 	Next(ctx context.Context) ([]byte, error)
+	// MarkFailed 声明"本轮以**失败终态**结束"（response.failed /
+	// response.incomplete）：此后 Release **不再归还**连接，改为终止它。
+	//
+	// 为什么要这个显式标记：传输层不做帧类型判定（那已删掉），但"以错误结束的
+	// 交换不把 socket 放回"是真实客户端的明确语义（错误即退役）。因此判定发生在
+	// **已经解析事件的地方**（聚合器 / SSE 视图），由它们调本方法。
+	//
+	// 契约（给纯字节透传的调用方，例如网关 relay）：**看到失败终态必须先调
+	// MarkFailed()（或直接 Close()）再收尾**，否则连接会被当成干净结束而复用。
+	// 内置的 sseView 与 responsesStreamWS 已在看到 failed/incomplete 时自动标记。
+	MarkFailed()
 	// Release 读到终态后尝试把连接交回缓存（T5 起）。true = 已交回，
 	// false = 未交回（连接已终止或将被终止）。没有缓存时恒 false。
+	// 本轮已 MarkFailed 的连接**永不**交回（返回 false 并终止）。
 	Release() bool
 	// Close 放弃本次请求（幂等；Release 之后为 no-op）。
+	// 看到失败终态时调它同样安全：连接一律不以可复用状态返回。
 	Close() error
 }
 
@@ -80,6 +93,9 @@ type wsExchange struct {
 
 	// closed 是 Release/Close 的先到者仲裁（CAS）：抢到的一方才做收尾。
 	closed atomic.Bool
+	// failed 标记"本轮以失败终态结束"（由已解析事件的那一层调 MarkFailed）。
+	// 它是**归还准入**的一部分，不是协议判定：传输层从不自己置位。
+	failed atomic.Bool
 }
 
 // beginFinish 抢本次 exchange 的收尾权。true = 抢到（调用方必须自己收尾）。
@@ -304,14 +320,26 @@ func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
 	return nil, err
 }
 
+// MarkFailed 标记本轮以失败终态结束（response.failed / response.incomplete）。
+// 幂等；一旦置位，Release 必定拒绝归还并终止连接。
+func (e *wsExchange) MarkFailed() { e.failed.Store(true) }
+
 // Release 尝试把连接交回缓存。true = 已交回（调用方随后什么都不用做）；
 // false = 未交回（连接已终止，或取消回调已接手）。
 //
-// 归还判定是四步合取：租约 CAS 成功 → 连接可用 → 队列空（置栏）→ 缓存收下。
-// 任何一步失败都终止连接——绝不允许"报成功但没进表"。
+// 归还判定是**五步合取**：租约 CAS 成功 → **本轮不是失败终态** → 连接可用 →
+// 队列空（置栏）→ 缓存收下。任何一步失败都终止连接——绝不允许"报成功但没进表"。
+//
+// 为什么要"不是失败终态"这一步：真实客户端在错误路径上直接丢 socket（R:388–396
+// 不放回），只有正常完成才归还。SDK 不在传输层判帧类型，而是由**已经解析事件的
+// 那一层**（聚合器 / SSE 视图）在看到 failed / incomplete 时调 MarkFailed——
+// 那个位置本来就知道事件类型，不违反"传输层不做协议判定"。
+//
+// 纯字节透传的调用方（如网关 relay）若自己消费帧而不经过上述两层，看到失败终态
+// 必须调 MarkFailed() 或直接 Close()，否则连接会被当成干净结束而复用。
 //
 // 这条"不干净不归还"是复用的全部安全性来源（客户端也一样：错误/早退的 socket
-// 直接丢，不放回）。它不靠帧级判定，所以不要为了"更安全"再往这里加逐帧检查。
+// 直接丢，不放回）。它不靠逐帧归属判定，所以不要为了"更安全"再往这里加逐帧检查。
 func (e *wsExchange) Release() bool {
 	if !e.beginFinish() {
 		return false
@@ -327,7 +355,7 @@ func (e *wsExchange) Release() bool {
 	if !e.cn.lease.CompareAndSwap(e, nil) {
 		return false // 取消回调已接手终止
 	}
-	if e.sink == nil || !e.cn.releasable() || !e.cn.inbox.fence() || !e.sink.put(e) {
+	if e.sink == nil || e.failed.Load() || !e.cn.releasable() || !e.cn.inbox.fence() || !e.sink.put(e) {
 		e.cn.terminate(io.EOF)
 		return false
 	}
@@ -336,6 +364,7 @@ func (e *wsExchange) Release() bool {
 
 // Close 放弃本次 exchange（幂等）：收尾一律强断，pumped 模式不做关闭握手。
 // Release 之后的 Close 是 no-op（连接已经交出去了，不能再杀）。
+// 看到失败终态时调它同样安全（且无需先 MarkFailed）：连接一定不会被复用。
 func (e *wsExchange) Close() error {
 	e.teardown(io.EOF)
 	return nil
