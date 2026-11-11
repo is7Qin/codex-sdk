@@ -54,7 +54,48 @@ func WithResponsesTransport(t Transport) Option
 不作用于它（只用于公开 `Dial`），所以这里**没有**“无限上界”形态。
 
 `pop` 的顺序是契约：① ctx 已结束 → 立即返回 ctx 错误（不 pop）；② 有帧 → 交付
-（不再查 ctx）；③ 已关闭且空 → 返回终止 cause；④ 等 `notify` / ctx。
+（不再查 ctx）；③ 已关闭且空 → 返回终止 cause；④ 等 `notify` / ctx；
+⑤ 有 idle 预算时再加一个"本次等待"的期限（见下节）。
+
+### 读空闲上限（idle read timeout）
+
+给"等一帧"加预算，**不是**请求总超时，也不是"socket 多久没字节"。
+
+- 默认 **300s**（对齐真实客户端 `DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000`），
+  `WithWSIdleTimeout(d)` 可配，`d<=0` = 关闭（显式 opt-out）。默认**开**。
+- **计时单位 = 一次消费侧取帧等待**：
+  - pumped：`wsExchange.Next` 里队列为空、`pop` 真正阻塞的那一段（deadline 是
+    `pop` 的局部变量，只在第一次阻塞时初始化）。队列里已有帧 ⇒ 立即交付、
+    不消耗预算；连接躺在缓存里、或消费者还没请求下一帧 ⇒ **没有计时器在跑**。
+  - pull：一次 `Client.Recv` 调用的持续时间。
+  - 因此慢消费者不会被杀，终态排队也不会失去归还资格；`Ping`/`Pong`、写帧、
+    心跳都不续命也不重置（控制帧由 coder 在 `Read` 内就地消化，不产生队列投递）。
+- 超时 ⇒ `ErrWSIdleTimeout`（独立哨兵，**不**包装 `context.DeadlineExceeded`，
+  否则续接 ACK 的 `errors.Is(err, context.DeadlineExceeded)` 判定会误命中）+
+  **经所有权裁决**（`beginFinish` + `lease.CompareAndSwap`，与 `Release` 同一
+  收尾序）退役该连接 + **不重试**（不重拨、不重发 `create`）。
+- 收尾顺序与 `teardown` 有意不同：`stopWatch → 租约 CAS → cancel → terminate`。
+  否则取消守卫的 `AfterFunc` 会在 `cancel` 当下抢走 CAS，把终止原因写成
+  `context.Canceled`，把"空闲超时"洗成"调用方取消"（`finish` 首因胜）。
+- 两条读路径都覆盖：pumped（`StreamBody`/`Responses` 的 WS 臂）与 pull
+  （`Dial → Client.Recv`）。**pull 是本地契约变更**：
+
+  ```
+  Client.Recv: 无期限读 socket  →  每次调用有上限（默认 300s）
+  一次调用内没有完整数据消息 ⇒ ErrWSIdleTimeout + 关闭该连接
+  ```
+
+  `Client.Closed()` 语义不变（仍只表示本地 `Close/CloseNow`）；不调用 `Recv`
+  时没有计时器，所以不保证诊断半开连接。网关 relay 的读循环跨轮常驻 ⇒
+  **轮间静默超过预算会关闭整条 WS 会话**（客户端收到上游错误关闭），这是接受的
+  代价。`WithWSIdleTimeout(0)` 是精确回滚。
+- 计时只用 `time.Timer`：pumped 每个 exchange 懒建 1 个、全部等待复用它
+  （`resetTimer`，Go ≥1.23 语义）：已在队帧 0 新增分配；没有每连接看门狗 goroutine
+  （那个设计被否：观察 deadline ≠ 终止权，见"被否方案"）。
+- 被否方案：把期限挂到 `conn.readFrame`（socket 计时 ⇒ 慢消费者/排队终态被误杀）；
+  每次 `readFrame` 派生 `context.WithDeadline`（每帧 1 timer + 1 ctx）；把预算塞进
+  `exchangeCtx`（退化成请求总超时，错误类型也会被翻成 `DeadlineExceeded`）；
+  连接级 `atomic` deadline 复核后 terminate（复核与 terminate 之间仍有窗口）。
 
 ### 终止（无心跳）
 
@@ -229,6 +270,13 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   纯拉**：对端 ping / pong 等控制帧只在有 Read 在飞时才被服务，纯拉模型下
   下游一慢就无人应答——那是只属于 WS 臂的截断源。队列饱和 ⇒ `ErrWSBackpressure`
   （快速失败；单帧大于字节闸但队列为空时照常通过）。
+- **读空闲上限对 pull 是契约变更（默认开）**：`Client.Recv` 由"无期限读 socket"
+  变为"每次调用有 300s（`WithWSIdleTimeout` 可配）上限"——一次调用内没有完整数据
+  消息就返回 `ErrWSIdleTimeout` 并**关闭该连接**。跨轮常驻的读循环（网关 relay）
+  因此会在**轮间静默超过预算**时关掉整条会话；`Closed()` 语义不变（仍只表示本地
+  `Close/CloseNow`），不调用 `Recv` 时没有计时器。
+  **运维限制**：模板 ext 目前还不能调这个值（与 `responsesWSFirstFrameTimeout`
+  同状态），今天只能改 SDK option 或代码；精确回滚用 `WithWSIdleTimeout(0)`。
 - **无主动心跳的作用面**：没有本地探针 ⇒ 半开连接不会被本地判死（客户端也如此）；
   存活只能靠读写错误、对端 close、或调用方 ctx / 自行 `Client.Ping` 兜底。
   这是对齐客户端后接受的代价，不是遗漏。
@@ -255,6 +303,9 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   `client_metadata`。
   `WithTimeout` 现在**对 WS 臂生效**：`>0` 时设在请求 exchange 的 ctx 上，
   覆盖请求使用期，含拨号/升级（T5 起）；`=0` 时沿用调用方的取消与 deadline。
+  两者是**独立预算**，不承诺墙钟严格"先到"：同时就绪时调用方 ctx 优先
+  （沿用取帧的既有次序）。`WithTimeout` 会按墙钟砍断长流，**不能**当 idle 用。
+  `WithWSIdleTimeout` 只作用于"等一帧"（默认 300s；`<=0` 关闭）。
   `WithMaxLineSize` 仍只作用于 HTTP SSE 行扫描。
 - **单消费者**：`Client.Recv` 与 `wsExchange.Next` 都不支持并发调用（未定义）；
   写与 ping 由内核写闸串行化。

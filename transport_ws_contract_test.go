@@ -464,7 +464,7 @@ func TestWSTerminateDrainsQueue(t *testing.T) {
 
 	ctx := context.Background()
 	for i, want := range frames {
-		got, err := cn.inbox.pop(ctx)
+		got, err := cn.inbox.pop(ctx, 0, nil)
 		if err != nil {
 			t.Fatalf("第 %d 帧: %v（终止后应先排空队列）", i, err)
 		}
@@ -472,7 +472,7 @@ func TestWSTerminateDrainsQueue(t *testing.T) {
 			t.Fatalf("第 %d 帧 = %s，想要 %s", i, got, want)
 		}
 	}
-	if _, err := cn.inbox.pop(ctx); !errors.Is(err, cause) {
+	if _, err := cn.inbox.pop(ctx, 0, nil); !errors.Is(err, cause) {
 		t.Fatalf("排空后错误 = %v，想要终止 cause", err)
 	}
 }
@@ -514,7 +514,7 @@ func TestWSQueueFramesBudget(t *testing.T) {
 				t.Fatalf("push: %v", err)
 			}
 		}
-		if _, err := q.pop(context.Background()); err != nil {
+		if _, err := q.pop(context.Background(), 0, nil); err != nil {
 			t.Fatalf("pop: %v", err)
 		}
 		if err := q.push([]byte(deltaFrame(7))); err != nil {
@@ -546,8 +546,8 @@ func TestWSFirstCauseWins(t *testing.T) {
 	wg.Wait()
 
 	ctx := context.Background()
-	_, first := cn.inbox.pop(ctx)
-	_, second := cn.inbox.pop(ctx)
+	_, first := cn.inbox.pop(ctx, 0, nil)
+	_, second := cn.inbox.pop(ctx, 0, nil)
 	if !errors.Is(first, causeA) && !errors.Is(first, causeB) {
 		t.Fatalf("终止原因 = %v，想要 a 或 b", first)
 	}
@@ -882,7 +882,7 @@ func TestWSInboxCloseWakesWaiter(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := q.pop(context.Background())
+		_, err := q.pop(context.Background(), 0, nil)
 		done <- err
 	}()
 	time.Sleep(50 * time.Millisecond) // 让 pop 真正进入等待

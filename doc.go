@@ -125,6 +125,16 @@
 //     StreamBody 由 Body.Close 触发归还（failed/incomplete 已在渲染层标记，不会归还）；
 //     Responses 消费终态后自动归还。
 //     注意：WithPingInterval 已无效果（纯兼容面）；需要主动探活的调用方自己做。
+//   - **读空闲上限（idle read timeout，默认 300s）**：计时单位是"一次消费侧取帧
+//     等待"，不是"socket 多久没字节"——pumped 挂在 wsExchange.Next 里队列为空、真正
+//     阻塞的那一段（队列有帧 ⇒ 立即交付、不计时；连接在缓存里或消费者没在等帧 ⇒
+//     无计时器），pull 挂在一次 Client.Recv 上。超时 ⇒ ErrWSIdleTimeout + 经
+//     beginFinish/租约 CAS 裁决后退役（不归还、不重试、不重拨）。Ping/Pong、写帧
+//     都不续命；计时只用复用的 *time.Timer（每 exchange 至多 1 个，无看门狗
+//     goroutine）。WithWSIdleTimeout(d) 可配，d<=0 关闭。
+//     **pull 契约变更**：Client.Recv 由"无期限读 socket"变为"每次调用有上限"——
+//     一次调用内无完整数据消息就关闭该连接；网关 relay 的读循环跨轮常驻 ⇒ 轮间
+//     静默超过预算会关闭整条 WS 会话（Closed() 语义不变，仍只表示本地 Close）。
 //   - WithWSConnCache(n) 开启默认关闭的 WS 连接复用：同一个 HTTPClient 上同一
 //     thread 的连续请求——含跨轮跨窗口——命中后不再付握手（连接身份 =
 //     (threadKey, readLimit)）；匿名（Identity{}）不参与复用。线程退休走

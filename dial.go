@@ -157,6 +157,9 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 		readLimit:   spec.readLimit,
 		queueFrames: defaultQueueFrames,
 		queueBytes:  defaultQueueBytes,
+		// 读空闲上限对两条读路径都生效（pumped 走 exchange.idle，pull 走 Recv），
+		// 值来自同一个 options 字段 ⇒ Dial 与 NewHTTPClient 自动一致。
+		idleTimeout: spec.opts.wsIdleTimeout,
 	}
 	return newConn(wsConn, cfg, connCtx, stop), hs, nil
 }

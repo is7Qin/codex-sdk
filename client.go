@@ -25,6 +25,10 @@ const (
 	defaultPingInterval = 30 * time.Second
 	// defaultCompressionThreshold 压缩开启时仅压缩超过该大小的消息。
 	defaultCompressionThreshold = 512
+	// defaultWSIdleTimeout 是 WS 读空闲上限的默认值：对齐真实客户端的
+	// DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000（5 分钟）。**默认开**——如果默认关，
+	// "上游收下 create 却永不回帧"的会话就会在消费侧永久挂住（现场症状）。
+	defaultWSIdleTimeout = 300 * time.Second
 )
 
 // StatusCode 是 WebSocket 关闭码（透传 coder/websocket.StatusCode），
@@ -128,6 +132,9 @@ type options struct {
 	// wsSweepInterval 是空闲表维护 ticker 的节拍（0 = defaultConnSweepInterval）。
 	// 包内私有（测试 seam）：它只控制 sweep 频率，不影响任何探测行为（已无探测）。
 	wsSweepInterval time.Duration
+	// wsIdleTimeout 是一次"消费侧取帧等待"的预算（默认 300s；<=0 = 关闭）。
+	// 它**不是**请求总超时：与 WithTimeout 互不影响，也不进 exchangeCtx。
+	wsIdleTimeout time.Duration
 }
 
 func defaultOptions() options {
@@ -141,6 +148,8 @@ func defaultOptions() options {
 		maxLineSize:  defaultMaxLineSize,
 
 		keepaliveInterval: defaultKeepaliveInterval,
+
+		wsIdleTimeout: defaultWSIdleTimeout, // 读空闲上限默认开（显式 opt-out 见 WithWSIdleTimeout）
 	}
 }
 
@@ -262,6 +271,27 @@ func WithTimeout(d time.Duration) Option {
 	return func(o *options) { o.timeout = d }
 }
 
+// WithWSIdleTimeout 设置 WS 读空闲上限（默认 300s，对齐真实客户端的
+// DEFAULT_STREAM_IDLE_TIMEOUT_MS；d<=0 = 关闭，显式 opt-out）。
+//
+// 它是"**等一帧**"的预算，不是请求总超时：计时单位是一次消费侧取帧等待
+// （pumped：wsExchange.Next 里队列为空、真正阻塞的那段；pull：一次 Client.Recv）。
+// 队里已有帧 ⇒ 立即交付、不消耗预算；连接躺在缓存里、或消费者没在等帧时
+// 没有计时器在跑。与 WithTimeout 互不影响——后者只作用于 HTTP 客户端的请求，
+// 且 >0 会按墙钟砍断长流，不能当 idle 用。
+//
+// 超时 ⇒ 返回可 `errors.Is(err, ErrWSIdleTimeout)` 的错误，连接经所有权裁决后
+// 退役（不可归还、不可复用），**不重试**（不重拨、不重发 create）。
+//
+// 两条读路径都覆盖：pumped（StreamBody/Responses 的 WS 臂）与 pull
+// （Dial → Client.Recv）。**pull 的契约变更**：`Recv` 由"无期限读 socket"变为
+// "每次调用有上限"——一次调用内没有完整数据消息就会关闭该连接；网关 relay 的读
+// 循环跨轮常驻，因此**轮间静默超过预算会关闭整条 WS 会话**。长驻留场景若要保留
+// 旧行为，用本选项显式传 0。
+func WithWSIdleTimeout(d time.Duration) Option {
+	return func(o *options) { o.wsIdleTimeout = d }
+}
+
 // WithMaxLineSize 设置 HTTP SSE 单行上限（默认 16MiB）。
 func WithMaxLineSize(n int) Option {
 	return func(o *options) { o.maxLineSize = n }
@@ -292,7 +322,9 @@ func withConnSweepInterval(d time.Duration) Option {
 //   - pong 由调用方的常驻 Recv 循环处理（coder/websocket：Ping 必须与 Reader
 //     并发，否则等不到 pong）。网关透传编排天然常驻 Recv 循环，满足该前提；
 //   - Recv 的 ctx 不是"可取消的一次取帧"：按 coder 语义，取消会**关闭连接**
-//     并返回 ctx 错误。
+//     并返回 ctx 错误；
+//   - 每次 Recv 有读空闲上限（默认 300s，WithWSIdleTimeout 可配）：一次调用内
+//     无完整数据消息 ⇒ ErrWSIdleTimeout 并关闭连接（**契约变更**，见 Recv 注释）。
 //
 // 心跳：**没有主动探测**（对齐真实 codex 客户端）。连接只在对端发 Ping 时就地
 // 回 Pong，这个服务由编码器/解码器（coder）在读循环里完成，不依赖调用方读频率
@@ -384,10 +416,36 @@ func (c *Client) encodeFrame(frame []byte) ([]byte, error) {
 // 独立分配的缓冲，跨次调用有效。对端关闭/网络断开/超 ReadLimit 时返回错误
 // （如 coder/websocket.CloseError、ErrMessageTooBig，网关自行分类处置）。
 //
+// **读空闲上限（契约变更，默认 300s，WithWSIdleTimeout 可配）**：一次 Recv 调用
+// 内没有收到任何完整数据消息（一次 Read 返回）⇒ 返回可
+// `errors.Is(err, ErrWSIdleTimeout)` 的错误，并**关闭该连接**（不可复用；后续调用
+// 失败）。计时范围就是"本次调用的持续时间"——没有 Recv 在飞时没有任何计时器，
+// 所以它不保证诊断半开连接；而跨轮常驻的读循环（如网关 relay）在轮间静默超过
+// 预算时会关掉整条 WS 会话。`WithWSIdleTimeout(0)` 恢复"无期限读 socket"。
+//
+// 父 ctx 的取消/期限优先：那种情况原样返回 ctx 错误，不算 idle 超时。
+//
 // 注意：ctx 取消按 coder 语义**关闭连接**并返回 ctx 错误——它不是"只影响本次
 // 取帧"的开关。
 func (c *Client) Recv(ctx context.Context) ([]byte, error) {
-	return c.cn.readFrame(ctx)
+	budget := c.cn.cfg.idleTimeout
+	if budget <= 0 {
+		return c.cn.readFrame(ctx) // 既有行为（显式 opt-out）
+	}
+	rctx, cancel := context.WithDeadline(ctx, time.Now().Add(budget))
+	defer cancel()
+	data, err := c.cn.readFrame(rctx)
+	if err == nil {
+		return data, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err() // 调用方取消/父 deadline：原样（显式，不靠编译器）
+	}
+	if errors.Is(rctx.Err(), context.DeadlineExceeded) {
+		c.cn.terminate(ErrWSIdleTimeout) // 退役：不可复用；后续调用失败
+		return nil, fmt.Errorf("%w（%s 内未收到任何帧）", ErrWSIdleTimeout, budget)
+	}
+	return nil, err
 }
 
 // Ping 发送 WS 层 ping 并等待 pong（对端库自动回 pong；ctx 控制等待上限）。

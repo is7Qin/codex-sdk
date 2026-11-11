@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	coderws "github.com/coder/websocket"
 )
@@ -39,10 +40,26 @@ var ErrWSBackpressure = errors.New("codexsdk: ws 入站队列饱和（消费者�
 // Deprecated: 不再产生；判活改用读写错误 / 调用方 ctx / releasable 复查。
 var ErrKeepaliveTimeout = errors.New("codexsdk: ws 心跳探测超预算")
 
+// ErrWSIdleTimeout 是 WS 读空闲超时：一次取帧等待的预算内没有收到任何完整数据
+// 消息（Text/Binary 帧）。
+//
+// 它是**传输层错误**，不是协议终态：触发即经所有权裁决退役该连接（不归还缓存、
+// 不可复用）、**不重试**（不重拨、不重发 create）。计时单位是"一次消费侧取帧等
+// 待"（pumped：一次 `Next` 内的阻塞等待；pull：一次 `Recv`），不是"底层 socket
+// 多久没字节"——队里已有帧时立即交付、不消耗预算。
+//
+// 错误链口径：**不**包装 context.DeadlineExceeded（调用方按 DeadlineExceeded 判
+// 续接 ACK 窗口的地方不能误命中），也**不**实现 net.Error / Timeout()。
+var ErrWSIdleTimeout = errors.New("codexsdk: ws 读空闲超时（预算内未收到任何帧）")
+
 // 内核内部错误。
 var (
 	// errConnClosing 关闭进行中拒绝写/公开 Ping。
 	errConnClosing = errors.New("codexsdk: ws 连接正在关闭")
+	// errIdleWait 是 frameInbox.pop 的包内哨兵：本次等待已用尽预算。
+	// **只表示"超了"**，不在这里退役连接——裁决在 wsExchange.idleExpire
+	// （beginFinish + 租约 CAS）。不外泄给调用方。
+	errIdleWait = errors.New("codexsdk: ws 读等待超时")
 	// errGracefulCloseUnsupported pumped 模式调 closeGracefully：属实现错误。
 	errGracefulCloseUnsupported = errors.New("codexsdk: ws 传输臂不支持关闭握手")
 	// errIdleFrame 已归还、未被取用的连接收到帧：上游违约（空闲期不该有帧）。
@@ -87,6 +104,10 @@ type connConfig struct {
 	readLimit   int64 // 单帧上限；-1 = 不限
 	queueFrames int   // pumped 帧数闸
 	queueBytes  int   // pumped 字节闸
+	// idleTimeout 是一次"消费侧取帧等待"的预算（pumped：pop 真正阻塞时起算；
+	// pull：一次 Recv）。<=0 = 关闭（显式 opt-out）。它**不**给 socket 读点任
+	// 何期限：readLoop / readFrame 与它无关。
+	idleTimeout time.Duration
 }
 
 // conn 是"一条连接 = 一个 socket 读点 + 一个写闸 + 一个终止入口"的内核。
@@ -482,8 +503,16 @@ func (q *frameInbox) tryPop() ([]byte, bool) {
 //  1. ctx 已结束 → 立即返回 ctx 错误（本次不 pop）；
 //  2. 有帧 → 交付（不再查 ctx）；
 //  3. 已关闭且空 → 返回终止 cause；
-//  4. 否则等 notify / ctx.Done()。
-func (q *frameInbox) pop(ctx context.Context) ([]byte, error) {
+//  4. 否则等 notify / ctx.Done()；budget>0 时再加一个"本次等待"的期限。
+//
+// budget 是**消费侧一次等待**的预算（<=0 = 不设限，既有行为）：deadline 只在
+// "队列已空、真的要阻塞"时初始化 ⇒ 调用方慢、队列有货、终态排队都不消耗预算。
+// 到点只返回包内哨兵 errIdleWait，**不在这里退役连接**（裁决在 idleExpire）。
+// t 是调用方复用的一次性计时器（每 exchange 至多 1 个；budget<=0 时可为 nil）。
+//
+// 绝不给 socket 读点加期限：pump 的 Read 与本函数无关，"socket 静默"不等于空闲。
+func (q *frameInbox) pop(ctx context.Context, budget time.Duration, t *time.Timer) ([]byte, error) {
+	var deadline time.Time // 只在真正开始阻塞时初始化 ⇒ 起点 = 开始等帧
 	for {
 		if cerr := ctx.Err(); cerr != nil { // ①
 			return nil, cerr
@@ -503,12 +532,41 @@ func (q *frameInbox) pop(ctx context.Context) ([]byte, error) {
 			return nil, cause
 		}
 		q.mu.Unlock()
-		select { // ④
-		case <-q.notify:
+		if budget <= 0 { // ④ 无预算：既有行为
+			select {
+			case <-q.notify:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		if deadline.IsZero() {
+			deadline = time.Now().Add(budget)
+		}
+		wait := time.Until(deadline)
+		if wait <= 0 { // ⑤ 只报"超了"，退役裁决不在这里
+			return nil, errIdleWait
+		}
+		resetTimer(t, wait)
+		select {
+		case <-q.notify: // 有帧/关闭：回到循环重判
+		case <-t.C: // 到点：回到循环（可能刚好来帧）
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// resetTimer 复用一个已经 Stop 过（或已触发）的计时器。Go ≥1.23 下 Stop 后不会
+// 残留陈旧值，但保守写法多排空一次也无害；计时器只在冷路径（真正阻塞时）被重置。
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
 }
 
 // takeLocked 弹出队头并维护 head/bytes（调用方持锁）。队头推进到边界时复位，

@@ -91,6 +91,12 @@ type wsExchange struct {
 	// 先 cancel 再等锁：否则阻塞在 pop 里的 Next 永远不会退出。
 	nextMu sync.Mutex
 
+	// idle 是一次"等帧"的预算（<=0 = 关闭）与 idleTimer 是它复用的计时器：
+	// 懒建，每个 exchange 至多 1 个。计时器**不跨等待存活**（deadline 是 pop 的
+	// 局部变量），所以连接在缓存里、或消费者没在等帧时都没有计时器在跑。
+	idle      time.Duration
+	idleTimer *time.Timer
+
 	// closed 是 Release/Close 的先到者仲裁（CAS）：抢到的一方才做收尾。
 	closed atomic.Bool
 	// failed 标记"本轮以失败终态结束"（由已解析事件的那一层调 MarkFailed）。
@@ -225,6 +231,7 @@ func (c *HTTPClient) activate(ctx context.Context, cancel context.CancelFunc, cn
 		ctx:    ctx,
 		cancel: cancel,
 		reused: reused,
+		idle:   c.opts.wsIdleTimeout, // 每条连接一致；<=0 = 关闭
 	}
 	cn.lease.Store(e)
 	e.stopWatch = context.AfterFunc(ctx, func() {
@@ -286,6 +293,8 @@ func (e *wsExchange) writeFailure(werr error) error {
 //     deadline 到点"这个次序（消费者已卡在 pop 里）会把已完成的终态帧丢掉，
 //     把上游成功的请求报成 DeadlineExceeded；
 //   - 有帧立即返回（取帧即提交：已取出的帧不再受 ctx 影响）；
+//   - 一次等待超过 idle 预算且队列仍空：帧优先 → ctx 优先 → 经所有权裁决退役
+//     （见 nextOnIdle / idleExpire），返回 ErrWSIdleTimeout；
 //   - 流结束：close frame 归一为 io.EOF，其它终止原因原样返回。
 func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
 	e.nextMu.Lock()
@@ -301,10 +310,13 @@ func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
 		e.terminateOwned(ctx.Err())
 		return nil, ctx.Err()
 	}
-	data, err := e.cn.inbox.pop(ctx)
+	data, err := e.cn.inbox.pop(ctx, e.idle, e.ensureIdleTimer())
 	if err == nil {
 		e.delivered.Add(1)
 		return data, nil
+	}
+	if errors.Is(err, errIdleWait) {
+		return e.nextOnIdle(ctx)
 	}
 	if cerr := ctx.Err(); cerr != nil {
 		if data, ok := e.cn.inbox.tryPop(); ok { // 取消与入队并发：已入队的帧优先
@@ -323,6 +335,86 @@ func (e *wsExchange) Next(ctx context.Context) ([]byte, error) {
 // MarkFailed 标记本轮以失败终态结束（response.failed / response.incomplete）。
 // 幂等；一旦置位，Release 必定拒绝归还并终止连接。
 func (e *wsExchange) MarkFailed() { e.failed.Store(true) }
+
+// ensureIdleTimer 懒建"等帧预算"复用的计时器（每个 exchange 至多 1 个）。
+//
+// 只在真正要阻塞等待时才创建：队列已有帧的路径（热路径）不碰它，因此没有每帧
+// 分配；同一 exchange 后续的等待全部复用它（resetTimer），不做 time.After。
+// idle <= 0（显式关闭）时返回 nil——pop 在该形态下不读计时器。
+func (e *wsExchange) ensureIdleTimer() *time.Timer {
+	if e.idle <= 0 {
+		return nil
+	}
+	if e.idleTimer == nil {
+		e.idleTimer = time.NewTimer(e.idle)
+		if !e.idleTimer.Stop() {
+			<-e.idleTimer.C
+		}
+	}
+	return e.idleTimer
+}
+
+// nextOnIdle 是"一次等待用尽预算"之后的裁决，次序写死（三支互斥）：
+//
+//  1. **帧优先**：竞态窗口里刚入队的帧必须交付——永不把"已到帧"读成超时
+//     （与 Next 里"取消与入队并发时帧优先"同一条既有语义）；
+//  2. **调用方取消优先**：预算与 ctx 同刻就绪时按既有次序报 ctx 错误
+//     （与 Next:296-316 一致），不把调用方的放弃洗成 idle；
+//  3. 队列空 + 未关闭 + ctx 未结束（errIdleWait 只能在这个状态下产生）⇒ 提交退役：
+//     beginFinish + 租约 CAS 裁决，绝不直接 terminate。
+//
+// 抽成独立函数是为了让"帧优先于超时"能被白盒用例**无竞态**地驱动（P2d）。
+func (e *wsExchange) nextOnIdle(ctx context.Context) ([]byte, error) {
+	if data, ok := e.cn.inbox.tryPop(); ok { // ①
+		e.delivered.Add(1)
+		return data, nil
+	}
+	if cerr := ctx.Err(); cerr != nil { // ②
+		e.terminateOwned(cerr)
+		return nil, cerr
+	}
+	return nil, e.idleExpire() // ③
+}
+
+// idleCommitHook 是超时提交的**测试挂点**（生产恒为 nil）。
+//
+// 位置唯一：`beginFinish` 成功之后、`lease.CompareAndSwap` 之前。放进这个窗口
+// 才能被确定性交错压到 CAS 那一行（放在 beginFinish 之前的话，Release 会先赢
+// beginFinish，通道变成"Release 先"的另一条分支）。测试同步调用：允许在 hook 里
+// 阻塞（channel）或改状态（换租约），返回后实现继续执行 CAS。
+//
+// 重入契约：同一次 idleExpire 至多调用一次。
+var idleCommitHook func(e *wsExchange)
+
+// idleExpire 提交"本次等待超预算"的退役，返回给 Next 的错误。
+//
+// 与 Release/teardown 共用**同一原子裁决点**：beginFinish（closed CAS）决定谁
+// 有收尾权，lease.CompareAndSwap 决定连接还属不属于我。少了任何一步，
+// "读到超时"就会被当成"终止权"——那会杀掉已归还/已被新请求取走的连接。
+//
+// 收尾顺序与 teardown 有意不同：**先停取消守卫（AfterFunc），再抢租约、再
+// cancel**。否则 AfterFunc 会在 cancel 当下抢走 CAS，把终止原因写成
+// context.Canceled，把"空闲超时"洗成"调用方取消"（finish 首因胜）。
+func (e *wsExchange) idleExpire() error {
+	if !e.beginFinish() { // Release/Close 已抢到收尾权 ⇒ 我无权处置
+		return io.EOF // 已交接：按既有"已关闭"语义返回（Next 的 e.closed 分支同义）
+	}
+	if e.stopWatch != nil {
+		e.stopWatch()
+	}
+	// 测试挂点：生产恒为 nil ⇒ 冷路径上一次可预测的 nil 判断。idleExpire 只在
+	// 超时提交时走（≤1 次/exchange），不在每帧热路径，故不引入 build-tag 双实现/
+	// 默认空实现那套构建复杂度（spec r4 方案 A）。
+	if idleCommitHook != nil {
+		idleCommitHook(e)
+	}
+	if !e.cn.lease.CompareAndSwap(e, nil) {
+		return io.EOF // 租约已不属我（新租约已持有 / 已归 nil）⇒ 不 terminate
+	}
+	e.cancel()
+	e.cn.terminate(ErrWSIdleTimeout)
+	return ErrWSIdleTimeout
+}
 
 // Release 尝试把连接交回缓存。true = 已交回（调用方随后什么都不用做）；
 // false = 未交回（连接已终止，或取消回调已接手）。
