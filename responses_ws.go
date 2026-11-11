@@ -33,7 +33,9 @@ const responseEventIncomplete = "response.incomplete"
 //
 // 明确不做（写在这里防后人再加）：
 //   - 不加 response_id 归属过滤（客户端没有；协议字段覆盖面也无证据）；
-//   - 不加 created 门槛（metadata / rate_limits / error 都可能在 created 前到）；
+//   - 不加 created 门槛（metadata / rate_limits 都可能在 created 前到；带 status 的
+//     error 帧在 created 前到会直接结束本轮——那是 responsesStreamWS 的翻译点，不是
+//     准入门槛）；
 //   - 不加归还后静默窗 / 预读 drain；
 //   - 不加写后自动重试（create 非幂等 ⇒ 重复计费）。
 //
@@ -111,6 +113,13 @@ func (c *HTTPClient) responsesStreamWS(ctx context.Context, payload []byte, id I
 			return fmt.Errorf("codexsdk: 读取响应流失败: %w", nextErr)
 		}
 		typ := frameEventType(raw)
+		if bytesAre(typ, responseEventError) {
+			// 错误帧不是内容：翻译成 *HTTPError 直接从本出口返回（与上面读失败
+			// 同一条路——不经 Release，连接保持拒绝归还）。
+			if e := errorFrameHTTPError(raw); e != nil {
+				return e
+			}
+		}
 		term := isTerminalType(typ)
 		if isFailureTerminal(typ) {
 			// 失败终态：声明本轮以错误结束 ⇒ Release 一定拒绝归还并终止连接。

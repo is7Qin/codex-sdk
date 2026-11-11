@@ -761,7 +761,8 @@ func TestWSNoActivePing(t *testing.T) {
 
 // TestWSFrameShapeUnchanged：帧 → SSE 的字节形状全量 golden。覆盖 event: 行取自
 // data.type、帧字节 verbatim、[DONE] 位置、failed/incomplete 不补 [DONE]、
-// type:error 透传、无 type 不出 event 行。
+// **无 status 的** type:error 透传、无 type 不出 event 行（带 4xx/5xx status 的
+// error 帧不是内容：见 TestWSErrorFrameBecomesHTTPError429）。
 func TestWSFrameShapeUnchanged(t *testing.T) {
 	noType := `{"hello":"world"}`
 	errEv := `{"type":"error","error":{"type":"invalid_request_error","message":"nope"}}`

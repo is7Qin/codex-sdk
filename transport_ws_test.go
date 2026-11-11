@@ -187,8 +187,9 @@ func readAllBody(t *testing.T, body io.ReadCloser) string {
 // ---- 1. StreamBody（ws）：帧 → SSE 逐帧形状 ----
 
 // TestStreamBodyWSRendersFramesAsSSE：上游帧序列 → SSE 字节流逐字断言。
-// 覆盖：event: 行取自 data.type、帧字节 verbatim、in-band error 帧（created
-// 前后各一）原样透传且不中断流、[DONE] 只在 completed 之后出现一次。
+// 覆盖：event: 行取自 data.type、帧字节 verbatim、**无 status 的** in-band error
+// 帧（created 前后各一）原样透传且不中断流、[DONE] 只在 completed 之后出现一次。
+// （带 4xx/5xx status 的 error 帧不是内容：见 TestWSErrorFrameBecomesHTTPError429。）
 func TestStreamBodyWSRendersFramesAsSSE(t *testing.T) {
 	errBeforeEv := `{"type":"error","error":{"type":"invalid_request_error","message":"nope"}}`
 	errAfterEv := `{"type":"error","error":{"type":"rate_limit_exceeded","message":"slow down"}}`

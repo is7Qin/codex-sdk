@@ -27,6 +27,9 @@ type frameStream interface {
 	// 契约（给纯字节透传的调用方，例如网关 relay）：**看到失败终态必须先调
 	// MarkFailed()（或直接 Close()）再收尾**，否则连接会被当成干净结束而复用。
 	// 内置的 sseView 与 responsesStreamWS 已在看到 failed/incomplete 时自动标记。
+	//
+	// 另一条终止路径**不需要**本方法：带 4xx/5xx status 的 error 帧由上面两层直接
+	// 以 *HTTPError 返回（调用方随即 Close），这条路径根本不走到 Release。
 	MarkFailed()
 	// Release 读到终态后尝试把连接交回缓存（T5 起）。true = 已交回，
 	// false = 未交回（连接已终止或将被终止）。没有缓存时恒 false。
@@ -428,7 +431,9 @@ func (e *wsExchange) idleExpire() error {
 // 那个位置本来就知道事件类型，不违反"传输层不做协议判定"。
 //
 // 纯字节透传的调用方（如网关 relay）若自己消费帧而不经过上述两层，看到失败终态
-// 必须调 MarkFailed() 或直接 Close()，否则连接会被当成干净结束而复用。
+// 必须调 MarkFailed() 或直接 Close()，否则连接会被当成干净结束而复用。带 4xx/5xx
+// status 的 error 帧例外：它由那两层直接以 *HTTPError 结束本轮（随后 Close），所以
+// 不经过 Release，也就不需要 MarkFailed。
 //
 // 这条"不干净不归还"是复用的全部安全性来源（客户端也一样：错误/早退的 socket
 // 直接丢，不放回）。它不靠逐帧归属判定，所以不要为了"更安全"再往这里加逐帧检查。

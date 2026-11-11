@@ -121,6 +121,10 @@ type HTTPResponse struct {
 // WS 臂的升级失败也归为同一形状（StatusCode + ≤1KiB 的截断 body），底层原因
 // 挂在未导出的 cause 上：errors.As 可回溯到 *DialError，errors.Is 可回溯到
 // context.Canceled 等（网关的判死/重试分类不必区分两臂）。
+//
+// 公开面三个读取口：StatusCode / Raw（原始字节）/ RawJSON()（Raw 的文本视图，
+// 满足网关 `rawJSONer` 信封协议——WS 错误帧翻译成本类型后，既有的"从错误体取
+// message"路径照常工作）。
 type HTTPError struct {
 	StatusCode int
 	Raw        []byte
@@ -134,6 +138,11 @@ func (e *HTTPError) Error() string {
 
 // Unwrap 暴露底层原因（有则回溯，无则 nil）。
 func (e *HTTPError) Unwrap() error { return e.cause }
+
+// RawJSON 把原始响应体/错误帧作为文本返回（网关 upstreamBody 的信封协议：
+// forward.go 的 rawJSONer）。WS 臂的错误帧翻成本类型之后，网关既有的"从错误体
+// 取 message"路径就能拿到上游原文，不必为 WS 再开一条提取通道。
+func (e *HTTPError) RawJSON() string { return string(e.Raw) }
 
 // Do 发送 POST <responses 端点> 请求（端点方法族成员——固定官方端点
 // DefaultResponsesURL；payload 为完整 JSON 请求体，调用方决定 stream 等字段），

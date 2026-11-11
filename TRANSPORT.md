@@ -133,8 +133,9 @@ data:<帧字节 verbatim>\n
 
 - `response.completed` → 该块之后补 `data: [DONE]\n\n` 并结束。
 - `response.failed` / `response.incomplete` → 帧透传后结束（不补 `[DONE]`）。
-- `type:"error"` → **一律**帧透传并继续读（不分 created 前后；与 HTTP 臂 200 流
-  里的 in-band error 同义）。
+- `type:"error"` 且 `status`/`status_code` ∈ 4xx/5xx → **不渲染**：以
+  `*HTTPError{StatusCode, Raw: 原帧}` 结束该流（连接终止、不入缓存）。缺 `status`
+  或 `status` 是 2xx → 帧透传并继续读（与 HTTP 臂 200 流里的 in-band error 同义）。
 - 无 `type` 的帧只出 data 行（不写空的 `event:` 名）。
 - 收到**任意** close frame（`CloseStatus >= 0`，含 1000/1001/1005/1011）= EOF；
   只有 `CloseStatus == -1`（对端没发 close frame：直接断 TCP / 连接重置 / 超
@@ -186,7 +187,7 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 | `response.incomplete` / 无终态 | 普通错误（"事件流截断"） | 同文案（普通错误，不是 5xx 信封） |
 | 复用连接写失败 | — | 原始错误链（终止连接，不重试、不轮转）；**复用命中**时错误文案额外带「连接年龄 + 本轮已交付帧数」诊断（`%w` 包装，分类不变） |
 | 复用连接的首帧 | — | **不做任何判定**：首帧就是普通帧，不认识的事件由消费者忽略（旧尾帧也一样） |
-| 服务端 60min 上限 | — | 本地 30min 在空闲时提前退役；若仍收到 `websocket_connection_limit_reached`，按普通 in-band error 透传，不重试 |
+| 服务端 60min 上限 | — | 本地 30min 在空闲时提前退役；若仍收到 `websocket_connection_limit_reached`（该帧不带 status），按普通 in-band error 透传，不重试 |
 | 坏请求体（坏 JSON / 非对象根） | 原样发上游，由上游 400 兜底 | 本地错误 `errResponsesFrameInvalid`：**不拨号、不发帧** |
 
 `errResponsesFrameInvalid` / `ErrEmptyFrame` 是本地输入错误（裸 error，不是
@@ -253,7 +254,9 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
 
 - **`DialError` 的 body 有上限**：升级失败的响应体只保留前 1024B（够网关取
   `error.message` / `error_code`，不整篇透传）。`DialError.Refreshed`（401 已轮转过）
-  在 `*HTTPError` 信封上不可见（`StatusCode` + `Raw` + cause 链可见）。
+  在 `*HTTPError` 信封上不可见（`StatusCode` + `Raw` + cause 链可见；`RawJSON()`
+  给出 `Raw` 的文本视图——网关 `upstreamBody` 的信封协议，WS 错误帧翻成的
+  `*HTTPError` 也走同一条路）。
   无升级响应的失败不再是 `DialError`（`StatusCode==0` 形态消失）。
 - **turn-state 的来源与跨轮**：请求侧只有一个来源——`Identity.TurnState`（`""` = 本次不带）。
   捕获到的签发值只回调 `Identity.Sink`，SDK **不缓存、不回落、不回填响应头**：重放策略由调用方
@@ -261,10 +264,11 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   **身份头是保留键**：`WithHeader` 遇到 `session-id` / `thread-id` / `x-client-request-id` /
   `x-codex-window-id` / `x-codex-installation-id` / `x-codex-turn-state` 会在构造期 panic——
   身份只能经 `Identity` 传入，默认头不能成为第二条通道。
-- **真实上游 in-band 429 未验证**：真实上游在 WS 帧里以 `type:"error"` 表达 429
-  语义的情况未实证。当前按"一律透传"处理（与 HTTP 臂的 200 流一致），因此这类
-  错误在非流式臂上表现为"事件流截断"而不是 429 —— 若上游确有该形态，需要重新
-  裁定分类策略。
+- **真实上游 in-band 429 未实测**：真实上游在 WS 帧里以 `type:"error"` + `status:429`
+  表达额度耗尽的情况尚未拿到活体验证。代码侧已按参考实现处理：带 `status`/`status_code`
+  且 ∈ 4xx/5xx → 翻译成 `*HTTPError{StatusCode}`（流式与非流式两臂都是）；**缺 status 的
+  错误帧仍然透传**（与 HTTP 臂的 200 流一致）——那种形状在非流式臂上仍会表现为
+  "事件流截断"，若上游确实发这种帧，需要先实测帧形再裁定。
 - **读模型（传输臂）：常驻读者 + 有界队列**。拨号成功后 SDK 起一个 goroutine
   持续读 socket，把帧压进队列（256 帧 / 8MiB）；`Read` 只从队列取。**为什么不能
   纯拉**：对端 ping / pong 等控制帧只在有 Read 在飞时才被服务，纯拉模型下
@@ -338,7 +342,7 @@ metadata 组合）逐字节比对，另有两例分别钉住"运行期 3.7KB 形
 ## 测试
 
 `transport_ws_test.go`（`httptest` + `websocket.Accept` 假上游）：帧→SSE 逐字节
-断言（含 in-band error 与 `[DONE]` 位置）、与 HTTP 臂合成体逐字段相等、
+断言（含 `[DONE]` 位置）、与 HTTP 臂合成体逐字段相等、
 `response.failed` 两臂同形、身份与 turn-state（请求侧只认 `Identity.TurnState`；升级头不携带；
 握手头与 `response.metadata` 事件捕获后只回调 `Identity.Sink`；空身份且自动字段关闭
 （`WithTurnAuto(false)` + `WithTraceAuto(false)`，否则 `turn_id` 仍会补齐对象）时 payload 自带的

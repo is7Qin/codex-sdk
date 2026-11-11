@@ -18,6 +18,9 @@ const (
 	responseEventItemDone  = "response.output_item.done"
 	responseEventCompleted = "response.completed"
 	responseEventFailed    = "response.failed"
+	// responseEventError 是上游的错误事件帧（`{"type":"error","status":N}`）。
+	// 它不是内容帧：命中即翻译成 *HTTPError 终止本流（见 errorFrameHTTPError）。
+	responseEventError = "error"
 )
 
 // Responses 在 WS 臂可用 WithWSConnCache(n) 开启默认关闭的连接复用：连接身份 =

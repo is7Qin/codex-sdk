@@ -298,8 +298,9 @@ func TestWSConnReusedStaleFrameIsOrdinary(t *testing.T) {
 	}
 }
 
-// TestWSConnReusedErrorFramePassesThrough（R22 反向）：首帧是 error ⇒ 按普通
-// in-band error 透传给消费者，本轮随后照常读到终态。
+// TestWSConnReusedErrorFramePassesThrough（R22 反向）：首帧是**无 status 的** error
+// ⇒ 按普通 in-band error 透传给消费者，本轮随后照常读到终态（带 4xx/5xx status 的
+// error 帧走另一条路：翻译成错误并退役连接，见 TestWSErrorFrameBecomesHTTPError429）。
 func TestWSConnReusedErrorFramePassesThrough(t *testing.T) {
 	up := newReuseUpstream(t,
 		[]string{wsCreatedEv, wsCompletedEv},

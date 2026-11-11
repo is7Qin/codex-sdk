@@ -55,8 +55,11 @@ const sseViewPrefixCap = 128
 //     ——失败结束的交换不得把连接交回缓存（客户端语义：错误即退役）。
 //     这就是"网关 relay 纯字节透传也不必自己标记"的原因：判定发生在渲染层，
 //     本来就已解析 `type`；传输层仍然不做任何帧类型判定；
-//   - 其余帧（含 `type:"error"`——**不分** created 前后）原样透传继续读：
-//     HTTP 臂的 200 流里 in-band error 也是普通帧，由下游按终态事件判定；
+//   - `type:"error"` 且 `status`/`status_code` ∈ 4xx/5xx ⇒ **不再是内容**：本视图以
+//     `*HTTPError{StatusCode, Raw: 原帧}` 结束该流（见 errorFrameHTTPError），连接
+//     随 `Close` 终止、不入缓存；
+//   - 其余帧（含缺 `status` 或 2xx 的 `type:"error"`——**不分** created 前后）原样
+//     透传继续读：HTTP 臂的 200 流里 in-band error 也是普通帧，由下游按终态事件判定；
 //   - 无 type 的帧只出 data 行（不写空的 `event:` 名）。
 //
 // 终态即提交：终态帧一旦从流里取出，本视图就不再取帧（吐完三段后 EOF），此后
@@ -66,6 +69,8 @@ const sseViewPrefixCap = 128
 //
 // 消费者只剩 StreamBody 的 ws 臂（需要"原始 SSE 字节"的外部调用方）；
 // HTTPClient.Responses 自 T3 起直接从 wsExchange 取帧聚合，不再经过本视图。
+// 所以本视图的消费者再也看不到 4xx/5xx 的错误帧：它们在上面的翻译点就变成了流的
+// 结束原因（`Read` 返回 `*HTTPError`），而不是 SSE 字节。
 //
 // 并发契约：Read 与 Close 由**同一个** goroutine 串行调用（单消费者）。
 type sseView struct {
@@ -171,6 +176,13 @@ func (v *sseView) load() error {
 		return ErrMessageTooBig
 	}
 	typ := frameEventType(raw)
+	if bytesAre(typ, responseEventError) {
+		// 错误帧不是内容：翻译成 *HTTPError 作为本流的结束原因（错误即退役——
+		// v.terminal 保持 false ⇒ Close 走 stream.Close()，连接不入缓存）。
+		if e := errorFrameHTTPError(raw); e != nil {
+			return e
+		}
+	}
 	if prefixNeed(typ) > sseViewPrefixCap {
 		v.segs[sseSegPrefix] = buildLongPrefix(typ) // 冷路径：事件名装不进固定窗
 	} else {

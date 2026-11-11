@@ -27,7 +27,7 @@ func TestSSERawSegmentIsFrameBacked(t *testing.T) {
 		raw  string
 	}{
 		{"无 type", `{"hello":"world"}`},
-		{"type:error 透传", `{"type":"error","error":{"type":"invalid_request_error","message":"nope"}}`},
+		{"type:error 透传（无 status）", `{"type":"error","error":{"type":"invalid_request_error","message":"nope"}}`},
 		{"created", wsCreatedEv},
 		{"delta", wsDeltaEv},
 		{"failed", wsFailedEv},
