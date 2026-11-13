@@ -560,6 +560,31 @@ func TestNoPrewarmOnReuseOrFollowup(t *testing.T) {
 	})
 }
 
+// TestHTTPWSCacheHitTurnState：HTTP→WS 缓存命中路径的真实帧必须带上
+// Identity.Turn.State（同一轮的后续请求命中缓存连接）。
+func TestHTTPWSCacheHitTurnState(t *testing.T) {
+	payload := []byte(`{"model":"gpt-6.1-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	up := newPrewarmUpstream(t)
+	hc := up.client(t, WithWSConnCache(2))
+	doStreamBodyPayload(t, hc, prewarmIdentity("thread-pw-hit-ts", nil), payload) // 新建 ⇒ 预热 + 真实，归还
+	hits := hc.wsCache.hits.Load()
+	doStreamBodyPayload(t, hc, followUpIdentity("thread-pw-hit-ts", "T-hit", nil), payload)
+
+	if d := hc.wsCache.hits.Load() - hits; d != 1 {
+		t.Fatalf("hits 增量 = %d, 期望 1（后续请求命中缓存连接）", d)
+	}
+	if n := up.upgrades.Load(); n != 1 {
+		t.Fatalf("upgrades = %d, 期望 1", n)
+	}
+	frames := up.sentFrames(t)
+	if len(frames) != 3 {
+		t.Fatalf("上游收到 %d 帧, 期望 3（预热 + 真实 + 命中的真实帧）", len(frames))
+	}
+	if got := frameTurnState(t, frames[2]); got != "T-hit" {
+		t.Fatalf("命中缓存的真实帧 ts = %q, 期望 %q（Identity.Turn.State）", got, "T-hit")
+	}
+}
+
 // TestPrewarmFailure：预热失败的三类处理。
 func TestPrewarmFailure(t *testing.T) {
 	payload := []byte(`{"model":"gpt-6.1-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
