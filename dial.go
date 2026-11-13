@@ -55,6 +55,9 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 	bornAt := time.Now()
 	// dialedToken 是最后一次成功升级所用的 Authorization（dialWS 填入）。
 	var dialedToken string
+	// issuedToken 是最近一次升级请求从 Auth 取得的 Authorization（401 时交给
+	// 轮转判定：它已不是当前 token 就不再 refresh）。
+	var issuedToken string
 
 	// 升级头组装（重连时以新 at 重取）。
 	buildHeaders := func(ctx context.Context) (http.Header, error) {
@@ -63,6 +66,7 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 		if err != nil {
 			return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
 		}
+		issuedToken = token
 		hdr["authorization"] = []string{token}
 		// 伪装层默认头（WithHeader 可覆盖）。头名小写直接赋值（User-Agent 除外：
 		// 它必须是规范写法，否则 Go 会再补一个默认 UA）。
@@ -135,7 +139,7 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 		status := dialStatus(resp)
 		if status == http.StatusUnauthorized {
 			// WS 升级 401 → 可轮转：单飞 refresh → 自动重连一次。
-			rotated, rerr := rotateOn401(ctx, spec.auth)
+			rotated, rerr := rotateOn401(ctx, spec.auth, issuedToken)
 			if rerr != nil {
 				return nil, handshake{}, rerr // refresh 失败（fatal / RefreshError）透传
 			}

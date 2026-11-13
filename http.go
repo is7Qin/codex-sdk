@@ -360,7 +360,7 @@ func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL strin
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	resp, err := c.sendRequest(ctx, hc, targetURL, method, payload, rh)
+	resp, token, err := c.sendRequest(ctx, hc, targetURL, method, payload, rh)
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +377,7 @@ func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL strin
 		notifyAuthFatal(c.auth, fatal)
 		return nil, fatal
 	}
-	rotated, rerr := rotateOn401(ctx, c.auth)
+	rotated, rerr := rotateOn401(ctx, c.auth, token)
 	if rerr != nil {
 		return nil, rerr // refresh 失败（fatal / RefreshError）透传
 	}
@@ -385,7 +385,7 @@ func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL strin
 		return respWithBody(resp, http.StatusUnauthorized, body), nil
 	}
 	// 自动重试一次（新 at）。
-	resp2, err := c.sendRequest(ctx, hc, targetURL, method, payload, rh)
+	resp2, _, err := c.sendRequest(ctx, hc, targetURL, method, payload, rh)
 	if err != nil {
 		return nil, err
 	}
@@ -407,15 +407,16 @@ func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL strin
 // hc 由调用方选定（默认/禁跟随重定向）。rh 非 nil 时是 POST /responses：另写官方
 // 形态头（version、beta-features、routing-hint、lite、身份头、turn-metadata、
 // turn-state、accept、content-encoding）。头名除 User-Agent 外一律小写直接赋值；
-// Accept-Encoding SDK 不设（调用方 Transport 需 DisableCompression）。
-func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte, rh *responsesHeaders) (*http.Response, error) {
+// Accept-Encoding SDK 不设（调用方 Transport 需 DisableCompression）。第二个返回值
+// 是从 Auth 取得的 Authorization 头值（401 轮转据此判断该 token 是否已被替换）。
+func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte, rh *responsesHeaders) (*http.Response, string, error) {
 	req, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("codexsdk: 构造请求失败: %w", err)
+		return nil, "", fmt.Errorf("codexsdk: 构造请求失败: %w", err)
 	}
 	token, err := c.auth.Authorization(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
+		return nil, "", fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
 	}
 	h := req.Header
 	h["authorization"] = []string{token}
@@ -430,9 +431,9 @@ func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL
 	applyHeaderOverrides(h, c.opts.headers)
 	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("codexsdk: 上游请求失败: %w", err)
+		return nil, "", fmt.Errorf("codexsdk: 上游请求失败: %w", err)
 	}
-	return resp, nil
+	return resp, token, nil
 }
 
 // readResponseBody 读取响应体（不关闭，调用方负责 defer Close），统一非流式

@@ -22,7 +22,8 @@
 //     DefaultResponsesWSURL（responses WS wss）、DefaultSearchURL、
 //     DefaultImagesURL / DefaultImagesEditsURL、DefaultUsageURL；所有操作直接使用对应常量，不可覆盖或追加 query
 //   - 升级与请求鉴权注入（PAT 静态 / OAuth 刷新回调 / OAuthWithRotation 轮转
-//     状态机，Auth 接口）：401 自动轮转（判死分类 + 单飞 refresh + 重试一次，
+//     状态机，Auth 接口）：401 自动轮转（判死分类 + 单飞 refresh + 重试一次；
+//     被拒请求所用 token 已不是当前 token 时不再 refresh，直接以当前 token 重试；
 //     WS 升级 401 自动重连一次并带 DialError.Refreshed 标记）、RT 判死码集 /
 //     token 端点 401 / 账号禁用类 → 账号级终止（导出错误类型 errors.As 区分，
 //     OnAuthFatal 通知），Invalidate() / Fatal(err) 显式入口（网关解析 WS 判死

@@ -224,11 +224,37 @@ func (r *rotationAuth) authFatal(err error) {
 	r.setFatal(err)
 }
 
-// refresh 是单飞入口（refreshTrigger 接口）：并发调用共享一次 refresh，
-// 结果一致返回；调用方 ctx 取消只退出本调用（不污染单飞——下次可再试）。
+// refresh 是缓存缺失路径（Authorization 无 at）的单飞入口：并发调用共享一次
+// refresh，结果一致返回；调用方 ctx 取消只退出本调用（不污染单飞——下次可再试）。
 func (r *rotationAuth) refresh(ctx context.Context) error {
+	return r.singleFlightRefresh(ctx, false, "")
+}
+
+// refreshIfCurrent 是 401 轮转入口（refreshTrigger 接口）：rejected 是被上游
+// 401 拒绝的请求所用的 Authorization 头值。只有它仍是当前缓存的 at 时才
+// refresh；当前 at 已换成别的值（其他请求已完成轮转）时不发 refresh、直接
+// 返回 nil，调用方以当前 at 重试。进行中的单飞 refresh 照常加入等待。
+func (r *rotationAuth) refreshIfCurrent(ctx context.Context, rejected string) error {
+	return r.singleFlightRefresh(ctx, true, rejected)
+}
+
+// singleFlightRefresh 是单飞实现。skipIfReplaced 为 true 时，在无进行中
+// refresh 的前提下若当前 at 非空且不等于 rejected，视为该 token 已被替换：
+// 不 refresh，终止态时返回终止错误，否则返回 nil。判定与 inflight 建立在同一把
+// 锁内——leader 先 Store 新 at、后在锁内清 inflight，所以锁内要么看到
+// inflight（加入等待），要么看到已替换的 at（跳过），不会漏判。
+func (r *rotationAuth) singleFlightRefresh(ctx context.Context, skipIfReplaced bool, rejected string) error {
 	r.refreshMu.Lock()
 	inf := r.inflight
+	if inf == nil && skipIfReplaced {
+		if at := r.at.Load(); at != nil && *at != rejected {
+			r.refreshMu.Unlock()
+			if f := r.fatal.Load(); f != nil {
+				return f.err
+			}
+			return nil
+		}
+	}
 	leader := inf == nil
 	if leader {
 		inf = &refreshRun{done: make(chan struct{})}
@@ -651,11 +677,12 @@ func WithTokenRotatedRetry(max int) OAuthOption {
 	return func(c *oauthConfig) { c.tokenRotatedRetry = max }
 }
 
-// refreshTrigger 是 401 自动轮转的触达接口（私有）：实现了 refresh 的 Auth
-// 在 Do/Stream/Dial 遇到 401 时触发单飞刷新。oauthAuth/patAuth 不实现 →
-// 无自动轮转（PAT 场景 401 原样返回，现状保持）。
+// refreshTrigger 是 401 自动轮转的触达接口（私有）：实现了 refreshIfCurrent
+// 的 Auth 在 Do/Stream/Dial 遇到 401 时触发单飞刷新；rejected 是被拒请求所用
+// 的 Authorization 头值，已不是当前 token 时不再 refresh。oauthAuth/patAuth
+// 不实现 → 无自动轮转（PAT 场景 401 原样返回，现状保持）。
 type refreshTrigger interface {
-	refresh(ctx context.Context) error
+	refreshIfCurrent(ctx context.Context, rejected string) error
 }
 
 // authFatalTrigger 是 AT 401 判死路径的通知接口（私有）：rotationAuth 实现为
@@ -668,13 +695,16 @@ type authFatalTrigger interface {
 // rotateOn401 是 401 自动轮转的统一编排（WS 升级与 HTTP 请求共用）：仅
 // refreshTrigger 实现者参与轮转（PAT/oauthAuth 不轮转 → rotated=false）；
 // 实现者执行单飞 refresh，失败（fatal / RefreshError）原样透传、不被
-// DialError/HTTPError 包层吞掉。rotated=true 表示已换新凭据，调用方应重试一次。
-func rotateOn401(ctx context.Context, auth Auth) (rotated bool, err error) {
+// DialError/HTTPError 包层吞掉。rejected 是被 401 拒绝的请求所用的
+// Authorization 头值（取自 Auth.Authorization 的返回值，不受 WithHeader 覆盖
+// 影响）：它已不是当前 token 时说明其他请求已完成轮转，不再 refresh。
+// rotated=true 表示当前已是新凭据，调用方应重试一次。
+func rotateOn401(ctx context.Context, auth Auth, rejected string) (rotated bool, err error) {
 	trigger, ok := auth.(refreshTrigger)
 	if !ok {
 		return false, nil
 	}
-	if err := trigger.refresh(ctx); err != nil {
+	if err := trigger.refreshIfCurrent(ctx, rejected); err != nil {
 		return false, err
 	}
 	return true, nil

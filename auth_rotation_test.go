@@ -34,6 +34,9 @@ type mockRefresh struct {
 	steps   []refreshStep
 	last    refreshStep
 	block   chan struct{}
+	// started 非空时每次请求进入 handler 即发送一个信号（发送方不阻塞时需
+	// 调用方预留缓冲）；用于等到 refresh 已在途再推进时序。
+	started chan struct{}
 }
 
 func newMockRefresh(t *testing.T, steps ...refreshStep) *mockRefresh {
@@ -52,7 +55,11 @@ func newMockRefresh(t *testing.T, steps ...refreshStep) *mockRefresh {
 			m.last = step
 		}
 		block := m.block
+		started := m.started
 		m.mu.Unlock()
+		if started != nil {
+			started <- struct{}{}
+		}
 		if block != nil {
 			<-block
 		}
@@ -1026,4 +1033,271 @@ func TestRotationRefreshEmptyAT(t *testing.T) {
 	if fatalCalls.Load() != 0 {
 		t.Fatal("缺 access_token 不应判死")
 	}
+}
+
+// staleGate 是“首个旧 token 请求被扣住”的上游 mock：第一个带 Bearer at-old 的
+// 请求到达后 close(arrived)，等 release 关闭才写 401；其余 at-old 请求立即 401；
+// 其他 token 交给 ok。用于让一个旧 token 的 401 在指定时刻才回到客户端。
+type staleGate struct {
+	srv      *httptest.Server
+	arrived  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+	first    atomic.Bool
+	accepted atomic.Int32
+}
+
+func newStaleGate(t *testing.T, ok http.HandlerFunc) *staleGate {
+	t.Helper()
+	g := &staleGate{arrived: make(chan struct{}), release: make(chan struct{})}
+	g.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer at-old" {
+			if g.first.CompareAndSwap(false, true) {
+				close(g.arrived)
+				<-g.release
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_exceeded"}}`))
+			return
+		}
+		g.accepted.Add(1)
+		ok(w, r)
+	}))
+	t.Cleanup(g.srv.Close)
+	t.Cleanup(g.open) // 后注册先执行：失败路径上先放行被扣住的 handler，Close 才不会卡住
+	return g
+}
+
+func (g *staleGate) open() { g.once.Do(func() { close(g.release) }) }
+
+// bodyCloseSignal 包装 RoundTripper：第一个 401 响应体被 Close 时 close(closed)。
+// doURL 读完 401 体并 Close 后才进入轮转，借此确认该 401 已被客户端读完。
+type bodyCloseSignal struct {
+	base   http.RoundTripper
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *bodyCloseSignal) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := b.base.RoundTrip(req)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		return resp, err
+	}
+	resp.Body = &signalOnClose{ReadCloser: resp.Body, fire: func() { b.once.Do(func() { close(b.closed) }) }}
+	return resp, nil
+}
+
+type signalOnClose struct {
+	io.ReadCloser
+	fire func()
+}
+
+func (s *signalOnClose) Close() error {
+	err := s.ReadCloser.Close()
+	s.fire()
+	return err
+}
+
+// TestRotationLateStale401SkipsRefresh：失败请求所用的 token 已不是当前 token
+// 时不再 refresh，直接用当前 token 重试一次（R-1）。时序全部由 channel 屏障决定。
+func TestRotationLateStale401SkipsRefresh(t *testing.T) {
+	const target = "https://chatgpt.com/backend-api/codex/responses"
+	newAT := `{"access_token":"at-new","refresh_token":"rt-new"}`
+	okJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x"}`))
+	}
+
+	t.Run("HTTP 迟到：轮转完成后才收到的旧 token 401", func(t *testing.T) {
+		m := newMockRefresh(t, refreshStep{status: 200, body: newAT})
+		g := newStaleGate(t, okJSON)
+		var rotated atomic.Int32
+		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"),
+			WithOnTokenRotated(func(at, rt string) { rotated.Add(1) }))
+		late := NewHTTPClient(auth, WithTransport(newFixedTransport(t, target, g.srv.URL)))
+		other := NewHTTPClient(auth, WithTransport(newFixedTransport(t, target, g.srv.URL)))
+
+		lateErr := make(chan error, 1)
+		go func() {
+			_, err := late.Do(context.Background(), []byte(`{}`))
+			lateErr <- err
+		}()
+		<-g.arrived // late 的旧 token 请求已在上游被扣住
+
+		// other：旧 token 401 → refresh → 新 token 重试成功，轮转整体完成。
+		if _, err := other.Do(context.Background(), []byte(`{}`)); err != nil {
+			t.Fatalf("other Do: %v", err)
+		}
+		if m.callCount() != 1 {
+			t.Fatalf("轮转后 refresh 次数 = %d, 期望 1", m.callCount())
+		}
+
+		g.open() // 放行迟到的 401
+		if err := <-lateErr; err != nil {
+			t.Fatalf("late Do: %v", err)
+		}
+		if m.callCount() != 1 {
+			t.Fatalf("refresh 次数 = %d, 期望 1（迟到的旧 token 401 不应再 refresh）", m.callCount())
+		}
+		if rotated.Load() != 1 {
+			t.Fatalf("OnTokenRotated 次数 = %d, 期望 1", rotated.Load())
+		}
+		if g.accepted.Load() != 2 {
+			t.Fatalf("新 token 成功请求数 = %d, 期望 2", g.accepted.Load())
+		}
+	})
+
+	t.Run("HTTP 并发：refresh 在途时读完的旧 token 401", func(t *testing.T) {
+		m := newMockRefresh(t, refreshStep{status: 200, body: newAT})
+		refreshGate := make(chan struct{})
+		m.block = refreshGate
+		m.started = make(chan struct{}, 4)
+		var gateOnce sync.Once
+		openRefresh := func() { gateOnce.Do(func() { close(refreshGate) }) }
+		t.Cleanup(openRefresh)
+		g := newStaleGate(t, okJSON)
+		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
+		sig := &bodyCloseSignal{base: newFixedTransport(t, target, g.srv.URL), closed: make(chan struct{})}
+		late := NewHTTPClient(auth, WithTransport(sig))
+		other := NewHTTPClient(auth, WithTransport(newFixedTransport(t, target, g.srv.URL)))
+
+		lateErr := make(chan error, 1)
+		go func() {
+			_, err := late.Do(context.Background(), []byte(`{}`))
+			lateErr <- err
+		}()
+		<-g.arrived
+
+		otherErr := make(chan error, 1)
+		go func() {
+			_, err := other.Do(context.Background(), []byte(`{}`))
+			otherErr <- err
+		}()
+		<-m.started // other 的 refresh 已在途（被 refreshGate 扣住）
+
+		g.open()     // late 收到旧 token 401
+		<-sig.closed // late 已读完 401 体，随即进入轮转
+		openRefresh()
+
+		if err := <-otherErr; err != nil {
+			t.Fatalf("other Do: %v", err)
+		}
+		if err := <-lateErr; err != nil {
+			t.Fatalf("late Do: %v", err)
+		}
+		if m.callCount() != 1 {
+			t.Fatalf("refresh 次数 = %d, 期望 1", m.callCount())
+		}
+		if g.accepted.Load() != 2 {
+			t.Fatalf("新 token 成功请求数 = %d, 期望 2", g.accepted.Load())
+		}
+	})
+
+	t.Run("WS 迟到：轮转完成后才收到的旧 token 升级 401", func(t *testing.T) {
+		m := newMockRefresh(t, refreshStep{status: 200, body: newAT})
+		g := newStaleGate(t, func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+			for {
+				if _, _, err := c.Read(r.Context()); err != nil {
+					return
+				}
+			}
+		})
+		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
+		dialOpt := func() Option { return WithTransport(newFixedTransport(t, target, g.srv.URL)) }
+
+		type dialResult struct {
+			c   *Client
+			err error
+		}
+		lateRes := make(chan dialResult, 1)
+		go func() {
+			c, err := Dial(context.Background(), auth, Identity{}, dialOpt())
+			lateRes <- dialResult{c, err}
+		}()
+		<-g.arrived
+
+		other, err := Dial(context.Background(), auth, Identity{}, dialOpt())
+		if err != nil {
+			t.Fatalf("other Dial: %v", err)
+		}
+		defer other.Close(StatusGoingAway, "")
+		if m.callCount() != 1 {
+			t.Fatalf("轮转后 refresh 次数 = %d, 期望 1", m.callCount())
+		}
+
+		g.open()
+		res := <-lateRes
+		if res.err != nil {
+			t.Fatalf("late Dial: %v", res.err)
+		}
+		defer res.c.Close(StatusGoingAway, "")
+		if m.callCount() != 1 {
+			t.Fatalf("refresh 次数 = %d, 期望 1（迟到的旧 token 升级 401 不应再 refresh）", m.callCount())
+		}
+		if g.accepted.Load() != 2 {
+			t.Fatalf("新 token 升级成功数 = %d, 期望 2", g.accepted.Load())
+		}
+	})
+}
+
+// TestRotationRefreshIfCurrent：refreshIfCurrent 只在被拒 token 仍是当前 token
+// （或缓存为空）时 refresh；已被替换时不发请求，终止态下返回终止错误。
+func TestRotationRefreshIfCurrent(t *testing.T) {
+	t.Run("被拒 token 已被替换：不 refresh", func(t *testing.T) {
+		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-x"}`})
+		r := OAuthWithRotation("rt-0", WithInitialAccessToken("at-new")).(*rotationAuth)
+		if err := r.refreshIfCurrent(context.Background(), "Bearer at-old"); err != nil {
+			t.Fatalf("refreshIfCurrent: %v", err)
+		}
+		if m.callCount() != 0 {
+			t.Fatalf("refresh 次数 = %d, 期望 0", m.callCount())
+		}
+		if got, _ := r.Authorization(context.Background()); got != "Bearer at-new" {
+			t.Fatalf("Authorization = %q, 期望保持 Bearer at-new", got)
+		}
+	})
+
+	t.Run("被拒 token 仍是当前 token：refresh", func(t *testing.T) {
+		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new"}`})
+		r := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old")).(*rotationAuth)
+		if err := r.refreshIfCurrent(context.Background(), "Bearer at-old"); err != nil {
+			t.Fatalf("refreshIfCurrent: %v", err)
+		}
+		if m.callCount() != 1 {
+			t.Fatalf("refresh 次数 = %d, 期望 1", m.callCount())
+		}
+		if got, _ := r.Authorization(context.Background()); got != "Bearer at-new" {
+			t.Fatalf("Authorization = %q, 期望 Bearer at-new", got)
+		}
+	})
+
+	t.Run("缓存为空（Invalidate 后）：refresh", func(t *testing.T) {
+		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new"}`})
+		r := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old")).(*rotationAuth)
+		r.Invalidate()
+		if err := r.refreshIfCurrent(context.Background(), "Bearer at-old"); err != nil {
+			t.Fatalf("refreshIfCurrent: %v", err)
+		}
+		if m.callCount() != 1 {
+			t.Fatalf("refresh 次数 = %d, 期望 1", m.callCount())
+		}
+	})
+
+	t.Run("已被替换但处于终止态：返回终止错误", func(t *testing.T) {
+		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-x"}`})
+		r := OAuthWithRotation("rt-0", WithInitialAccessToken("at-new")).(*rotationAuth)
+		boom := errors.New("boom")
+		r.Fatal(boom)
+		if err := r.refreshIfCurrent(context.Background(), "Bearer at-old"); !errors.Is(err, boom) {
+			t.Fatalf("err = %v, 期望终止错误", err)
+		}
+		if m.callCount() != 0 {
+			t.Fatalf("refresh 次数 = %d, 期望 0", m.callCount())
+		}
+	})
 }
