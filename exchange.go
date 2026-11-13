@@ -10,6 +10,7 @@ import (
 	"time"
 
 	coderws "github.com/coder/websocket"
+	"github.com/tidwall/gjson"
 )
 
 // frameStream 是"一次请求 = 一条入站帧流"的取帧入口。sseView 只认这个接口，
@@ -49,15 +50,21 @@ type connSink interface {
 
 // connKey 是一条可复用连接的身份。
 //
-// 身份 = (threadKey, readLimit)，不含 turn-state、也不含 window：真实 codex 的
-// WS 连接是 thread 级、跨轮跨窗口缓存复用；ts 与 window 都是请求级数据。
-// threadKey == "" 是匿名，不参与复用（openWSExchange 不取不存）。
+// 身份 = (threadKey, routingHint, readLimit)，不含 turn-state、也不含 window：
+// 真实 codex 的 WS 连接是 thread 级、跨轮跨窗口缓存复用；ts 与 window 都是请求级
+// 数据。threadKey == "" 是匿名，不参与复用（openWSExchange 不取不存）。
+//
+// routingHint（x-codex-routing-hint，model 与 service_tier）是握手头：上游按它把
+// 连接路由到模型所在的后端，换模型或档位的请求不能复用这条连接。它是独立字段，
+// 不拼进 threadKey——RetireThread 仍按 threadKey 精确匹配，一次摘掉该线程所有
+// 路由的空闲连接。
 //
 // readLimit 必须进键：两条取数路径的单帧内存上界不同（64MiB / 16MiB），按路径
 // 拨号时就把上限固定了，共享连接会把聚合臂的单帧上界放大 4 倍。
 type connKey struct {
-	threadKey string
-	readLimit int64
+	threadKey   string
+	routingHint string
+	readLimit   int64
 }
 
 // wsExchange 是一次 Responses WS 请求的生命周期：一条连接 + 取帧入口。conn
@@ -129,12 +136,17 @@ func (e *wsExchange) teardown(cause error) {
 // openWSExchange 建立一次请求级 WS exchange。
 //
 // 创建次序是契约（写死）：**整形**（parseRequest + shapeRequest；本地校验在此，
-// 坏请求体不烧握手）→ 查缓存 → 必要时拨号（握手带 routing-hint 与本帧形态的
-// turn-metadata）→ 组装并发一帧（发送时刻在取得写闸后写入）。握手响应头里的
-// turn-state 不取（官方只认 response.metadata 事件，由 turnStateTap 捕获）。
+// 坏请求体不烧握手）→ 查缓存（键含 routing-hint）→ 必要时拨号（握手带
+// routing-hint 与第一帧形态的 turn-metadata：将预热则 prewarm 形态）→ 新建连接且
+// Identity.Turn.First 时预热（见 prewarm）→ 组装并发真实帧（发送时刻在取得写闸后
+// 写入）。握手响应头里的 turn-state 不取（官方只认 response.metadata 事件）。
 //
-// T5 起 exchangeCtx 承担三件事：拨号预算、取帧预算、取消守卫。connCtx 已经
-// 与请求解耦（Background），所以请求结束不再杀 socket；但"调用方取消 ⇒ 本次
+// 预热只发生在新建连接上（缓存命中但连接已死、重拨的也算新建）；复用连接与
+// 一轮的后续请求不预热，发全量、不带 previous_response_id。真实帧在预热之后才
+// 组装：它的 previous_response_id、输入起点与 turn-state 取决于预热结果。
+//
+// T5 起 exchangeCtx 承担三件事：拨号预算、取帧预算（含预热）、取消守卫。connCtx
+// 已经与请求解耦（Background），所以请求结束不再杀 socket；但"调用方取消 ⇒ 本次
 // 请求的连接必须终止"仍由 AfterFunc + 租约 CAS 保证。
 func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identity, readLimit int64) (*wsExchange, error) {
 	exchangeCtx, cancel := exchangeContext(ctx, c.opts.timeout)
@@ -144,7 +156,7 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 		cancel()
 		return nil, err
 	}
-	frame, startOff := assembleWS(&sh, wsAssembly{turnState: sh.turnState(id)})
+	full := wsAssembly{turnState: sh.turnState(id)}
 	threadKey := id.threadKey()
 	key := connKey{threadKey: threadKey, readLimit: readLimit}
 	// sink 是归还口：**必须**在 nil 时保持真正的 nil 接口（typed-nil 陷阱：
@@ -153,11 +165,12 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 	var sink connSink
 	if c.wsCache != nil && threadKey != "" {
 		sink = c.wsCache
+		key.routingHint = sh.routingHint()
 	}
 
 	// 取用：只有开启缓存且非匿名才可能命中。token 必须在锁外取（OAuth 可能
 	// 取锁/刷新），报错就直接失败——不拿旧连接硬上。
-	if cache := c.wsCache; cache != nil && threadKey != "" {
+	if cache := c.wsCache; sink != nil {
 		if c.auth == nil { // 与 dialConn 同一道保护：缓存分支不能先崩在解引用上
 			cancel()
 			return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
@@ -168,6 +181,7 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 			return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", terr)
 		}
 		if cc, ok := cache.get(key, token); ok {
+			frame, startOff := assembleWS(&sh, full)
 			e := c.activate(exchangeCtx, cancel, cc.cn, cc.key,
 				handshake{token: cc.token, bornAt: cc.bornAt}, true, sink)
 			// 复查 + 解栏。顺序是契约：解栏在写 create 帧**之前**——反过来的话，
@@ -191,7 +205,8 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 		}
 	}
 
-	cn, hs, derr := dialConn(exchangeCtx, dialSpec{
+	prewarm := id.Turn.First && !sh.anonymous
+	spec := dialSpec{
 		auth:      c.auth,
 		opts:      c.opts,
 		readLimit: readLimit,
@@ -199,17 +214,145 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 		headers:   c.opts.headers,
 		identity:  id,
 		shaped:    &sh,
-	})
+		prewarm:   prewarm,
+	}
+	cn, hs, derr := dialConn(exchangeCtx, spec)
 	if derr != nil {
 		cancel()
 		return nil, wsDialError(derr)
 	}
 	e := c.activate(exchangeCtx, cancel, cn, key, hs, false, sink)
-	if werr := cn.writeStamped(exchangeCtx, frame, startOff); werr != nil {
+	a := full
+	if prewarm {
+		var redial bool
+		a, redial, err = e.prewarm(&sh, id.Sink, full)
+		if err != nil {
+			return nil, err // 连接已终止、exchange 已收尾
+		}
+		if redial {
+			// 预热响应以失败结束：这条连接不再用。重拨一次，握手为 turn 形态，
+			// 不再预热，真实帧发全量、不带 previous_response_id。
+			e.abandon(io.EOF)
+			spec.prewarm = false
+			cn, hs, derr = dialConn(exchangeCtx, spec)
+			if derr != nil {
+				cancel()
+				return nil, wsDialError(derr)
+			}
+			e = c.activate(exchangeCtx, cancel, cn, key, hs, false, sink)
+			a = full
+		}
+	}
+	frame, startOff := assembleWS(&sh, a)
+	if werr := e.cn.writeStamped(exchangeCtx, frame, startOff); werr != nil {
 		e.teardown(werr) // 写失败不重试、不重拨（response.create 可能已进 socket）
 		return nil, werr
 	}
 	return e, nil
+}
+
+// prewarm 在新建的连接上发预热帧，并在 SDK 内部读完预热响应（到
+// response.completed）。预热事件不进入返回流、不计用量、不触发 Release（Release
+// 的归还判定只在真实帧终态后发生）。
+//
+// 返回真实帧的组装参数：
+//   - 预热 response.metadata 给的 turn-state（属于预热 response 的）交给 sink，
+//     并作为真实帧的 turn-state（无则沿用 real.turnState，即 Identity.Turn.State）；
+//   - prewarmChains 时 previous_response_id = 预热 response id、跳过预热输入项；
+//     否则不带、全量。
+//
+// 失败分三类：
+//   - 连接类（写预热帧失败、读到 EOF / 连接错误、空闲超时、ctx 结束）：真实请求
+//     未发出。exchange 收尾、连接终止，返回 prewarmConnError（原错误链保留，
+//     errors.Is(context.Canceled / DeadlineExceeded / ErrWSIdleTimeout) 照旧成立；
+//     不是 *HTTPError，调用方按连接错误重试 / 故障转移）；
+//   - 4xx（含 429）error 帧：上游的确定性拒绝，*HTTPError 直接返回，不重拨；
+//   - response.failed / response.incomplete、无状态或 5xx 的 error 帧：redial =
+//     true，exchange 未收尾，由调用方 abandon 后重拨。
+func (e *wsExchange) prewarm(sh *shapedRequest, sink TurnStateSink, real wsAssembly) (a wsAssembly, redial bool, err error) {
+	shapeStats.prewarms.Add(1)
+	frame, off := assembleWS(sh, wsAssembly{prewarm: true})
+	if werr := e.cn.writeStamped(e.ctx, frame, off); werr != nil {
+		return real, false, e.prewarmConnFailure(werr)
+	}
+	held := prewarmTurnState{inner: sink}
+	obs := turnStateObserver{sink: &held}
+	for {
+		raw, nerr := e.Next(e.ctx)
+		if nerr != nil {
+			return real, false, e.prewarmConnFailure(nerr)
+		}
+		obs.observe(raw)
+		typ := frameEventType(raw)
+		switch {
+		case bytesAre(typ, responseEventCompleted):
+			e.delivered.Store(0) // 预热帧不算本轮交付
+			respID := obs.seenID
+			if respID == "" {
+				respID = gjson.GetBytes(raw, "response.id").String()
+			}
+			if held.v != "" {
+				real.turnState = held.v
+			}
+			if respID != "" && sh.prewarmChains() {
+				real.prevID = respID
+				real.inputSkip = sh.prewarmInputItems()
+				shapeStats.prewarmChained.Add(1)
+			} else {
+				shapeStats.prewarmUnchained.Add(1)
+			}
+			return real, false, nil
+		case bytesAre(typ, responseEventError):
+			if he, ok := errorFrameHTTPError(raw).(*HTTPError); ok && he.StatusCode < 500 {
+				shapeStats.prewarmRejections.Add(1)
+				e.teardown(he)
+				return real, false, he
+			}
+			shapeStats.prewarmRedials.Add(1)
+			return real, true, nil
+		case isFailureTerminal(typ):
+			shapeStats.prewarmRedials.Add(1)
+			return real, true, nil
+		}
+	}
+}
+
+// prewarmConnFailure 收尾 exchange（终止连接）并把预热阶段的连接类错误包成
+// "真实请求未发出"的连接错误（%w 保留原错误链）。
+func (e *wsExchange) prewarmConnFailure(cause error) error {
+	shapeStats.prewarmConnFailures.Add(1)
+	e.teardown(cause)
+	return fmt.Errorf("codexsdk: websocket 预热未完成（真实请求未发出）: %w", cause)
+}
+
+// abandon 放弃本 exchange 的连接但**不**取消 exchange ctx（预热失败后重拨要继续
+// 用同一个 ctx 与 cancel）：注销取消守卫、停空闲计时器、置已收尾，租约仍属本
+// exchange 时终止连接。
+func (e *wsExchange) abandon(cause error) {
+	e.closed.Store(true)
+	if e.stopWatch != nil {
+		e.stopWatch()
+	}
+	if e.idleTimer != nil {
+		e.idleTimer.Stop()
+	}
+	e.terminateOwned(cause)
+}
+
+// prewarmTurnState 是预热期间的 TurnStateSink：记下预热 response 的第一个
+// turn-state（真实帧要带），同时转交 Identity.Sink。
+type prewarmTurnState struct {
+	inner TurnStateSink
+	v     string
+}
+
+func (p *prewarmTurnState) SetTurnState(v string) {
+	if p.v == "" {
+		p.v = v
+	}
+	if p.inner != nil {
+		p.inner.SetTurnState(v)
+	}
 }
 
 // activate 把一条连接交给新的 exchange：先落租约，再装取消守卫。

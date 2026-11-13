@@ -59,6 +59,15 @@ dump("tui-prewarm.json", body(tui[29]))
 dump("tui-turn.json", body(tui[35]))
 dump("tui-followup.json", body(tui[40]))
 
+# 预热链接（log169b-tui：假上游的 completed 带 response id）：预热后的真实帧带
+# previous_response_id = 预热 id、全量输入；标题线程（text.format）不带、全量。
+tb = load("log169b-tui.jsonl")
+dump("tui-chained-handshake.headers.json", headers(tb[21]))
+dump("tui-chained-prewarm.json", body(tb[29]))
+dump("tui-chained-turn.json", body(tb[35]))
+dump("title-prewarm.json", body(tb[39]))
+dump("title-turn.json", body(tb[42]))
+
 ws = load("log169-ws.jsonl")
 dump("exec-ws-handshake.headers.json", headers(ws[11]))
 dump("exec-ws-prewarm.json", body(ws[14]))

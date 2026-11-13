@@ -445,6 +445,8 @@ type shapedRequest struct {
 	// nativePrewarm：WS→WS 客户端自己的预热帧（generate:false）。client_metadata
 	// 与握手 turn-metadata 用 prewarm 形态，不带 turn-state；输入按客户端原样。
 	nativePrewarm bool
+	// hint 是 routingHint 的缓存（"" = 未生成）。
+	hint string
 }
 
 // injectHash 是本次插入项（工具项 + 指令消息）内容的 FNV-64a；无插入项为 0。
@@ -476,12 +478,35 @@ func (sh *shapedRequest) handshakeTurnMeta(prewarm bool) []byte {
 	return sh.turnMeta
 }
 
-// routingHint 返回 x-codex-routing-hint 的值。
+// routingHint 返回 x-codex-routing-hint 的值。首次调用时生成并记在 sh 上：
+// HTTP→WS 的连接缓存键与握手头共用同一个字符串（一次分配）。
 func (sh *shapedRequest) routingHint() string {
-	if len(sh.serviceTier) > 0 {
-		return "model=" + string(sh.model) + ";tier=" + string(sh.serviceTier)
+	if sh.hint == "" {
+		if len(sh.serviceTier) > 0 {
+			sh.hint = "model=" + string(sh.model) + ";tier=" + string(sh.serviceTier)
+		} else {
+			sh.hint = "model=" + string(sh.model)
+		}
 	}
-	return "model=" + string(sh.model)
+	return sh.hint
+}
+
+// prewarmInputItems 是预热帧的输入项数：lite 为 0；非 lite 为 SDK 由顶层
+// instructions 生成的那条消息（inputPrefix 在非 lite 下只有它；没有则 0）。
+// 预热后的真实帧以它作 inputSkip。
+func (sh *shapedRequest) prewarmInputItems() int {
+	if sh.lite {
+		return 0
+	}
+	return len(sh.inputPrefix)
+}
+
+// prewarmChains 报告预热帧与真实帧的非输入字段是否逐项相等（官方
+// core/src/client.rs 的判定）。两帧由同一份整形结果组装，唯一可能的差别是
+// text：真实 text 带 format 时预热帧去掉了它。相等时真实帧带预热 response id
+// 并跳过预热输入；否则不带、发全量。
+func (sh *shapedRequest) prewarmChains() bool {
+	return bytes.Equal(sh.values[keyText], sh.textPrewarm)
 }
 
 // shapeRequest 是第二段：只做与身份、模型有关的变换（spec §5.1 变换 1–11）。
@@ -1312,10 +1337,8 @@ func (sh *shapedRequest) writeInput(w *jsonWriter, skip int, prewarm bool) {
 		w.raw(b)
 	}
 	if prewarm {
-		if !sh.lite {
-			for _, it := range sh.inputPrefix {
-				put(it)
-			}
+		for _, it := range sh.inputPrefix[:sh.prewarmInputItems()] {
+			put(it)
 		}
 		w.byte(']')
 		return

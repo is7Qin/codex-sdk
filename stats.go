@@ -15,6 +15,22 @@ type ShapeStats struct {
 	// 插入项与本连接上次不同而重新插入的次数（相同则不插，不计；连接上此前没有
 	// 插入记录时的第一次插入也不计）。
 	IncrementalReinjects int64
+
+	// HTTP→WS 预热（新建上游连接且 Identity.Turn.First 时，SDK 先发一帧
+	// generate:false 的预热帧，读完其响应再发真实帧）。
+	Prewarms int64 // 发出的预热帧数
+	// PrewarmConnFailures：预热阶段（写预热帧到读到 response.completed）连接出错、
+	// EOF、空闲超时或 ctx 结束。真实请求未发出，以连接类错误返回调用方。
+	PrewarmConnFailures int64
+	// PrewarmRejections：预热收到 4xx（含 429）error 帧，以 *HTTPError 直接返回。
+	PrewarmRejections int64
+	// PrewarmRedials：预热收到 response.failed / response.incomplete、无状态或 5xx
+	// 的 error 帧；关闭该连接、重拨一次、不预热、发全量。
+	PrewarmRedials int64
+	// PrewarmChained / PrewarmUnchained：预热成功后真实帧带 / 不带
+	// previous_response_id（不带 = 真实 text 带 format，或预热响应没有 id）。
+	PrewarmChained   int64
+	PrewarmUnchained int64
 }
 
 // shapeCounters 是 ShapeStats 的原子计数器。
@@ -26,6 +42,12 @@ type shapeCounters struct {
 	dualToolSources       atomic.Int64
 	unknownModels         atomic.Int64
 	incrementalReinjects  atomic.Int64
+	prewarms              atomic.Int64
+	prewarmConnFailures   atomic.Int64
+	prewarmRejections     atomic.Int64
+	prewarmRedials        atomic.Int64
+	prewarmChained        atomic.Int64
+	prewarmUnchained      atomic.Int64
 }
 
 func (c *shapeCounters) snapshot() ShapeStats {
@@ -37,6 +59,12 @@ func (c *shapeCounters) snapshot() ShapeStats {
 		DualToolSources:       c.dualToolSources.Load(),
 		UnknownModels:         c.unknownModels.Load(),
 		IncrementalReinjects:  c.incrementalReinjects.Load(),
+		Prewarms:              c.prewarms.Load(),
+		PrewarmConnFailures:   c.prewarmConnFailures.Load(),
+		PrewarmRejections:     c.prewarmRejections.Load(),
+		PrewarmRedials:        c.prewarmRedials.Load(),
+		PrewarmChained:        c.prewarmChained.Load(),
+		PrewarmUnchained:      c.prewarmUnchained.Load(),
 	}
 }
 
