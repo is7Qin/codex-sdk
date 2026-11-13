@@ -113,8 +113,7 @@ func (cv *wsConversation) prepareFrame(ctx context.Context, p *parsedRequest, cu
 		return cur // 预热帧：不开新轮
 	}
 	in := analyzeInputValue(p.vals[keyInput])
-	prev := p.vals[keyPreviousResponseID]
-	if s, ok := jsonStringValue(prev); !ok || len(s) == 0 {
+	if !incrementalFrame(p) {
 		// 全量帧：会话簿开轮/续轮。
 		id, ce := cv.book.prepare(ctx, ConversationRequest{
 			Key: cv.key, InstallationID: cv.inst, Owner: cv.owner, Input: in, Now: now,
@@ -154,8 +153,16 @@ func (cv *wsConversation) prepareFrame(ctx context.Context, p *parsedRequest, cu
 	return &ns
 }
 
+// incrementalFrame 报告帧是否带非空 previous_response_id（增量帧）。
+func incrementalFrame(p *parsedRequest) bool {
+	s, ok := jsonStringValue(p.vals[keyPreviousResponseID])
+	return ok && len(s) > 0
+}
+
 // dialConversation 在 Dial 时对首帧做一次计算：generate:false → 只取对话记录
-// （prewarm 形态握手）；否则 Prepare（turn 形态握手）。返回握手身份与首帧整形。
+// （prewarm 形态握手）；带 previous_response_id 的增量首帧 → 先取对话记录，再按
+// 增量帧规则定轮次（turn 形态握手）；否则 Prepare（turn 形态握手）。返回握手身份
+// 与首帧整形。
 func dialConversation(ctx context.Context, opt *conversationOption, cfg shapeConfig) (*wsConversation, Identity, *firstFrameState, error) {
 	now := time.Now()
 	p, err := parseRequest(opt.first, surfaceWSNative, now)
@@ -169,13 +176,16 @@ func dialConversation(ctx context.Context, opt *conversationOption, cfg shapeCon
 		owner: opt.req.Owner,
 		fifo:  make(chan *wsFrameIdentity, wsConversationFIFO),
 	}
-	var st *wsConvState
-	if bytes.Equal(p.vals[keyGenerate], litFalse) {
-		st = &wsConvState{conv: opt.book.prepareConversation(ctx, ConversationRequest{
+	st := &wsConvState{}
+	prewarm := bytes.Equal(p.vals[keyGenerate], litFalse)
+	if prewarm || incrementalFrame(&p) {
+		// 预热帧与增量首帧都没有全量输入可 Prepare：先补对话记录（缓存或 Open）。
+		st.conv = opt.book.prepareConversation(ctx, ConversationRequest{
 			Key: cv.key, InstallationID: cv.inst, Owner: cv.owner, Now: now,
-		})}
-	} else {
-		st = cv.prepareFrame(ctx, &p, &wsConvState{}, now)
+		})
+	}
+	if !prewarm {
+		st = cv.prepareFrame(ctx, &p, st, now)
 	}
 	cv.state.Store(st)
 	id := st.identity(cv.inst)

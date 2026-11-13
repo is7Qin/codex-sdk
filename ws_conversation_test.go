@@ -162,6 +162,10 @@ func TestWSConversationFrames(t *testing.T) {
 		if s.calls() != 1 || len(book.queue) != 1 {
 			t.Fatalf("首帧应只 Prepare 一次: calls=%d queue=%d", s.calls(), len(book.queue))
 		}
+		// Dial 那次 Prepare 不经缓存命中；首帧若又 Prepare 一次，对话与轮次缓存必然各命中一次。
+		if st := book.Stats(); st.ConversationCacheHits != 0 || st.TurnCacheHits != 0 {
+			t.Fatalf("首帧不应再 Prepare（缓存命中说明重算了）: %+v", st)
+		}
 		if got := handshakeTurnMetaField(t, up, "turn_id").String(); got == "" || got != frameTurnID(t, f) {
 			t.Fatalf("握手 turn_id %q 与首帧 %q 不一致", got, frameTurnID(t, f))
 		}
@@ -200,6 +204,9 @@ func TestWSConversationFrames(t *testing.T) {
 		if nt := frameTurnID(t, newTurn); nt == "" || nt == turn || frameTurnState(t, newTurn) != "" {
 			t.Fatalf("新用户消息应开新轮且不带旧 ts: %q ts=%q", nt, frameTurnState(t, newTurn))
 		}
+		if st := c.conv.state.Load(); st.turn.ID != frameTurnID(t, newTurn) || !st.turn.First || st.source != turnSourceLocal {
+			t.Fatalf("连接内新轮应 First=true、来源 local: %+v source=%d", st.turn, st.source)
+		}
 		if frameTurnID(t, after) != frameTurnID(t, newTurn) || frameTurnState(t, after) != "ts-4" {
 			t.Fatalf("连接内新轮的 ts 只进连接快照: turn=%q ts=%q", frameTurnID(t, after), frameTurnState(t, after))
 		}
@@ -213,6 +220,43 @@ func TestWSConversationFrames(t *testing.T) {
 		}
 		if len(book.queue) != 2 { // 开轮写入 + ts 写入；连接内新轮不写
 			t.Fatalf("写入队列 = %d", len(book.queue))
+		}
+	})
+
+	// 首帧就是增量帧（带 previous_response_id）：Dial 先补对话记录，再按增量规则。
+	t.Run("IncrementalFirstFrame", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, frame string
+			first       bool
+			temporary   int64
+		}{
+			{"FollowUp", wsFollowIncr, false, 1},
+			{"NewUserMessage", wsNewUserIncr, true, 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newCountingStore(NewMemoryConversationStore())
+				book := newTestBook(s, nil)
+				up := newTSUpstream(t, nil)
+				c := dialConversationClient(t, up, book, tc.frame)
+				st := c.conv.state.Load()
+				if st.conv == nil || st.turn.ID == "" || st.source != turnSourceLocal || st.turn.First != tc.first {
+					t.Fatalf("增量首帧快照 = %+v source=%d", st.turn, st.source)
+				}
+				if s.opens.Load() != 1 || s.loads.Load() != 0 || len(book.queue) != 0 ||
+					book.Stats().WSLocalTemporaryTurns != tc.temporary {
+					t.Fatalf("增量首帧只取对话记录、不读写轮次: opens=%d loads=%d queue=%d %+v",
+						s.opens.Load(), s.loads.Load(), len(book.queue), book.Stats())
+				}
+				mustSend(t, c, tc.frame)
+				up.waitFrames(t, 1)
+				f := up.sentFrames(t)[0]
+				if got := handshakeTurnMetaField(t, up, "turn_id").String(); got != st.turn.ID || frameTurnID(t, f) != got {
+					t.Fatalf("握手 turn_id %q / 帧 %q / 快照 %q", got, frameTurnID(t, f), st.turn.ID)
+				}
+				if th := gjson.GetBytes(f, "client_metadata.thread_id").String(); th != st.conv.rec.Thread || th == "" {
+					t.Fatalf("帧线程号 %q ≠ 对话记录 %q", th, st.conv.rec.Thread)
+				}
+			})
 		}
 	})
 
