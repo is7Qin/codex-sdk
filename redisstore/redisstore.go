@@ -11,6 +11,16 @@
 // 64 位数值（窗口号、压缩标记、开始时刻）以十进制字符串存放，脚本只做字符串
 // 相等比较（窗口号加一除外），不经过 Lua 的双精度数。
 //
+// 期限：会话簿给 Open/Advance/Load 30ms 预算（SaveTurns 每批 2s），全靠 ctx 期限
+// 落实。go-redis 只有开启 ContextTimeoutEnabled 才按 ctx 期限设套接字超时，否则
+// 按 ReadTimeout/WriteTimeout（默认 3s，实测服务端卡住时 Prepare 卡约 5s，熔断
+// 来不及打开）。因此传入 *redis.Client / *redis.ClusterClient / *redis.Ring 时
+// Options().ContextTimeoutEnabled 必须为 true，否则 New panic；其他 Scripter 实现
+// （包装器、自定义客户端）无法检查，须自行尊重 ctx 期限。
+//
+// 脚本不是事务：SaveTurns 返回错误（如客户端超时、断连）时服务端可能已部分写入；
+// 写入本身幂等，会话簿丢弃整批不重试，后果至多是该批 ts 未回填本地缓存。
+//
 // 只支持单节点 Redis：SaveTurns 一批一次脚本（KEYS 为 2N 个），跨哈希槽的
 // Cluster 部署会被服务端拒绝；键不加哈希标签（设计如此）。
 package redisstore
@@ -44,10 +54,15 @@ func WithTTL(conversation, turn time.Duration) Option {
 	}
 }
 
-// New 返回基于 rdb 的 ConversationStore。
+// New 返回基于 rdb 的 ConversationStore。rdb 为 go-redis 的 *redis.Client /
+// *redis.ClusterClient / *redis.Ring 时必须开启 ContextTimeoutEnabled（否则
+// panic，见包文档）；其他 Scripter 须自行尊重 ctx 期限。
 func New(rdb redis.Scripter, opts ...Option) codexsdk.ConversationStore {
 	if rdb == nil {
 		panic("redisstore: rdb 不能为 nil")
+	}
+	if !honorsContextDeadline(rdb) {
+		panic("redisstore: go-redis 客户端必须设置 ContextTimeoutEnabled=true（否则 30ms 预算失效）")
 	}
 	s := &store{rdb: rdb, convTTL: codexsdk.StoreConversationTTL, turnTTL: codexsdk.StoreTurnTTL}
 	for _, o := range opts {
@@ -56,6 +71,20 @@ func New(rdb redis.Scripter, opts ...Option) codexsdk.ConversationStore {
 	s.convTTLms = strconv.FormatInt(s.convTTL.Milliseconds(), 10)
 	s.turnTTLms = strconv.FormatInt(s.turnTTL.Milliseconds(), 10)
 	return s
+}
+
+// honorsContextDeadline 检查已知的 go-redis 客户端是否开启 ContextTimeoutEnabled；
+// 其他实现无从检查，视为满足（由调用方负责）。
+func honorsContextDeadline(rdb redis.Scripter) bool {
+	switch c := rdb.(type) {
+	case *redis.Client:
+		return c.Options().ContextTimeoutEnabled
+	case *redis.ClusterClient:
+		return c.Options().ContextTimeoutEnabled
+	case *redis.Ring:
+		return c.Options().ContextTimeoutEnabled
+	}
+	return true
 }
 
 type store struct {
