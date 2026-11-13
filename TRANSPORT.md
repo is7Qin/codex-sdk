@@ -173,6 +173,7 @@ data:<帧字节 verbatim>\n
 | `StreamBody` 非 200 / 升级失败（有响应） | `*HTTPError{StatusCode, Raw: body}` | `*HTTPError{StatusCode, Raw: ≤1KiB 截断 body, cause: *DialError}`（`errors.As` 可回溯到 `*DialError`，两侧错误分类面对称） |
 | 拨号失败（**无**响应：连接拒绝 / 拨号中取消） | `*url.Error` | 原始错误链（`%w`），**不是** `*HTTPError`（`errors.Is(ctx)` 保持成立） |
 | 预取消 / 拨号中取消 | ctx 错误 | `errors.Is(ctx)` 成立，无 `*HTTPError` |
+| 取消与写 create 帧赛跑（取消守卫先关连接，写返回 errConnClosing / closed network connection） | — | 写失败时 exchange ctx 已结束 ⇒ 错误链并入 `ctx.Err()`（`errors.Is(context.Canceled / DeadlineExceeded)` 成立，原错误链 `%w` 保留）；ctx 未结束时原样返回 |
 | 读 body 出错 | 裸错误（`*url.Error` 等） | 裸错误（底层读错；不包成 `*HTTPError`） |
 | close frame | 无此形态 | pumped：`io.EOF`；pull：`Client.Recv` 返回 `*CloseError` |
 | pull 模式 `Recv` 的 ctx 取消 | — | 按 coder 语义**关闭连接**并返回 ctx 错误（不是"只影响本次取帧"） |

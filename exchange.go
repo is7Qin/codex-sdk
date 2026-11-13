@@ -191,7 +191,7 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 				frame, startOff := assembleWS(&sh, full)
 				if werr := cc.cn.writeStamped(exchangeCtx, frame, startOff); werr != nil {
 					e.teardown(werr) // 写失败不重试、不重拨（create 可能已进 socket）
-					return nil, e.writeFailure(werr)
+					return nil, e.writeFailure(ctxWriteErr(exchangeCtx, werr))
 				}
 				return e, nil
 			}
@@ -247,7 +247,7 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 	frame, startOff := assembleWS(&sh, a)
 	if werr := e.cn.writeStamped(exchangeCtx, frame, startOff); werr != nil {
 		e.teardown(werr) // 写失败不重试、不重拨（response.create 可能已进 socket）
-		return nil, werr
+		return nil, ctxWriteErr(exchangeCtx, werr)
 	}
 	return e, nil
 }
@@ -276,7 +276,7 @@ func (e *wsExchange) prewarm(sh *shapedRequest, sink TurnStateSink, real wsAssem
 	shapeStats.prewarms.Add(1)
 	frame, off := assembleWS(sh, wsAssembly{prewarm: true})
 	if werr := e.cn.writeStamped(e.ctx, frame, off); werr != nil {
-		return real, false, e.prewarmConnFailure(werr)
+		return real, false, e.prewarmConnFailure(ctxWriteErr(e.ctx, werr))
 	}
 	held := prewarmTurnState{inner: sink}
 	obs := turnStateObserver{sink: &held}
@@ -409,6 +409,20 @@ func (e *wsExchange) terminateOwned(cause error) {
 	if e.cn.lease.CompareAndSwap(e, nil) {
 		e.cn.terminate(cause)
 	}
+}
+
+// ctxWriteErr：写帧失败时若 exchange ctx 已结束，把 ctx.Err() 并入错误链。
+//
+// 调用方取消与写帧赛跑时，取消守卫（AfterFunc）可能先把连接置为关闭，写返回的
+// 是 errConnClosing / "use of closed network connection"，链里没有 Canceled。
+// 这里补上 ctx 错误（errors.Is(err, context.Canceled / DeadlineExceeded) 成立），
+// 原错误链 %w 保留；ctx 未结束时原样返回，不改变其他错误分类。只在失败路径执行。
+func ctxWriteErr(ctx context.Context, werr error) error {
+	cerr := ctx.Err()
+	if cerr == nil || errors.Is(werr, cerr) {
+		return werr
+	}
+	return fmt.Errorf("codexsdk: 写帧时请求已结束（%w）: %w", cerr, werr)
 }
 
 // writeFailure 给"写 create 帧失败"补上复用诊断：**只改错误文案，不改分类**
