@@ -113,6 +113,13 @@ var classifyDiffCases = []string{
 	`{"type":"agent_message"}`,
 }
 
+// escapedInputKeyPayloads：顶层 input 键用转义拼写（按解码名比较、只认首现）。
+// 第二条里首个解码为 input 的成员是字符串，其后的字面 "input" 数组须被忽略。
+var escapedInputKeyPayloads = []string{
+	`{"inp\u0075t":[{"role":"user","content":"a"},{"type":"function_call_output"}]}`,
+	`{"x":{"input":[1]},"inp\u0075t":"hi","input":[{"role":"user"}]}`,
+}
+
 // TestClassifyInputItemMatchesEager：单遍惰性分类与旧的逐成员查找语义一致
 // （含转义键、重复键首现、非字符串 type/role、role 在 type 之前）。
 func TestClassifyInputItemMatchesEager(t *testing.T) {
@@ -123,7 +130,7 @@ func TestClassifyInputItemMatchesEager(t *testing.T) {
 		}
 	}
 	payload := `{"model":"m","input":[` + strings.Join(classifyDiffCases[5:], ",") + `]}`
-	for _, p := range []string{payload, payload[:len(payload)-3] + `,{"type":"function_call_output"}]}`} {
+	for _, p := range append([]string{payload, payload[:len(payload)-3] + `,{"type":"function_call_output"}]}`}, escapedInputKeyPayloads...) {
 		if got, want := AnalyzeConversationInput([]byte(p)), analyzeEager([]byte(p)); got != want {
 			t.Errorf("Analyze 不一致\n got=%+v\nwant=%+v", got, want)
 		}
@@ -135,6 +142,9 @@ func FuzzClassifyInputItemMatchesEager(f *testing.F) {
 		f.Add([]byte(`{"input":[` + c + `]}`))
 	}
 	f.Add([]byte(`{"input":"hi"}`))
+	for _, p := range escapedInputKeyPayloads {
+		f.Add([]byte(p))
+	}
 	f.Add([]byte(`{"input":[{"role":"user"},{"type":"compaction"},{"type":"x_call_output"}]}`))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if !gjson.ValidBytes(b) {
