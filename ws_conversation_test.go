@@ -566,6 +566,143 @@ func TestWSConversationFrames(t *testing.T) {
 		}
 	})
 
+	// 下面三例在"Send 读快照"与"写闸内 commit / rollback"之间插入一次 Recv
+	// （改快照），交错由挂点在写闸内同步执行构造，不依赖调度。
+
+	// commit：本帧沿用的同一轮次在窗口内捕获到 ts，发布时保留。
+	t.Run("CommitKeepsSameTurnTS", func(t *testing.T) {
+		book := newTestBook(NewMemoryConversationStore(), nil)
+		up := newTSUpstream(t, func(i int, _ []byte) []string {
+			if i == 0 {
+				return respondTurn("r0", "ts-0")
+			}
+			return nil
+		})
+		c := dialConversationClient(t, up, book, wsFullFrame)
+		mustSend(t, c, wsFullFrame) // 不 Recv：Send 读到的快照 ts 为空
+		armWriteHook(t, func() { recvUntil(t, c, 1) })
+		mustSend(t, c, wsFollowIncr) // 同轮后续帧；窗口内 Recv 捕获 ts-0
+		if st := c.conv.state.Load(); st.ts != "ts-0" {
+			t.Fatalf("commit 丢了窗口内捕获的同轮 ts: %q", st.ts)
+		}
+		mustSend(t, c, wsFollowIncr)
+		up.waitFrames(t, 3)
+		fs := up.sentFrames(t)
+		if frameTurnID(t, fs[2]) != frameTurnID(t, fs[0]) || frameTurnState(t, fs[2]) != "ts-0" {
+			t.Fatalf("同轮后续帧应带 ts-0: turn=%q/%q ts=%q", frameTurnID(t, fs[2]), frameTurnID(t, fs[0]), frameTurnState(t, fs[2]))
+		}
+	})
+
+	// commit：本帧用掉旧预热 ts，窗口内又到了新预热 ts——新预热 ts 保留给下一轮。
+	t.Run("CommitKeepsNewerPrewarmTS", func(t *testing.T) {
+		book := newTestBook(NewMemoryConversationStore(), nil)
+		up := newTSUpstream(t, func(i int, _ []byte) []string {
+			switch i {
+			case 0:
+				return respondTurn("r0", "ts-pw")
+			case 1:
+				return respondTurn("r1", "ts-pw2")
+			}
+			return nil
+		})
+		c := dialConversationClient(t, up, book, wsPrewarmFrame)
+		mustSend(t, c, wsPrewarmFrame)
+		recvUntil(t, c, 1)
+		mustSend(t, c, wsPrewarmFrame) // 第二次预热，响应留待窗口内收
+		armWriteHook(t, func() { recvUntil(t, c, 1) })
+		mustSend(t, c, wsNewUserIncr) // 新轮用掉 ts-pw；窗口内到 ts-pw2
+		if got := c.conv.state.Load().prewarmTS; got != "ts-pw2" {
+			t.Fatalf("commit 丢了窗口内到达的新预热 ts: %q", got)
+		}
+		mustSend(t, c, wsNewUserIncr) // 再开一轮：带 ts-pw2
+		up.waitFrames(t, 4)
+		fs := up.sentFrames(t)
+		if frameTurnState(t, fs[2]) != "ts-pw" || frameTurnState(t, fs[3]) != "ts-pw2" {
+			t.Fatalf("预热 ts 归属错误: %q %q", frameTurnState(t, fs[2]), frameTurnState(t, fs[3]))
+		}
+	})
+
+	// rollback 慢路径：发布后、写失败前 Recv 改了快照（同轮 ts），撤销时以发布前的
+	// 快照为底并保留该 ts。
+	t.Run("RollbackKeepsTSCapturedAfterCommit", func(t *testing.T) {
+		book := newTestBook(NewMemoryConversationStore(), nil)
+		up := newTSUpstream(t, func(i int, _ []byte) []string {
+			if i == 0 {
+				return respondTurn("r0", "ts-0")
+			}
+			return nil
+		})
+		tr := newStallTransport(t, up.srv.URL)
+		c, err := Dial(context.Background(), PAT("pat-conv"), Identity{}, WithTransport(tr),
+			WithConversation(book, ConversationRequest{Key: wsConvKey, InstallationID: "inst-ws", Owner: ownerA}, []byte(wsFullFrame)))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.CloseNow() })
+		mustSend(t, c, wsFullFrame)
+		up.waitFrames(t, 1)
+		before := c.conv.state.Load()
+		var published *wsConvState
+		fail := func() {
+			published = c.conv.state.Load()
+			recvUntil(t, c, 1) // 帧 0 的 ts 落进已发布的快照（同一轮次）
+		}
+		tr.onFail.Store(&fail)
+		tr.failNext.Store(true)
+		// 同轮增量帧换了指令：发布的快照与原快照不同（inject 变）。
+		if err := c.Send(context.Background(), []byte(wsIncrWithInstr("changed"))); err == nil {
+			t.Fatal("写帧应失败")
+		}
+		if published == nil || published == before || published.inject == before.inject {
+			t.Fatal("写帧前未发布新快照（测试无效）")
+		}
+		st := c.conv.state.Load()
+		if st.ts != "ts-0" || st.turn != before.turn {
+			t.Fatalf("rollback 丢了发布后捕获的同轮 ts: ts=%q turn=%+v", st.ts, st.turn)
+		}
+		if st.inject != before.inject {
+			t.Fatalf("rollback 未撤销本帧的 inject: %d != %d", st.inject, before.inject)
+		}
+	})
+
+	// rollback 慢路径：发布后、写失败前到了预热 ts，撤销时保留。
+	t.Run("RollbackKeepsPrewarmTSArrivedAfterCommit", func(t *testing.T) {
+		book := newTestBook(NewMemoryConversationStore(), nil)
+		up := newTSUpstream(t, func(i int, _ []byte) []string {
+			if i == 0 {
+				return respondTurn("r0", "ts-pw")
+			}
+			return nil
+		})
+		tr := newStallTransport(t, up.srv.URL)
+		c, err := Dial(context.Background(), PAT("pat-conv"), Identity{}, WithTransport(tr),
+			WithConversation(book, ConversationRequest{Key: wsConvKey, InstallationID: "inst-ws", Owner: ownerA}, []byte(wsPrewarmFrame)))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.CloseNow() })
+		mustSend(t, c, wsPrewarmFrame)
+		up.waitFrames(t, 1)
+		before := c.conv.state.Load()
+		var published *wsConvState
+		fail := func() {
+			published = c.conv.state.Load()
+			recvUntil(t, c, 1) // 预热响应的 ts 落进已发布的快照
+		}
+		tr.onFail.Store(&fail)
+		tr.failNext.Store(true)
+		if err := c.Send(context.Background(), []byte(wsNewUserIncr)); err == nil {
+			t.Fatal("写帧应失败")
+		}
+		if published == nil || published == before {
+			t.Fatal("写帧前未发布新快照（测试无效）")
+		}
+		st := c.conv.state.Load()
+		if st.prewarmTS != "ts-pw" || st.turn != before.turn {
+			t.Fatalf("rollback 丢了发布后到达的预热 ts 或未撤销轮次: prewarm=%q turn=%+v", st.prewarmTS, st.turn)
+		}
+	})
+
 	t.Run("FIFOFullStopsCapture", func(t *testing.T) {
 		book := newTestBook(NewMemoryConversationStore(), nil)
 		up := newTSUpstream(t, func(i int, _ []byte) []string {
@@ -708,6 +845,19 @@ func TestWSConversationClientValuesNeverEgress(t *testing.T) {
 	}
 }
 
+// armWriteHook 让下一次写在写闸内、登记之前同步执行 fn（一次性）。
+func armWriteHook(t *testing.T, fn func()) {
+	t.Helper()
+	var once atomic.Bool
+	hook := func() {
+		if once.CompareAndSwap(false, true) {
+			fn()
+		}
+	}
+	writeStampHook.Store(&hook)
+	t.Cleanup(func() { writeStampHook.Store(nil) })
+}
+
 // stallTransport 把请求改写到测试服务器，并能让下一次网络写在字节交给内核之后、
 // Write 返回之前停住（直到给定通道关闭）：模拟"帧已上线、写方尚未返回"时上游
 // 立即回包。
@@ -715,8 +865,9 @@ type stallTransport struct {
 	srv      *url.URL
 	rt       *http.Transport
 	gate     atomic.Pointer[chan struct{}]
-	failNext atomic.Bool // 下一次网络写直接失败
-	stalled  atomic.Bool // 确实停住过、且等到了通道关闭
+	failNext atomic.Bool            // 下一次网络写直接失败
+	onFail   atomic.Pointer[func()] // failNext 生效时、返回错误之前调用（一次性）
+	stalled  atomic.Bool            // 确实停住过、且等到了通道关闭
 }
 
 func newStallTransport(t *testing.T, srvBase string) *stallTransport {
@@ -755,6 +906,9 @@ type stallConn struct {
 
 func (c *stallConn) Write(p []byte) (int, error) {
 	if c.st.failNext.CompareAndSwap(true, false) {
+		if f := c.st.onFail.Swap(nil); f != nil {
+			(*f)()
+		}
 		return 0, errors.New("stallConn: write failed")
 	}
 	n, err := c.Conn.Write(p)
