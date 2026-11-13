@@ -483,6 +483,70 @@ func TestBookDegradation(t *testing.T) {
 			t.Fatalf("关闭后应放行: %d → %d", before, s.calls())
 		}
 	})
+	t.Run("LoadFailsKeepsLocalConversation", func(t *testing.T) {
+		// 本地已有对话记录、只是轮次未命中且 Load 失败：沿用本地对话记录（不换线程），
+		// 给临时轮次（First=false、无 Sink），不退回一次性身份。
+		s := newCountingStore(NewMemoryConversationStore())
+		b := newTestBook(s, nil)
+		key := NewConversationKey("dom", 1, "c")
+		x := b.Prepare(bgctx, convReq(key, turnPayload, ownerA))
+		if x.Sink == nil || !x.Turn.First {
+			t.Fatalf("首请求应走正常路径: %+v", x)
+		}
+		before := b.Stats()
+		s.fail.Store(true)
+		// 第二轮（turn2Payload）的后续请求：本副本没见过这一轮 ⇒ 轮次缓存未命中 ⇒ Load。
+		follow2 := `{"model":"gpt-5.5","input":[` + userHi + `,` + toolCall + `,` + toolOutput + `,` + assistantMsg + `,` + userHi + `,` +
+			`{"type":"function_call","call_id":"c2","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"c2","output":"ok"}]}`
+		y := b.Prepare(bgctx, convReq(key, follow2, ownerA))
+		if y.Session.ThreadID != x.Session.ThreadID || y.Window != x.Window {
+			t.Fatalf("Load 失败应沿用本地对话记录: x=%+v y=%+v", x.Session, y.Session)
+		}
+		if y.Turn.First || y.Sink != nil || y.Turn.ID == "" || y.Turn.ID == x.Turn.ID {
+			t.Fatalf("应给临时轮次（First=false、无 Sink、新轮次号）: %+v", y.Turn)
+		}
+		st := b.Stats()
+		if st.LoadFailures != before.LoadFailures+1 || st.TemporaryTurns != before.TemporaryTurns+1 || st.OneShotIdentities != before.OneShotIdentities {
+			t.Fatalf("计数: before=%+v after=%+v", before, st)
+		}
+	})
+	t.Run("CallerCancelNotCountedByBreaker", func(t *testing.T) {
+		// 调用方 ctx 已取消导致的存储失败不计入熔断；半开探测被取消时归还探测名额。
+		s := newCountingStore(NewMemoryConversationStore())
+		s.fail.Store(true)
+		clk := newTestClock()
+		b := newTestBook(s, clk)
+		cctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		p := func(ctx context.Context, i int) Identity {
+			return b.Prepare(ctx, convReq(NewConversationKey("dom", int64(i), "c"), turnPayload, ownerA))
+		}
+		for i := range 2 * bookBreakerFails {
+			if id := p(cctx, i); id.Session.ThreadID == "" {
+				t.Fatal("取消也应降级出身份")
+			}
+		}
+		if st := b.Stats(); st.BreakerOpens != 0 || st.BreakerRejects != 0 || s.calls() != 2*bookBreakerFails {
+			t.Fatalf("取消不得计入熔断: calls=%d %+v", s.calls(), st)
+		}
+		// 真实失败打开熔断，到期后半开：被取消的探测不得把熔断器再开，名额要归还。
+		for i := range bookBreakerFails {
+			p(bgctx, 100+i)
+		}
+		if b.Stats().BreakerOpens != 1 {
+			t.Fatalf("真实失败应打开熔断: %+v", b.Stats())
+		}
+		clk.advance(5 * time.Second)
+		calls := s.calls()
+		p(cctx, 200) // 半开探测，调用方已取消
+		if s.calls() != calls+1 || b.Stats().BreakerOpens != 1 {
+			t.Fatalf("被取消的探测不得再开熔断: calls=%d→%d %+v", calls, s.calls(), b.Stats())
+		}
+		s.fail.Store(false)
+		if id := p(bgctx, 201); id.Sink == nil || s.calls() != calls+2 {
+			t.Fatalf("探测名额应已归还，下一次作为探测放行并关闭熔断: calls=%d %+v", s.calls(), id)
+		}
+	})
 	t.Run("QueueFull", func(t *testing.T) {
 		b := newTestBook(NewMemoryConversationStore(), nil, WithBookQueueSize(2))
 		for i := range 3 {

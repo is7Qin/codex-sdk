@@ -792,6 +792,8 @@ func TestPrewarmFailure(t *testing.T) {
 			`{"type":"response.incomplete","response":{"id":"resp_pw","object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`,
 		}, "T-held-inc"},
 		{"5xx error 帧", []string{`{"type":"error","status":503,"error":{"type":"server_error","message":"unavailable"}}`}, ""},
+		// 边界：500 是 5xx 的下界，必须重拨（不是 4xx 的确定性拒绝）。
+		{"500 error 帧", []string{`{"type":"error","status":500,"error":{"type":"server_error","message":"internal"}}`}, ""},
 		{"无状态 error 帧", []string{`{"type":"error","error":{"type":"server_error","message":"no status"}}`}, ""},
 	} {
 		t.Run("重拨-"+c.name, func(t *testing.T) {
