@@ -3,14 +3,11 @@ package codexsdk
 import (
 	"bytes"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 var easternTime = func() *time.Location {
@@ -21,21 +18,21 @@ var easternTime = func() *time.Location {
 	return loc
 }()
 
-// 伪装层：Codex 客户端形态对齐（逐点对齐真实 codex 客户端源码）。
-// UA / originator / beta 头、头常量、字段白名单、client_metadata 组装、
-// trace 与 turn_id 自动生成、会话标识与 turn-state 回传。
-// 机制进 SDK，业务值由调用方（网关）提供。
+// 伪装层：Codex 客户端形态对齐（逐点对齐官方 codex-tui 0.169.0 源码与抓包）。
+// 头常量、UA / originator / version / beta 头；请求整形见 shape.go。
 
-// DefaultOriginator 默认 originator 头值（codex-tui；
-// 首方值集合：codex_cli_rs / codex-tui / codex_vscode / codex_exec）。
-// WithHeader("Originator", ...) 可覆盖。
+// CodexVersion 是伪装的官方客户端版本（UA 与 version 头共用）。
+const CodexVersion = "0.169.0"
+
+// DefaultOriginator 默认 originator 头值（codex-tui）。WithHeader("originator", ...) 可覆盖。
 const DefaultOriginator = "codex-tui"
 
-// DefaultCodexUserAgent 默认 codex UA（codex-tui/0.154.0 +
-// Ubuntu 指纹；真实形态 "{originator}/{version} ({os} {os_version}; {arch})
-// {terminal} ({originator}; {version})"——UA 前缀与 originator 保持一致）。
-// WithHeader("User-Agent", ...) 可覆盖。
-const DefaultCodexUserAgent = "codex-tui/0.154.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tui; 0.154.0)"
+// DefaultCodexUserAgent 默认 codex UA（照抓包原样：codex-tui 0.169.0 + Ubuntu +
+// gnome-terminal）。WithHeader("User-Agent", ...) 可覆盖。
+const DefaultCodexUserAgent = "codex-tui/0.169.0 (Ubuntu 24.4.0; x86_64) gnome-terminal (codex-tui; 0.169.0)"
+
+// DefaultBetaFeatures 是 x-codex-beta-features 的值（默认安装下只有这一项）。
+const DefaultBetaFeatures = "remote_compaction_v2"
 
 // DefaultBetaWS 是现役唯一的 Responses WS beta 值（真实源码全仓库唯一常量），
 // 仅 WS 握手注入。
@@ -57,158 +54,20 @@ const (
 	HeaderOAIAAttestation = "x-oai-attestation"
 	HeaderTraceparent     = "traceparent"
 	HeaderTracestate      = "tracestate"
-	// HeaderResponsesLite 是 responses-lite internal 标记头（值 "true"；
-	// 仅 gpt-5.6-sol/terra/luna 等 lite 模型触发）：HTTP 请求以
-	// WithHeader 透传，SDK 只透传不解析（lite 触发与请求体形态由网关决定）。
+	HeaderVersion         = "version"
+	HeaderRoutingHint     = "x-codex-routing-hint"
+	// HeaderResponsesLite 是 responses-lite internal 标记头（值 "true"）：SDK 对
+	// lite 模型的 HTTP 请求自动发送（WS 走 client_metadata 的 MetaResponsesLiteKey）。
 	HeaderResponsesLite = "x-openai-internal-codex-responses-lite"
 )
 
-// client_metadata 内的 key 名（对齐真实 client_metadata()：
-// session_id/thread_id/turn_id 为 snake_case 且与头名不同；
-// x-codex-turn-state 的 metadata key 名即头名）。
-const (
-	codexMetaInstallationKey = "x-codex-installation-id"
-	codexMetaSessionKey      = "session_id"
-	codexMetaThreadKey       = "thread_id"
-	codexMetaTurnKey         = "turn_id"
-	codexMetaWindowKey       = "x-codex-window-id"
-	codexMetaSubagentKey     = "x-openai-subagent"
-	codexMetaParentThreadKey = "x-codex-parent-thread-id" // 条件键（真实 client_metadata()，responses_metadata.rs）
-	codexMetaParentTurnKey   = "parent_turn_id"           // 条件键（真实 client_metadata()，responses_metadata.rs）
-	codexMetaTurnMetadataKey = "x-codex-turn-metadata"
-	codexMetaTurnStateKey    = "x-codex-turn-state"
-	codexMetaTraceparentKey  = "ws_request_header_traceparent"
-	codexMetaTracestateKey   = "ws_request_header_tracestate"
-	// MetaResponsesLiteKey 是 responses-lite 的 client_metadata 键（值 "true"；
-	// 服务端约定把 ws_request_header_ 前缀键还原为请求头，与 HeaderResponsesLite
-	// 同一标记）。SDK 只保留键名常量，不提供任意 metadata 透传入口。
-	MetaResponsesLiteKey = "ws_request_header_x_openai_internal_codex_responses_lite"
-)
+// MetaResponsesLiteKey 是 responses-lite 的 client_metadata 键（值 "true"；
+// 服务端约定把 ws_request_header_ 前缀键还原为请求头，与 HeaderResponsesLite
+// 同一标记）。SDK 在 lite 模型的 WS 帧里自动写入。
+const MetaResponsesLiteKey = "ws_request_header_x_openai_internal_codex_responses_lite"
 
-// codexWsPayloadFields 是 WS response.create 帧顶层 key 白名单（19 键，逐键对齐
-// 真实 ResponseCreateWsRequest，含 access_programs）。包内私有（不导出，防外部
-// 改动污染过滤语义）；只读，勿改。
-var codexWsPayloadFields = []string{
-	"type", "model", "instructions", "previous_response_id", "input",
-	"tools", "tool_choice", "parallel_tool_calls", "reasoning",
-	"store", "stream", "stream_options", "include", "service_tier",
-	"prompt_cache_key", "text", "generate", "client_metadata", "access_programs",
-}
-
-// codexHTTPPayloadFields 是 HTTP POST 体顶层 key 白名单（16 键，逐键对齐真实
-// ResponsesApiRequest；无 type/previous_response_id/generate）。包内私有（不导出，
-// 防外部改动污染过滤语义）；只读，勿改。
-var codexHTTPPayloadFields = []string{
-	"model", "instructions", "input", "tools", "tool_choice",
-	"parallel_tool_calls", "reasoning", "store", "stream", "stream_options",
-	"include", "service_tier", "prompt_cache_key", "text",
-	"client_metadata", "access_programs",
-}
-
-// codexWsPayloadFieldSet / codexHTTPPayloadFieldSet 是两张白名单的构建期查表集
-// （供过滤用；只读，勿改）。
-var (
-	codexWsPayloadFieldSet   = newCodexFieldSet(codexWsPayloadFields)
-	codexHTTPPayloadFieldSet = newCodexFieldSet(codexHTTPPayloadFields)
-)
-
-func newCodexFieldSet(fields []string) map[string]struct{} {
-	m := make(map[string]struct{}, len(fields))
-	for _, f := range fields {
-		m[f] = struct{}{}
-	}
-	return m
-}
-
-// ErrEmptyFrame 是帧经白名单过滤后无任何白名单字段时返回的错误
-// （空结果帧不入网）。
-var ErrEmptyFrame = errors.New("codexsdk: 帧经白名单过滤后为空")
-
-// clientMetadataKey 是顶层身份键的规范拼写（解码后的名字）：白名单过滤、
-// 重复判定与注入/删除都以它为准。
+// clientMetadataKey 是顶层 client_metadata 的规范拼写（解码后的名字）。
 const clientMetadataKey = "client_metadata"
-
-// codexTopLevelNeedsFilter 报告 raw（经 gjson.ValidBytes 校验的 JSON）是否
-// 需要按白名单重建顶层对象：出现非白名单 key，或身份键 `client_metadata`
-// 出现**多次**。重复成员是 JSON 里的"后者生效"歧义，而覆写只写第一处——
-// 留着第二处等于把 payload 的旧身份原样送上游；重建按有序白名单逐键写一次，
-// 天然收敛成唯一成员。零拷贝零分配（对象根且顶层 key 无转义的快路径）。
-// 非对象根 / 顶层 key 含转义（\）→ 回退 gjsonTopLevelNeedsFilter（精确
-// gjson unescape 语义，罕见、可分配）。判定只看顶层，不深入嵌套。
-func codexTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
-	// 跳过前导空白；非对象根（数组 / 标量 / null）回退 gjson（精确语义）。
-	i := 0
-	for i < len(raw) && isJSONSpace(raw[i]) {
-		i++
-	}
-	if i >= len(raw) || raw[i] != '{' {
-		return gjsonTopLevelNeedsFilter(raw, set)
-	}
-	i++ // 越过 '{'
-	seenIdentity := false
-	for {
-		// 跳过空白与 ','；遇 '}' / 输入末即扫描完毕（无白名单外键）。
-		for i < len(raw) && (isJSONSpace(raw[i]) || raw[i] == ',') {
-			i++
-		}
-		if i >= len(raw) || raw[i] == '}' {
-			return false
-		}
-		if raw[i] != '"' {
-			return true // 防御：合法 JSON 不可达
-		}
-		keyStart := i + 1 // 开引号之后
-		i = skipJSONString(raw, i)
-		if i < 0 { // 未闭合：结构异常 → 回退
-			return gjsonTopLevelNeedsFilter(raw, set)
-		}
-		key := raw[keyStart : i-1]
-		if bytes.IndexByte(key, '\\') >= 0 { // 键含转义：回退 gjson（解码语义）
-			return gjsonTopLevelNeedsFilter(raw, set)
-		}
-		// set[string(key)] 为 Go 编译器特化的无分配 map 查找。
-		if _, ok := set[string(key)]; !ok {
-			return true
-		}
-		if string(key) == clientMetadataKey { // 同样走编译器的无分配比较
-			if seenIdentity {
-				return true // 重复身份键 ⇒ 重建（收敛成唯一成员）
-			}
-			seenIdentity = true
-		}
-		// 跳过空白与 ':' 后跳过整个值。
-		for i < len(raw) && (isJSONSpace(raw[i]) || raw[i] == ':') {
-			i++
-		}
-		i = skipJSONValue(raw, i)
-		if i < 0 { // 值结构异常 → 回退
-			return gjsonTopLevelNeedsFilter(raw, set)
-		}
-	}
-}
-
-// gjsonTopLevelNeedsFilter 旧路径（gjson ForEach + key.String()，精确 unescape
-// 语义）；仅非对象根或顶层 key 含转义（罕见）时使用。
-func gjsonTopLevelNeedsFilter(raw []byte, set map[string]struct{}) bool {
-	needs := false
-	identity := 0
-	gjson.ParseBytes(raw).ForEach(func(key, _ gjson.Result) bool {
-		k := key.String()
-		if _, ok := set[k]; !ok {
-			needs = true
-			return false
-		}
-		if k == clientMetadataKey {
-			identity++
-			if identity > 1 { // 重复（含转义拼写）⇒ 重建
-				needs = true
-				return false
-			}
-		}
-		return true
-	})
-	return needs
-}
 
 // skipJSONString 跳过 JSON 字符串（raw[i] 为开引号），返回闭引号之后的下标；
 // 未闭合返回 -1。'\' 转义分支跳 1 字节（+循环自增 = 跳过转义目标；\"、\\、
@@ -293,63 +152,6 @@ var (
 	jsonNullBytes  = []byte("null")
 )
 
-// filterCodexPayload 顶层 key 白名单过滤（纯函数，WS/HTTP 两侧过滤器共用）：
-// 删除不在 ordered 中的顶层 key，白名单字段的值原样搬移（gjson raw，值内容
-// 零解析，只动顶层不深入嵌套）；set 为 ordered 的查表集。
-//
-// 空输入/非法 JSON 原样返回；无需删除时零拷贝返回原字节；
-// 过滤后无任何白名单字段时返回 ErrEmptyFrame。
-func filterCodexPayload(raw []byte, ordered []string, set map[string]struct{}) ([]byte, error) {
-	if len(raw) == 0 || !gjson.ValidBytes(raw) {
-		return raw, nil
-	}
-	if !codexTopLevelNeedsFilter(raw, set) {
-		return raw, nil
-	}
-	filtered := []byte(`{}`)
-	for _, field := range ordered {
-		v := gjson.GetBytes(raw, field)
-		if !v.Exists() {
-			continue
-		}
-		// sjson.SetRawBytes 错误可忽略：field 来自构建期静态白名单（合法 key）、
-		// v.Raw 来自 gjson 对已验证合法 JSON 的解析（合法值），向仅含 "{}" 的
-		// filtered 追加原始值不会失败；此处吞错维持现状（无需 debug 埋点）。
-		filtered, _ = sjson.SetRawBytes(filtered, field, []byte(v.Raw))
-	}
-	if len(filtered) == 2 { // "{}"
-		return nil, ErrEmptyFrame
-	}
-	return filtered, nil
-}
-
-// FilterCodexWsPayload 用 WS 白名单（codexWsPayloadFields）过滤帧顶层 key。
-func FilterCodexWsPayload(raw []byte) ([]byte, error) {
-	return filterCodexPayload(raw, codexWsPayloadFields, codexWsPayloadFieldSet)
-}
-
-// FilterCodexHTTPPayload 用 HTTP 白名单（codexHTTPPayloadFields）过滤请求体顶层 key。
-func FilterCodexHTTPPayload(raw []byte) ([]byte, error) {
-	return filterCodexPayload(raw, codexHTTPPayloadFields, codexHTTPPayloadFieldSet)
-}
-
-// forceCodexStoreFalse 强制顶层 store:false（真 codex 恒 false：client.rs:997）。
-// 非法 JSON 原样返回；store 已为 false 时**零拷贝**返回原字节（真 codex 帧恒带
-// store:false → 不重写，归一未改动时 Send 保有零拷贝快速路径）。
-func forceCodexStoreFalse(raw []byte) []byte {
-	if !gjson.ValidBytes(raw) {
-		return raw
-	}
-	if v := gjson.GetBytes(raw, "store"); v.Exists() && v.Type == gjson.False {
-		return raw // 已 false：零拷贝
-	}
-	out, err := sjson.SetBytes(raw, "store", false)
-	if err != nil {
-		return raw
-	}
-	return out
-}
-
 // RewriteEnvironmentContextTime 把 Codex 环境上下文中的本地时间改成美东时间。
 // 只替换 <current_date> 与 <timezone> 的文本内容，其余字节保持不变。
 func RewriteEnvironmentContextTime(raw []byte, now time.Time) []byte {
@@ -366,20 +168,18 @@ func RewriteEnvironmentContextTime(raw []byte, now time.Time) []byte {
 		if v.Type == gjson.String && strings.Contains(v.Str, "<environment_context>") {
 			next := replaceEnvironmentTime(v.Str, date)
 			if next != v.Str {
-				encoded, err := sjson.SetBytes([]byte("{}"), "v", next)
-				if err == nil {
-					value := gjson.GetBytes(encoded, "v").Raw
-					start := v.Index
-					end := start + len(v.Raw)
-					if !envContextSpliceOK(cursor, start, end, len(raw)) {
-						return // 游标异常：保守跳过该次改写（不越界 panic）
-					}
-					out = append(out, raw[cursor:start]...)
-					out = append(out, value...)
-					cursor = end
-					changed = true
-					return
+				// serde_json 规则编码（不做 HTML 转义）：官方请求体里 < > & 原样。
+				value := appendJSONString(nil, next)
+				start := v.Index
+				end := start + len(v.Raw)
+				if !envContextSpliceOK(cursor, start, end, len(raw)) {
+					return // 游标异常：保守跳过该次改写（不越界 panic）
 				}
+				out = append(out, raw[cursor:start]...)
+				out = append(out, value...)
+				cursor = end
+				changed = true
+				return
 			}
 		}
 		if v.IsArray() || v.IsObject() {
@@ -443,23 +243,6 @@ type Session struct {
 	ThreadID        string // 头 thread-id / metadata thread_id
 	WindowID        string // 头 x-codex-window-id / metadata x-codex-window-id（{thread_id}:{n}，n 自 0 起）
 	ClientRequestID string // 头 x-client-request-id（空则用 ThreadID）
-}
-
-// CodexMeta 是 client_metadata 静态载体（值由调用方提供，SDK 只组装不生成；
-// trace 与 turn_id 另有自动机制，见 WithTraceContext / WithTurnAuto，
-// 也可用本结构静态注入。优先级：Identity.Meta > Identity.Session > 自动机制）。
-type CodexMeta struct {
-	InstallationID string // metadata "x-codex-installation-id"（UUIDv4，账号级持久）
-	SessionID      string // metadata "session_id"（UUIDv7，会话级）
-	ThreadID       string // metadata "thread_id"（UUIDv7，线程级）
-	TurnID         string // metadata "turn_id"（UUIDv7；为空时 SDK 每轮自动生成）
-	WindowID       string // metadata "x-codex-window-id"（{thread_id}:{n}）
-	Subagent       string // metadata "x-openai-subagent"（条件）
-	ParentThreadID string // metadata "x-codex-parent-thread-id"（条件；续接/子代理）
-	ParentTurnID   string // metadata "parent_turn_id"（条件；续接/子代理）
-	TurnMetadata   string // metadata "x-codex-turn-metadata"
-	Traceparent    string // metadata "ws_request_header_traceparent"（为空时自动生成）
-	Tracestate     string // metadata "ws_request_header_tracestate"
 }
 
 // TraceContext 是 W3C trace context（仅注入 WS 帧内 client_metadata——
@@ -534,202 +317,4 @@ func randFill(b []byte) {
 	if _, err := rand.Read(b); err != nil {
 		panic(fmt.Sprintf("codexsdk: crypto/rand 失败: %v", err))
 	}
-}
-
-// metadataEntry 是 client_metadata 注入项（key 值均由调用方/机制提供）。
-type metadataEntry struct {
-	key   string
-	value string
-}
-
-// metaEntries 是 client_metadata 注入项序列，惰性累积：出现首个非空值才分配
-// 底层数组（全空 / 未注入路径零分配）。同名键取**首次出现**
-// （clientMetadataObject 去重，后写不覆盖）——WS 帧编码器与 HTTP
-// injectResponsesClientMetadata 共用同一累积器与键序。
-//
-// 方法按值收发（如 append 的惯用法，返回新切片）——指针接收会让调用方的
-// entries 逃逸到堆，令 HTTP 注入路径平白多一次分配。
-type metaEntries []metadataEntry
-
-// add 追加一项，跳过空值，返回新切片。
-func (e metaEntries) add(key, value string) metaEntries {
-	if value == "" {
-		return e
-	}
-	if e == nil {
-		e = make(metaEntries, 0, 8)
-	}
-	return append(e, metadataEntry{key, value})
-}
-
-// withCodexMetaIdentity 追加 CodexMeta 的共有身份键（installation/session/
-// thread/turn/window/subagent，与真实 client_metadata() 同序）。面特有键
-// （WS 的 turn_metadata/traceparent/tracestate、HTTP 的父键 + turn_metadata）
-// 由调用方紧随其后按各自键序补充。零值不追加任何键。
-func (e metaEntries) withCodexMetaIdentity(m CodexMeta) metaEntries {
-	e = e.add(codexMetaInstallationKey, m.InstallationID)
-	e = e.add(codexMetaSessionKey, m.SessionID)
-	e = e.add(codexMetaThreadKey, m.ThreadID)
-	e = e.add(codexMetaTurnKey, m.TurnID)
-	e = e.add(codexMetaWindowKey, m.WindowID)
-	e = e.add(codexMetaSubagentKey, m.Subagent)
-	return e
-}
-
-// withSessionIdentity 追加 Session 兜底身份键；CodexMeta 同名键已先入，按
-// 首现优先不覆盖。零值不追加任何键。
-func (e metaEntries) withSessionIdentity(s Session) metaEntries {
-	e = e.add(codexMetaSessionKey, s.SessionID)
-	e = e.add(codexMetaThreadKey, s.ThreadID)
-	e = e.add(codexMetaWindowKey, s.WindowID)
-	return e
-}
-
-// clientMetadataObject 组装 client_metadata 对象字节：entries 按**首次出现**去重
-// （entries 自身优先级：Identity.Meta > Identity.Session > turn-state > 自动机制）、
-// 空值跳过。键/值按 encoding/json 规则转义（含 `<`/`>`/`&` 的 HTML
-// 转义 \u003c/\u003e/\u0026 与 U+2028/U+2029——与 sjson 对已有字节的原样直写
-// 不同）。无有效 entry → nil（调用方据此**删除**该键，见 injectClientMetadataObject）。
-func clientMetadataObject(entries []metadataEntry) []byte {
-	if len(entries) == 0 {
-		return nil
-	}
-	buf := make([]byte, 0, 4+len(entries)*32)
-	buf = append(buf, '{')
-	first := true
-	for i, e := range entries {
-		if e.value == "" {
-			continue
-		}
-		dup := false
-		for j := 0; j < i; j++ {
-			if entries[j].key == e.key && entries[j].value != "" {
-				dup = true
-				break
-			}
-		}
-		if dup {
-			continue
-		}
-		if !first {
-			buf = append(buf, ',')
-		}
-		first = false
-		buf = appendJSONString(buf, e.key)
-		buf = append(buf, ':')
-		buf = appendJSONString(buf, e.value)
-	}
-	if first {
-		return nil
-	}
-	return append(buf, '}')
-}
-
-// appendJSONString 按 encoding/json 规则把 s 作为 JSON 字符串追加到 out，
-// 与 json.Marshal(string) 逐字节一致：`"`/`\` 与 \n\r\t\b\f 快捷转义、其余
-// 控制字符 \u00XX、HTML 敏感字符 & < > → \u0026/\u003c/\u003e、行分隔符
-// U+2028/U+2029 → \uXXXX、非法 UTF-8 字节 → \ufffd。相对 json.Marshal 省去
-// 每个键/值一次 []byte 分配（键多为常量、值为 UUID/ASCII，通常走零转义快路径）。
-func appendJSONString(out []byte, s string) []byte {
-	out = append(out, '"')
-	start := 0
-	for i := 0; i < len(s); {
-		c := s[i]
-		if c < utf8.RuneSelf {
-			if c != '"' && c != '\\' && c >= 0x20 && c != '&' && c != '<' && c != '>' {
-				i++
-				continue
-			}
-			out = append(out, s[start:i]...)
-			switch c {
-			case '"':
-				out = append(out, '\\', '"')
-			case '\\':
-				out = append(out, '\\', '\\')
-			case '\n':
-				out = append(out, '\\', 'n')
-			case '\r':
-				out = append(out, '\\', 'r')
-			case '\t':
-				out = append(out, '\\', 't')
-			case '\b':
-				out = append(out, '\\', 'b')
-			case '\f':
-				out = append(out, '\\', 'f')
-			case '&':
-				out = append(out, '\\', 'u', '0', '0', '2', '6')
-			case '<':
-				out = append(out, '\\', 'u', '0', '0', '3', 'c')
-			case '>':
-				out = append(out, '\\', 'u', '0', '0', '3', 'e')
-			default: // c < 0x20
-				out = append(out, '\\', 'u', '0', '0', hexDigit(c>>4), hexDigit(c&0xf))
-			}
-			i++
-			start = i
-			continue
-		}
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size == 1 {
-			out = append(out, s[start:i]...)
-			out = append(out, '\\', 'u', 'f', 'f', 'f', 'd')
-			i++
-			start = i
-			continue
-		}
-		if r == '\u2028' || r == '\u2029' {
-			out = append(out, s[start:i]...)
-			out = append(out, '\\', 'u', '2', '0', '2', hexDigit(byte(r)&0xf))
-			i += size
-			start = i
-			continue
-		}
-		i += size
-	}
-	out = append(out, s[start:]...)
-	return append(out, '"')
-}
-
-func hexDigit(b byte) byte {
-	if b < 10 {
-		return '0' + b
-	}
-	return 'a' + b - 10
-}
-
-// injectClientMetadataKeys 用网关身份**整体替换**帧/请求体顶层 client_metadata
-// （单遍 sjson.SetRawBytes——protoconv 字节级拼接同款：只做一次改写真）：
-// codex 面客户端自带的 client_metadata **永不透传**（连同非网关键一并丢弃，网关
-// 身份恒为准）。整体替换实测优于逐键覆盖（逐键 N 次重序列化整份 body，整体替换
-// 1 次；256KB 体 ~0.73ms/25 allocs → ~0.29ms/11 allocs，内存 ~1.4MB → ~0.29MB）。
-// entries 无有效项 ⇒ 删除帧内该键。
-func injectClientMetadataKeys(frame []byte, entries []metadataEntry) []byte {
-	return injectClientMetadataObject(frame, clientMetadataObject(entries))
-}
-
-// injectClientMetadataObject 用本次身份对象整体覆写 payload 的 client_metadata。
-// obj 为空（匿名且无任何自动字段）时**删除**该键：身份只来自 Identity，留着
-// payload 自带值等于把调用方的旧 session/thread/ts 透传给上游。
-//
-// 前置条件：帧已过白名单过滤（filterCodexPayload）——它保证顶层身份键**至多
-// 一个**，无论输入是普通拼写、转义拼写还是重复成员（见
-// codexTopLevelNeedsFilter）。所以这里的删除/覆写只作用于唯一那个成员，不存在
-// "删了第一个、第二个漏网"。
-//
-// 删除/覆写都交给 sjson 按 JSON 键语义匹配，不做原始字节前缀判断：转义拼写
-// （`client_\u006detadata`）在上游会被 unescape 成同一个键，字节比较看不见它，
-// 但 sjson 看得见。键本来就不存在时 sjson 返回入参同一切片（零拷贝）。
-func injectClientMetadataObject(frame, obj []byte) []byte {
-	if len(obj) == 0 {
-		out, err := sjson.DeleteBytes(frame, clientMetadataKey)
-		if err != nil {
-			return frame // 非法 JSON：放弃本次注入，保持帧原样
-		}
-		return out
-	}
-	out, err := sjson.SetRawBytes(frame, clientMetadataKey, obj)
-	if err != nil {
-		return frame // 非法 JSON：放弃本次注入，保持帧原样
-	}
-	return out
 }

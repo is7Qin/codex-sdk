@@ -439,7 +439,7 @@ func TestRotationFatalCodeCaseInsensitive(t *testing.T) {
 // TestRotationEndpoint401UnconditionalFatal：token 端点 401 无条件判死
 // （无论错误码，对齐 codex manager.rs:1537-1538）。
 func TestRotationEndpoint401UnconditionalFatal(t *testing.T) {
-	for _, body := range []string{`{"error":"something_unknown"}`, `{}`, ``} {
+	for _, body := range []string{`{"error":"something_unknown"}`, `{"model":"m"}`, ``} {
 		m := newMockRefresh(t, refreshStep{status: 401, body: body})
 		auth := OAuthWithRotation("rt-0")
 		_, err := auth.Authorization(context.Background())
@@ -687,7 +687,7 @@ func TestWSDial401Rotation(t *testing.T) {
 			t.Fatalf("refresh 次数 = %d, 期望 1", m.callCount())
 		}
 		// 重连后连接可用
-		if err := c.Send(context.Background(), []byte(`{"type":"ping"}`)); err != nil {
+		if err := c.Send(context.Background(), []byte(`{"type":"ping","model":"m"}`)); err != nil {
 			t.Fatalf("重连后 Send: %v", err)
 		}
 	})

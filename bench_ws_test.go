@@ -152,41 +152,31 @@ func benchWSClient(b *testing.B, up *benchWSUpstream) *HTTPClient {
 	b.Helper()
 	return NewHTTPClient(PAT("pat-bench"),
 		WithResponsesTransport(TransportWS),
-		WithTurnAuto(false),
 		WithTransport(benchFixedTransport(b, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
 	)
 }
 
-// BenchmarkFrameCodecPrepare3KB：spec §7 P1 —— 帧构造 + 归一（3.7KB 体）。
-//
-// 测量体是生产发送的等价链：frameCodec.encode(encodeWSResponses) = HTTP→WS 协议
-// 形状（单遍快路径 encodeOnePass；非紧凑 / 转义键 / 重复键 / 白名单外键才回退
-// buildResponsesCreateFrame）+ 伪装层归一（白名单 / store 归零 / client_metadata
-// 组装）。codec 在循环外构造（无状态），循环内构造等于把配置
-// 成本摊进被测链。traceAuto/turnAuto 保持 true —— 每帧生成 traceparent 与
-// turn_id 是真实路径。
-func BenchmarkFrameCodecPrepare3KB(b *testing.B) {
+// BenchmarkWSShape3KB：HTTP→WS 每帧整形（parseRequest + shapeRequest + assembleWS）
+// 的完整成本，3.7KB 请求体、非匿名身份（client_metadata 与 turn-metadata 都合成）。
+// 取代旧 BenchmarkFrameCodecPrepare3KB（单遍编码器已删除）。
+func BenchmarkWSShape3KB(b *testing.B) {
 	if n := len(wsBenchPayload); n < 3600 || n > 3800 {
 		b.Fatalf("wsBenchPayload 长度 %d 越界（要求 3600–3800）", n)
 	}
-	fc := newFrameCodec(&options{traceAuto: true, turnAuto: true})
 	id := Identity{
-		Session: Session{SessionID: "bench-session", ThreadID: "bench-thread", WindowID: "bench-thread:0"},
-		Meta: CodexMeta{
-			InstallationID: "bench-installation",
-			SessionID:      "bench-session",
-			ThreadID:       "bench-thread",
-			WindowID:       "bench-thread:0",
-		},
+		InstallationID: "bench-installation",
+		Session:        Session{SessionID: "bench-thread", ThreadID: "bench-thread", WindowID: "bench-thread:0"},
 	}
+	cfg := shapeConfig{}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(wsBenchPayload)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		out, err := fc.encode(wsBenchPayload, encodeWSResponses, frameInput{Identity: id, Now: time.Now()})
+		sh, err := shapeBody(wsBenchPayload, surfaceWSFromHTTP, id, time.Now(), cfg)
 		if err != nil {
-			b.Fatalf("frameCodec.encode: %v", err)
+			b.Fatalf("shapeBody: %v", err)
 		}
+		out, _ := assembleWS(&sh, wsAssembly{})
 		benchSink = len(out)
 	}
 }

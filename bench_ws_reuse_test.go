@@ -62,7 +62,6 @@ func BenchmarkWSStreamBodyReused(b *testing.B) {
 	})
 	hc := NewHTTPClient(PAT("pat-bench"),
 		WithResponsesTransport(TransportWS),
-		WithTurnAuto(false),
 		WithTransport(benchFixedTransport(b, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
 		WithWSConnCache(2),
 	)
@@ -121,7 +120,6 @@ func TestWSReuseR18Counters(t *testing.T) {
 	})
 	hc := NewHTTPClient(PAT("pat-bench"),
 		WithResponsesTransport(TransportWS),
-		WithTurnAuto(false),
 		WithTransport(newFixedTransport(t, DefaultResponsesURL, up.srv.URL)),
 		WithWSConnCache(2),
 	)

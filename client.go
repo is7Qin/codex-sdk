@@ -1,6 +1,7 @@
 package codexsdk
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,8 +24,6 @@ const (
 	// Pong，从不主动周期 Ping）。这个默认值现在只用于让 WithPingInterval(0) 这类
 	// 现有调用照旧编译；内核不再读它。
 	defaultPingInterval = 30 * time.Second
-	// defaultCompressionThreshold 压缩开启时仅压缩超过该大小的消息。
-	defaultCompressionThreshold = 512
 	// defaultWSIdleTimeout 是 WS 读空闲上限的默认值：对齐真实客户端的
 	// DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000（5 分钟）。**默认开**——如果默认关，
 	// "上游收下 create 却永不回帧"的会话就会在消费侧永久挂住（现场症状）。
@@ -48,8 +47,10 @@ const (
 // ErrMessageTooBig 单帧超过 ReadLimit（透传 coder/websocket）。
 var ErrMessageTooBig = coderws.ErrMessageTooBig
 
-// CompressionMode 是消息压缩模式（默认不压缩：性能优先，LLM 流式小消息
-// 压缩收益低、耗 CPU）。
+// CompressionMode 是 WS 压缩协商模式（默认 CompressionContextTakeover：握手声明
+// permessage-deflate，与官方客户端一致）。无论哪种模式，SDK 出站帧都不压缩
+// （CompressionThreshold = math.MaxInt）：context takeover 的 flate 写入器每连接
+// 常驻约 1.2MB，出站压缩不值这个内存；入站压缩帧照常解压。
 type CompressionMode int
 
 const (
@@ -109,12 +110,14 @@ type options struct {
 	beta         string        // Responses WS beta 版本（默认 DefaultBetaWS=2026-02-06，现役唯一真实值）
 	headers      http.Header
 
-	// 伪装层（Send 帧 / 升级与请求头）。身份（Session/Meta/turn-state）是请求
-	// 数据，经 Identity 逐次传入，不落在 options 上。
-	trace        *TraceContext // 外部注入（WS 帧 metadata，优先于自动生成）
-	traceAuto    bool          // 每帧自动生成 trace（默认开，WS 专用）
-	turnAuto     bool          // 每帧自动生成 turn_id（默认开）
-	turnProvider func(turn uint64) string
+	// 伪装层（Send 帧 / 升级与请求头）。身份是请求数据，经 Identity 逐次传入，
+	// 不落在 options 上。
+	trace     *TraceContext // 外部注入（WS 帧 metadata，优先于自动生成）
+	traceAuto bool          // 每帧自动生成 trace（默认关，WS 专用）
+
+	// firstFrame 是 WithFirstFrame 的首帧（仅 Dial 读）：握手头的 routing-hint
+	// 与 turn-metadata 取自它。
+	firstFrame []byte
 
 	// HTTP 专用。
 	timeout     time.Duration
@@ -139,12 +142,10 @@ type options struct {
 
 func defaultOptions() options {
 	return options{
-		compression:  CompressionDisabled,
+		compression:  CompressionContextTakeover,
 		readLimit:    defaultReadLimit,
 		pingInterval: defaultPingInterval,
 		beta:         DefaultBetaWS,
-		traceAuto:    true,
-		turnAuto:     true,
 		maxLineSize:  defaultMaxLineSize,
 
 		keepaliveInterval: defaultKeepaliveInterval,
@@ -156,9 +157,10 @@ func defaultOptions() options {
 // Option 配置 Dial / NewHTTPClient。
 type Option func(*options)
 
-// reservedIdentityHeaders 是身份/turn-state 保留头：身份只能经 Identity 传入，
-// WithHeader（含默认头）遇到它们一律构造期 panic——否则删掉身份 Option 之后
-// 仍可从默认头注入身份，边界就白划了。匹配大小写不敏感。
+// reservedIdentityHeaders 是保留头：身份 / turn-state 只能经 Identity 传入，
+// 官方形态头（version、routing-hint、beta-features、turn-metadata、lite 标记、
+// accept、content-encoding）只由 SDK 合成。WithHeader 遇到它们一律构造期
+// panic——否则默认头就成了第二条注入通道。匹配大小写不敏感。
 var reservedIdentityHeaders = [...]string{
 	HeaderSessionID,
 	HeaderThreadID,
@@ -166,6 +168,13 @@ var reservedIdentityHeaders = [...]string{
 	HeaderWindowID,
 	HeaderInstallationID,
 	HeaderTurnState,
+	HeaderVersion,
+	HeaderRoutingHint,
+	HeaderBetaFeatures,
+	HeaderTurnMetadata,
+	HeaderResponsesLite,
+	"accept",
+	"content-encoding",
 }
 
 // resolveOptions 是 Dial / NewHTTPClient 共用的 Option 应用阶段：默认值 → 选项
@@ -184,13 +193,14 @@ func rejectReservedHeaders(h http.Header) {
 	for k := range h {
 		for _, reserved := range reservedIdentityHeaders {
 			if strings.EqualFold(k, reserved) {
-				panic("codexsdk: WithHeader 不得设置身份保留头 " + reserved + "（身份只能经 Identity 传入）")
+				panic("codexsdk: WithHeader 不得设置保留头 " + reserved + "（身份经 Identity 传入，形态头由 SDK 合成）")
 			}
 		}
 	}
 }
 
-// WithCompression 设置 WS 压缩模式（默认 CompressionDisabled）。
+// WithCompression 设置 WS 压缩协商模式（默认 CompressionContextTakeover）。
+// 出站帧恒不压缩（见 CompressionMode）。
 func WithCompression(mode CompressionMode) Option {
 	return func(o *options) { o.compression = mode }
 }
@@ -224,10 +234,13 @@ func WithBeta(version string) Option {
 
 // WithHeader 注入附加请求头（WS 升级 / HTTP 请求通用），覆盖默认头
 // （如 WithHeader("User-Agent", ...) 覆盖默认 codex UA）；同名多次调用为扩展。
+// 发送时头名一律小写（User-Agent 除外），覆盖时规范写法与小写写法都删除。
 //
-// 身份/turn-state 保留键（session-id / thread-id / x-client-request-id /
-// x-codex-window-id / x-codex-installation-id / x-codex-turn-state）在构造期
-// panic：身份只能经 Identity 传入，默认头不得成为第二条注入通道。
+// 保留键（身份：session-id / thread-id / x-client-request-id / x-codex-window-id /
+// x-codex-installation-id / x-codex-turn-state；形态：version /
+// x-codex-routing-hint / x-codex-beta-features / x-codex-turn-metadata /
+// x-openai-internal-codex-responses-lite / accept / content-encoding）在构造期
+// panic。
 func WithHeader(key, value string) Option {
 	return func(o *options) {
 		if o.headers == nil {
@@ -237,33 +250,26 @@ func WithHeader(key, value string) Option {
 	}
 }
 
-// WithTraceContext 注入外部 trace context（每帧注入 Send 帧
-// client_metadata 的 trace key；禁用自动生成）。仅作用于 WS——
-// 真实客户端握手头与 HTTP 请求均不发 trace。
+// WithTraceContext 注入外部 trace context（WS 帧 client_metadata 的
+// ws_request_header_traceparent / tracestate；优先于自动生成）。仅作用于 WS——
+// 官方客户端握手头与 HTTP 请求均不发 trace。
 func WithTraceContext(tc TraceContext) Option {
 	return func(o *options) { o.trace = &tc }
 }
 
-// WithTraceAuto 开关每帧 trace 自动生成（默认开：每个 Send 帧生成新的
-// W3C traceparent 并注入 client_metadata，与真实客户端每请求新 span 一致）。
-// 仅作用于 WS。
+// WithTraceAuto 开关每帧 trace 自动生成（默认关：官方客户端只在进程开启
+// 链路追踪时才带 trace 键）。开启后每个 WS 帧生成新的 W3C traceparent。
 func WithTraceAuto(enabled bool) Option {
 	return func(o *options) { o.traceAuto = enabled }
 }
 
-// WithTurnAuto 开关 turn_id 自动生成（默认开：每个 Send 帧生成新的 UUIDv7
-// 注入 client_metadata.turn_id；CodexMeta.TurnID 静态值优先）。
-// 关闭后（且无静态值）帧内不带 turn_id。
-func WithTurnAuto(enabled bool) Option {
-	return func(o *options) { o.turnAuto = enabled }
-}
-
-// WithTurnMetadata 设置 turn_metadata 内容提供回调：每次 Send 计一轮 turn
-// （从 1 起自增），以当前 turn 序号调用回调，返回值（协议约定格式的字符串，
-// 可为空=不注入）组装进 client_metadata."x-codex-turn-metadata"。
-// 优先级：帧内已存在 > CodexMeta.TurnMetadata > 本回调。
-func WithTurnMetadata(provider func(turn uint64) string) Option {
-	return func(o *options) { o.turnProvider = provider }
+// WithFirstFrame 只作用于 Dial（WS→WS 静态身份）：first 必须与随后第一次 Send
+// 的帧逐字节相同。Dial 用它整形一次，握手带 x-codex-routing-hint 与
+// x-codex-turn-metadata（first 是 generate:false 时为 prewarm 形态，否则 turn
+// 形态）；第一次 Send 复用这次整形（同一个 turn_id）。未设置时握手不带这两个头。
+// first 不是合法请求体时 Dial 返回 ErrInvalidRequestBody。
+func WithFirstFrame(first []byte) Option {
+	return func(o *options) { o.firstFrame = first }
 }
 
 // WithTimeout 设置 HTTP 客户端总超时（http.Client.Timeout；默认 0 不设限）。
@@ -336,10 +342,17 @@ func withConnSweepInterval(d time.Duration) Option {
 // 5s + 等对端关闭帧 5s），等不起用 CloseNow（立即返回）。
 type Client struct {
 	cn    *conn
-	codec *frameCodec
+	shape shapeConfig
 	id    Identity
 
-	turn atomic.Uint64 // turn_metadata 计数（仅 WithTurnMetadata 时自增）
+	// first 是 WithFirstFrame 的首帧与 Dial 时对它的整形；第一次 Send 的帧与
+	// first 逐字节相同时复用（同一个 turn_id），之后清空。
+	first       []byte
+	firstShaped atomic.Pointer[shapedRequest]
+
+	// observer 只在 Recv 里使用（至多一个 goroutine 同时 Recv）：把属于本次
+	// response 的 response.metadata turn-state 交给 id.Sink。
+	observer turnStateObserver
 
 	// closed 标记本地已发起关闭（Close/CloseNow）。对端关闭由常驻读者观测。
 	closed atomic.Bool
@@ -367,50 +380,66 @@ func Dial(ctx context.Context, auth Auth, id Identity, opts ...Option) (*Client,
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
 	cfg := resolveOptions(opts)
-	cn, hs, err := dialConn(ctx, dialSpec{
+	c := &Client{shape: shapeConfigOf(&cfg), id: id}
+	spec := dialSpec{
 		auth:      auth,
 		opts:      cfg,
 		readLimit: cfg.readLimit,
 		mode:      modePull,
 		headers:   cfg.headers,
 		identity:  id,
-	})
+	}
+	if cfg.firstFrame != nil {
+		sh, err := shapeBody(cfg.firstFrame, surfaceWSNative, id, time.Now(), c.shape)
+		if err != nil {
+			return nil, err
+		}
+		spec.shaped = &sh
+		c.first = cfg.firstFrame
+		c.firstShaped.Store(&sh)
+	}
+	cn, _, err := dialConn(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
-	// 握手响应头签发的 ts 只走 Sink（消息身份边界：SDK 不保留状态）。
-	id.deliverTurnState(hs.turnState)
-	return &Client{cn: cn, codec: newFrameCodec(&cfg), id: id}, nil
+	c.cn = cn
+	c.observer = turnStateObserver{sink: id.Sink}
+	return c, nil
 }
 
-// Send 发送一帧字节（文本帧）。
+// Send 发送一帧 response.create（文本帧）。
 //
-// WS 归一无条件生效：顶层白名单过滤（FilterCodexWsPayload，过滤后为空返回
-// ErrEmptyFrame 不入网）+ 强制 store:false；其后 client_metadata 组装照旧
-// （CodexMeta 静态值 / trace / turn_metadata；整体替换帧内 client_metadata——
-// 客户端自带的永不透传）。Write 同步消费——Send 返回前不得复用 frame。
+// 每帧按官方形态整形（两段式：白名单、同名键首现、官方键序、client_metadata
+// 由 Identity 合成——客户端自带的整个丢弃）；previous_response_id 与 generate
+// 原样保留（由上游判断）。generate:false 的帧按预热形态写 client_metadata
+// （turn_id 为空串、prewarm 形态 turn-metadata、不带 turn-state）。
+// 请求体无效返回 ErrInvalidRequestBody（不入网）。
+// x-codex-ws-stream-request-start-ms 在取得写闸之后写入发送时刻。Write 同步
+// 消费——Send 返回前不得复用 frame。
 func (c *Client) Send(ctx context.Context, frame []byte) error {
-	wire, err := c.encodeFrame(frame)
-	if err != nil {
-		return err
+	var sh shapedRequest
+	if p := c.firstShaped.Swap(nil); p != nil && bytes.Equal(c.first, frame) {
+		sh = *p
+	} else {
+		var err error
+		if sh, err = shapeBody(frame, surfaceWSNative, c.id, time.Now(), c.shape); err != nil {
+			return err
+		}
 	}
-	return c.cn.write(ctx, wire)
+	a := wsAssembly{prevID: sh.clientPrevID, generate: sh.clientGenerate}
+	if !sh.nativePrewarm {
+		a.turnState = sh.turnState(c.id)
+	}
+	wire, off := assembleWS(&sh, a)
+	return c.cn.writeStamped(ctx, wire, off)
 }
 
-// encodeFrame 把原生帧编码成 wire 字节（请求级快照：Identity + turn 计数）。
-func (c *Client) encodeFrame(frame []byte) ([]byte, error) {
-	turn := uint64(0)
-	if c.codec.turnProvider != nil {
-		turn = c.turn.Add(1)
-	}
-	return c.codec.encode(frame, encodeNativeWS, frameInput{
-		Identity: c.id,
-		Turn:     turn,
-		Now:      time.Now(),
-	})
-}
-
-// Recv 读取下一帧字节（文本/二进制帧原样透传，不区分帧类型不做解析）。
+// Recv 读取下一帧字节（文本/二进制帧原样透传，不改写）。
+//
+// turn-state：帧是 response.metadata 且其 response_id 等于最近一次
+// response.created 的 id 时，把其中的 x-codex-turn-state 交给 Identity.Sink
+// （只读顶层 type，其余帧零解析）。握手响应头里的 turn-state 不取（官方只认
+// 事件）。
 //
 // 直读 socket（pull 模式无 pump、无队列）。data 为 coder/websocket 每次 Read
 // 独立分配的缓冲，跨次调用有效。对端关闭/网络断开/超 ReadLimit 时返回错误
@@ -430,12 +459,17 @@ func (c *Client) encodeFrame(frame []byte) ([]byte, error) {
 func (c *Client) Recv(ctx context.Context) ([]byte, error) {
 	budget := c.cn.cfg.idleTimeout
 	if budget <= 0 {
-		return c.cn.readFrame(ctx) // 既有行为（显式 opt-out）
+		data, err := c.cn.readFrame(ctx) // 既有行为（显式 opt-out）
+		if err == nil {
+			c.observer.observe(data)
+		}
+		return data, err
 	}
 	rctx, cancel := context.WithDeadline(ctx, time.Now().Add(budget))
 	defer cancel()
 	data, err := c.cn.readFrame(rctx)
 	if err == nil {
+		c.observer.observe(data)
 		return data, nil
 	}
 	if ctx.Err() != nil {

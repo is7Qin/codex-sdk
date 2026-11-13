@@ -188,7 +188,7 @@ func startResponsesMock(t *testing.T, hdr http.Header, events []string, sendDone
 			cap.ct = r.Header.Get("Content-Type")
 			cap.ua = r.Header.Get("User-Agent")
 			cap.origin = r.Header.Get("Originator")
-			cap.body, _ = io.ReadAll(r.Body)
+			cap.body, _ = readRequestBody(r)
 			cap.mu.Unlock()
 		}
 		for k, vs := range hdr {
@@ -243,7 +243,7 @@ func TestResponsesAggregateWire(t *testing.T) {
 		t.Fatalf("payload 未带 stream 应注入 stream:true, body = %s", cap.body)
 	}
 	if gjson.GetBytes(cap.body, "model").String() != "gpt-5.6" ||
-		gjson.GetBytes(cap.body, "input").String() != "hi" {
+		gjson.GetBytes(cap.body, "input.0.content.0.text").String() != "hi" {
 		t.Fatalf("注入不应动其余字段: %s", cap.body)
 	}
 
@@ -317,32 +317,24 @@ func TestResponsesStreamFalseOverridden(t *testing.T) {
 	}
 }
 
-// TestResponsesInvalidPayloadAbandonInjection：非法 JSON payload → 放弃注入
-// 保持原样（对齐 injectClientMetadataKeys 失败语义）→ 上游 400 原样透传。
-func TestResponsesInvalidPayloadAbandonInjection(t *testing.T) {
-	errorBody := []byte(`{"error":{"code":"invalid_request","message":"bad json"}}`)
-	var gotBody []byte
+// TestResponsesInvalidPayloadRejectedLocally：非法 JSON payload → 本地
+// ErrInvalidRequestBody，不发上游。
+func TestResponsesInvalidPayloadRejectedLocally(t *testing.T) {
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotBody, _ = io.ReadAll(r.Body)
+		hits.Add(1)
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write(errorBody)
 	}))
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	_, err := hc.Responses(context.Background(), []byte(`{"broken`), Identity{})
-	var he *HTTPError
-	if !errors.As(err, &he) {
-		t.Fatalf("期望 *HTTPError, got %T: %v", err, err)
+	for _, in := range []string{`{"broken`, `{}`, `[]`, `{"model":3}`} {
+		if _, err := hc.Responses(context.Background(), []byte(in), Identity{}); !errors.Is(err, ErrInvalidRequestBody) {
+			t.Fatalf("%s: 期望 ErrInvalidRequestBody, got %v", in, err)
+		}
 	}
-	if he.StatusCode != http.StatusBadRequest {
-		t.Fatalf("StatusCode = %d, 期望 400", he.StatusCode)
-	}
-	if !bytes.Equal(he.Raw, errorBody) {
-		t.Fatalf("Raw 应原样交付上游错误体: %s", he.Raw)
-	}
-	if string(gotBody) != `{"broken` {
-		t.Fatalf("非法 payload 应原样上送（放弃注入）, got %s", gotBody)
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("无效请求体不应发上游, 实际 %d 次", n)
 	}
 }
 
@@ -380,7 +372,7 @@ func TestResponsesFailedEventWire(t *testing.T) {
 	failedEv := `{"type":"response.failed","error":{"code":"server_error","message":"upstream exploded"}}`
 	srv := startResponsesMock(t, nil, []string{respCreatedEvent, failedEv}, true, nil)
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
-	_, err := hc.Responses(context.Background(), []byte(`{}`), Identity{})
+	_, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{})
 	var he *HTTPError
 	if !errors.As(err, &he) {
 		t.Fatalf("期望 *HTTPError, got %T: %v", err, err)
@@ -448,7 +440,7 @@ func TestResponses403Passthrough(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	_, err := hc.Responses(context.Background(), []byte(`{}`), Identity{})
+	_, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{})
 	var he *HTTPError
 	if !errors.As(err, &he) {
 		t.Fatalf("期望 *HTTPError, got %T: %v", err, err)
@@ -474,7 +466,7 @@ func TestResponses401Fatal(t *testing.T) {
 
 	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
 	hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-	_, err := hc.Responses(context.Background(), []byte(`{}`), Identity{})
+	_, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{})
 	var are *AuthPermanentlyRevokedError
 	if !errors.As(err, &are) {
 		t.Fatalf("期望 *AuthPermanentlyRevokedError 透传, got %T: %v", err, err)
@@ -486,7 +478,7 @@ func TestResponses401Fatal(t *testing.T) {
 		t.Fatalf("判死不重试, 请求数 = %d", reqs)
 	}
 	// Fatal 态：后续调用不再发请求
-	_, err = hc.Responses(context.Background(), []byte(`{}`), Identity{})
+	_, err = hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{})
 	if !errors.As(err, &are) {
 		t.Fatalf("Fatal 态后应恒报错, got %T: %v", err, err)
 	}
@@ -585,8 +577,8 @@ func TestResponsesConnectionReuse(t *testing.T) {
 }
 
 // TestResponsesClientMetadataWire：Responses（非流式聚合路径，内部走 Stream
-// 统一注入点）——Identity.Meta + Identity.Session → wire 请求体带恒 4 key
-// （Meta 优先于 Session）+ 自动 turn_id（UUIDv7）+ stream:true 注入共存。
+// 同一整形）——Identity → wire 请求体的 client_metadata 由身份合成，客户端自带
+// 的整个丢弃；自动 turn_id（UUIDv7）与 stream:true 共存。
 func TestResponsesClientMetadataWire(t *testing.T) {
 	var cap responsesWireCapture
 	srv := startResponsesMock(t, nil,
@@ -594,15 +586,10 @@ func TestResponsesClientMetadataWire(t *testing.T) {
 
 	hc := NewHTTPClient(PAT("p"), WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv)))
 	id := Identity{
-		Session: Session{SessionID: "sess-other", ThreadID: "thread-other", WindowID: "win-other:1"},
-		Meta: CodexMeta{
-			InstallationID: "inst-1",
-			SessionID:      "sess-1",
-			ThreadID:       "thread-1",
-			WindowID:       "win-1:0",
-		},
+		InstallationID: "inst-1",
+		Session:        Session{SessionID: "sess-1", ThreadID: "thread-1", WindowID: "win-1:0"},
 	}
-	resp, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6"}`), id)
+	resp, err := hc.Responses(context.Background(), []byte(`{"model":"gpt-5.6","client_metadata":{"session_id":"sess-other"}}`), id)
 	if err != nil {
 		t.Fatalf("Responses: %v", err)
 	}
@@ -616,8 +603,8 @@ func TestResponsesClientMetadataWire(t *testing.T) {
 		t.Fatalf("stream:true 注入应保留, body = %s", cap.body)
 	}
 	cm := gjson.GetBytes(cap.body, "client_metadata")
-	if !cm.Exists() || len(cm.Map()) != 5 {
-		t.Fatalf("client_metadata = %s（期望恒 4 key + turn_id）", cm.Raw)
+	if !cm.Exists() || len(cm.Map()) != 9 {
+		t.Fatalf("client_metadata = %s（期望 HTTP 面 9 个键）", cm.Raw)
 	}
 	for key, want := range map[string]string{
 		"x-codex-installation-id": "inst-1",
@@ -626,7 +613,7 @@ func TestResponsesClientMetadataWire(t *testing.T) {
 		"x-codex-window-id":       "win-1:0",
 	} {
 		if got := cm.Get(key).String(); got != want {
-			t.Fatalf("%s = %q, 期望 %q（Identity.Meta 优先于 Identity.Session）", key, got, want)
+			t.Fatalf("%s = %q, 期望 %q（只来自 Identity）", key, got, want)
 		}
 	}
 	if turn := cm.Get("turn_id").String(); !uuidv7Re.MatchString(turn) {
@@ -640,7 +627,7 @@ func TestResponsesClientMetadataWire(t *testing.T) {
 // TestResponsesNilAuth：auth 为 nil 直接报错（不发出请求）。
 func TestResponsesNilAuth(t *testing.T) {
 	hc := NewHTTPClient(nil, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", "http://127.0.0.1:1")))
-	if _, err := hc.Responses(context.Background(), []byte(`{}`), Identity{}); err == nil {
+	if _, err := hc.Responses(context.Background(), []byte(`{"model":"m"}`), Identity{}); err == nil {
 		t.Fatal("auth 为 nil 应报错")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"time"
 
@@ -23,7 +24,11 @@ type dialSpec struct {
 	readLimit int64
 	mode      connMode
 	headers   http.Header
-	identity  Identity // 握手头来源（帧内身份由编码器直接取）
+	identity  Identity // 握手头来源（帧内身份由整形器直接取）
+	// shaped 是这条连接第一帧的整形结果（nil = 未知：握手不带 routing-hint 与
+	// turn-metadata）。prewarm 表示第一帧是 SDK 的预热帧（prewarm 形态）。
+	shaped  *shapedRequest
+	prewarm bool
 }
 
 // handshake 是握手成功后从上游取到的东西。
@@ -33,9 +38,8 @@ type dialSpec struct {
 // 不能将就。bornAt 是拨号起始时刻，是本地寿命上限（connMaxAge）的起点——
 // 它随连接在缓存里逐次传递，命中不重置。
 type handshake struct {
-	turnState string
-	token     string
-	bornAt    time.Time
+	token  string
+	bornAt time.Time
 }
 
 // dialConn 拨号 + 升级 + 401 轮转，返回连接内核与握手结果。
@@ -59,27 +63,39 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 		if err != nil {
 			return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
 		}
-		hdr.Set("Authorization", token)
-		// 伪装层默认头（WithHeader 可覆盖）。
+		hdr["authorization"] = []string{token}
+		// 伪装层默认头（WithHeader 可覆盖）。头名小写直接赋值（User-Agent 除外：
+		// 它必须是规范写法，否则 Go 会再补一个默认 UA）。
 		applyDefaultHeaders(hdr)
-		hdr.Set("OpenAI-Beta", "responses_websockets="+spec.opts.beta)
-		// 会话标识握手头（真实客户端恒带；trace 不进握手头，只进帧内 metadata）。
-		if s := spec.identity.Session; s.SessionID != "" || s.ThreadID != "" || s.ClientRequestID != "" || s.WindowID != "" {
-			if s.SessionID != "" {
-				hdr.Set(HeaderSessionID, s.SessionID)
-			}
+		hdr["openai-beta"] = []string{"responses_websockets=" + spec.opts.beta}
+		hdr[HeaderVersion] = []string{CodexVersion}
+		hdr[HeaderBetaFeatures] = []string{DefaultBetaFeatures}
+		// 会话标识握手头（非匿名；trace 不进握手头，只进帧内 metadata）。
+		if id := spec.identity; !id.anonymous() {
+			s := id.Session
+			hdr[HeaderSessionID] = []string{s.SessionID}
 			if s.ThreadID != "" {
-				hdr.Set(HeaderThreadID, s.ThreadID)
+				hdr[HeaderThreadID] = []string{s.ThreadID}
 			}
 			clientRequestID := s.ClientRequestID
 			if clientRequestID == "" {
 				clientRequestID = s.ThreadID
 			}
 			if clientRequestID != "" {
-				hdr.Set(HeaderClientRequestID, clientRequestID)
+				hdr[HeaderClientRequestID] = []string{clientRequestID}
 			}
-			if s.WindowID != "" {
-				hdr.Set(HeaderWindowID, s.WindowID)
+			windowID := s.WindowID
+			if spec.shaped != nil {
+				windowID = spec.shaped.windowID
+			}
+			if windowID != "" {
+				hdr[HeaderWindowID] = []string{windowID}
+			}
+		}
+		if sh := spec.shaped; sh != nil {
+			hdr[HeaderRoutingHint] = []string{sh.routingHint()}
+			if tm := sh.handshakeTurnMeta(spec.prewarm); tm != nil {
+				hdr[HeaderTurnMetadata] = []string{string(tm)}
 			}
 		}
 		// 账号标识头（ChatGPT 系 auth 恒发；空 = 不发，向后兼容）。
@@ -94,14 +110,16 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		dialedToken = hdr.Get("Authorization")
+		dialedToken = firstHeader(hdr, "authorization")
 		dopts := &coderws.DialOptions{HTTPHeader: hdr}
 		if spec.opts.transport != nil {
 			dopts.HTTPClient = &http.Client{Transport: spec.opts.transport}
 		}
 		if spec.opts.compression != CompressionDisabled {
+			// 协商 permessage-deflate（握手与官方一致，差 client_max_window_bits：
+			// coder 产不出），但出站一律不压缩：阈值 MaxInt ⇒ 不建常驻 flate 写入器。
 			dopts.CompressionMode = spec.opts.compression.coder()
-			dopts.CompressionThreshold = defaultCompressionThreshold
+			dopts.CompressionThreshold = math.MaxInt
 		}
 		return coderws.Dial(ctx, wsURL, dopts)
 	}
@@ -139,10 +157,8 @@ func dialConn(ctx context.Context, spec dialSpec) (*conn, handshake, error) {
 	}
 	wsConn.SetReadLimit(spec.readLimit)
 
+	// 握手响应头里的 turn-state 不取：官方只认 response.metadata 事件。
 	hs := handshake{token: dialedToken, bornAt: bornAt}
-	if resp != nil {
-		hs.turnState = resp.Header.Get(HeaderTurnState)
-	}
 
 	// 连接寿命 ctx：
 	//   - pumped：**与请求 ctx 解耦**（T5 起）。连接要跨请求复用，所以不能再让
@@ -196,4 +212,13 @@ func dialErrBody(resp *http.Response) []byte {
 		return nil
 	}
 	return b
+}
+
+// firstHeader 按实际写入的键读取头（SDK 写入的头名是小写，Header.Get 按规范名
+// 查找会读空）。
+func firstHeader(h http.Header, key string) string {
+	if v := h[key]; len(v) > 0 {
+		return v[0]
+	}
+	return ""
 }

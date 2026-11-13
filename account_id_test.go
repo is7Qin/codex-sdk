@@ -193,7 +193,7 @@ func TestAccountIDHTTPDoAndStream(t *testing.T) {
 		t.Cleanup(srv.Close)
 		hc := NewHTTPClient(PAT("t", WithPATAccountID("acc-1")),
 			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
-		if err := hc.Stream(ctx, []byte(`{}`), Identity{}, func(raw []byte) error { return nil }); err != nil {
+		if err := hc.Stream(ctx, []byte(`{"model":"m"}`), Identity{}, func(raw []byte) error { return nil }); err != nil {
 			t.Fatalf("Stream: %v", err)
 		}
 		mu.Lock()
@@ -333,14 +333,14 @@ func TestAccountIDHeaderOverride(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("请求数 = %d, 期望 1", len(got))
 	}
-	if v := got[0].Get("ChatGPT-Account-ID"); v != "override" {
+	if v := firstHeader(got[0], "chatgpt-account-id"); v != "override" || len(got[0]["ChatGPT-Account-Id"]) != 0 {
 		t.Fatalf("覆盖后头 = %q, 期望 override（WithHeader 后写赢）", v)
 	}
 }
 
 // T9：版本号——DefaultCodexUserAgent 全串相等断言（常量级，防单点漏改）。
 func TestAccountIDUserAgentVersion(t *testing.T) {
-	const want = "codex-tui/0.154.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex-tui; 0.154.0)"
+	const want = "codex-tui/0.169.0 (Ubuntu 24.4.0; x86_64) gnome-terminal (codex-tui; 0.169.0)"
 	if DefaultCodexUserAgent != want {
 		t.Fatalf("DefaultCodexUserAgent = %q, 期望 %q", DefaultCodexUserAgent, want)
 	}

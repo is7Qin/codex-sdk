@@ -8,26 +8,30 @@ import (
 )
 
 // ChatGPTAccountIDHeader 是账号标识请求头（真客户端由 BearerAuthProvider
-// 对 ChatGPT 系 auth 恒发；Go 端经 textproto 规范化后上线形态为
-// Chatgpt-Account-Id，头名大小写不敏感，见 §2.4）。
+// 对 ChatGPT 系 auth 恒发；SDK 以小写 chatgpt-account-id 写出，与官方抓包一致）。
 const ChatGPTAccountIDHeader = "ChatGPT-Account-ID"
 
 // applyDefaultHeaders 注入伪装层默认头（codex UA + originator；断言值见
 // DefaultCodexUserAgent / DefaultOriginator）。调用方 WithHeader 经
 // applyHeaderOverrides 可覆盖，故本助手须在各面默认头之后、覆盖循环之前应用。
 func applyDefaultHeaders(h http.Header) {
-	h.Set("User-Agent", DefaultCodexUserAgent)
-	h.Set("Originator", DefaultOriginator)
+	h["User-Agent"] = []string{DefaultCodexUserAgent}
+	h["originator"] = []string{DefaultOriginator}
 }
 
-// applyHeaderOverrides 应用调用方 WithHeader 注入项：同名先删后加（覆盖默认头），
-// 同名多次调用为扩展（多个值）。WS 升级头与 HTTP 请求头共用。
+// applyHeaderOverrides 应用调用方 WithHeader 注入项：按小写键覆盖——覆盖前同时
+// 删除规范写法与小写写法（同一头不会以两种写法重复发出），同名多次调用为扩展
+// （多个值）。User-Agent 例外保持规范写法（否则 Go 会补默认 UA）。WS 升级头与
+// HTTP 请求头共用。
 func applyHeaderOverrides(h http.Header, overrides http.Header) {
 	for k, vals := range overrides {
-		h.Del(k)
-		for _, v := range vals {
-			h.Add(k, v)
+		lk := strings.ToLower(k)
+		delete(h, http.CanonicalHeaderKey(k))
+		delete(h, lk)
+		if lk == "user-agent" {
+			lk = "User-Agent"
 		}
+		h[lk] = append([]string(nil), vals...)
 	}
 }
 
@@ -44,7 +48,7 @@ func applyAccountID(h http.Header, auth Auth) {
 	if id == "" || hasControlByte(id) {
 		return // 空 = 不发（向后兼容）；任何控制字节都会让 Transport 直接拒绝整请求，跳过
 	}
-	h.Set(ChatGPTAccountIDHeader, id)
+	h["chatgpt-account-id"] = []string{id}
 }
 
 // hasControlByte 值卫生：<0x20（TAB 除外）与 0x7f 一律拒绝——对齐 net/http

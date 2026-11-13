@@ -26,7 +26,7 @@ import (
 const idleBudget = 40 * time.Millisecond
 
 // idleThread 是参与复用的身份（threadKey 非空）。
-var idleThread = Identity{Session: Session{ThreadID: "idle-thread"}}
+var idleThread = Identity{Session: Session{SessionID: "idle-thread", ThreadID: "idle-thread"}}
 
 // ---- 夹具 ----
 
@@ -173,7 +173,6 @@ func dialIdlePull(t *testing.T, srvURL string, opts ...Option) *Client {
 	t.Helper()
 	base := []Option{
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srvURL)),
-		WithTurnAuto(false),
 		WithTraceAuto(false),
 	}
 	cl, err := Dial(context.Background(), PAT("pat-idle"), Identity{}, append(base, opts...)...)

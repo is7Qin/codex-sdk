@@ -164,7 +164,7 @@ func (u *tsUpstream) client(t *testing.T, opts ...Option) *HTTPClient {
 	base := []Option{
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", u.srv.URL)),
-		WithTurnAuto(false), WithTraceAuto(false),
+		WithTraceAuto(false),
 	}
 	return NewHTTPClient(PAT("pat-ts"), append(base, opts...)...)
 }
@@ -293,7 +293,7 @@ func TestS3RetireOnlyIdle(t *testing.T) {
 	}
 }
 
-// S4：握手头 T1 → response.metadata T2 ⇒ Sink 序列 [T1, T2]；Sink == nil
+// S4：握手头 T1（不取）→ response.metadata T2 ⇒ Sink 序列 [T2]；Sink == nil
 // 不 panic，帧照旧透传。
 func TestS4TurnStateOnlyGoesToSink(t *testing.T) {
 	const id = "resp_s4"
@@ -305,8 +305,8 @@ func TestS4TurnStateOnlyGoesToSink(t *testing.T) {
 	var sink turnStateSink
 	id4 := identityFor("thread-s4", "thread-s4:0", "", &sink)
 	_, body := doStreamBodyFull(t, hc, id4)
-	if got := sink.values(); len(got) != 2 || got[0] != "T1" || got[1] != "T2" {
-		t.Fatalf("Sink = %v, 期望 [T1 T2]", got)
+	if got := sink.values(); len(got) != 1 || got[0] != "T2" {
+		t.Fatalf("Sink = %v, 期望 [T2]（握手响应头的 ts 不取）", got)
 	}
 	if !strings.Contains(body, "T2") {
 		t.Fatalf("metadata 帧未被透传: %q", body)
@@ -343,14 +343,14 @@ func TestS5RequestIdentityPerRequest(t *testing.T) {
 		{0, idA}, {1, idB},
 	}
 	for _, c := range checks {
-		if got := frameMeta(t, frames[c.frame], codexMetaSessionKey); got != c.id.Meta.SessionID {
-			t.Fatalf("第 %d 帧 session = %q, 期望 %q", c.frame+1, got, c.id.Meta.SessionID)
+		if got := frameMeta(t, frames[c.frame], codexMetaSessionKey); got != c.id.Session.SessionID {
+			t.Fatalf("第 %d 帧 session = %q, 期望 %q", c.frame+1, got, c.id.Session.SessionID)
 		}
-		if got := frameMeta(t, frames[c.frame], codexMetaThreadKey); got != c.id.Meta.ThreadID {
-			t.Fatalf("第 %d 帧 thread = %q, 期望 %q", c.frame+1, got, c.id.Meta.ThreadID)
+		if got := frameMeta(t, frames[c.frame], codexMetaThreadKey); got != c.id.Session.ThreadID {
+			t.Fatalf("第 %d 帧 thread = %q, 期望 %q", c.frame+1, got, c.id.Session.ThreadID)
 		}
-		if got := frameMeta(t, frames[c.frame], codexMetaWindowKey); got != c.id.Meta.WindowID {
-			t.Fatalf("第 %d 帧 window = %q, 期望 %q", c.frame+1, got, c.id.Meta.WindowID)
+		if got := frameMeta(t, frames[c.frame], codexMetaWindowKey); got != c.id.Session.WindowID {
+			t.Fatalf("第 %d 帧 window = %q, 期望 %q", c.frame+1, got, c.id.Session.WindowID)
 		}
 	}
 	for i, want := range []string{"thread-s5-A", "thread-s5-B"} {
@@ -391,7 +391,6 @@ func TestS6AnonymousNeverReuses(t *testing.T) {
 		WithResponsesTransport(TransportWS),
 		WithTransport(tr),
 		WithWSConnCache(2),
-		WithTurnAuto(false),
 		WithTraceAuto(false),
 	)
 	// payload 自带旧身份：匿名请求必须把它整体抹掉（否则等于冒充调用方的老会话）。
@@ -464,7 +463,7 @@ func TestS7ConcurrentIdentities(t *testing.T) {
 	}
 }
 
-// S8：Dial(ctx, auth, Identity) ⇒ 握手头与 Identity 一致；握手响应头 ts 进 Sink。
+// S8：Dial(ctx, auth, Identity) ⇒ 握手头与 Identity 一致；握手响应头 ts 不进 Sink。
 func TestS8DialIdentity(t *testing.T) {
 	up := newTSUpstream(t, nil)
 	up.setHandshake("T-dial")
@@ -472,7 +471,7 @@ func TestS8DialIdentity(t *testing.T) {
 	id := identityFor("thread-dial", "thread-dial:2", "T-req", &sink)
 	c, err := Dial(context.Background(), PAT("pat-dial"), id,
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithTurnAuto(false), WithTraceAuto(false))
+		WithTraceAuto(false))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -489,8 +488,8 @@ func TestS8DialIdentity(t *testing.T) {
 			t.Fatalf("握手头 %s = %q, 期望 %q", key, got, want)
 		}
 	}
-	if got := sink.values(); len(got) != 1 || got[0] != "T-dial" {
-		t.Fatalf("Sink = %v, 期望 [T-dial]", got)
+	if got := sink.values(); len(got) != 0 {
+		t.Fatalf("Sink = %v, 期望空（握手响应头的 ts 不取）", got)
 	}
 	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"m"}`)); err != nil {
 		t.Fatalf("Send: %v", err)
@@ -612,7 +611,7 @@ func TestS12NoSinkAfterClose(t *testing.T) {
 			hc := NewHTTPClient(PAT("pat-s12"),
 				WithResponsesTransport(TransportWS),
 				WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
-				WithTurnAuto(false), WithTraceAuto(false))
+				WithTraceAuto(false))
 			var sink turnStateSink
 			ctx, cancel := context.WithCancel(context.Background())
 			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), identityFor("thread-s12", "thread-s12:0", "", &sink))
@@ -657,7 +656,7 @@ func TestS12NoSinkAfterClose(t *testing.T) {
 }
 
 // S13：Responses 的 ws 臂（直取帧喂聚合器，不经 sseView）与流式臂同源上报——
-// 握手 T1 + response.metadata T2 ⇒ Sink 收到 [T1 T2]；合成体里没有任何 ts
+// 握手 T1（不取）+ response.metadata T2 ⇒ Sink 收到 [T2]；合成体里没有任何 ts
 // （HTTPResponse 无 ts 字段）；第二次请求命中复用连接且本次未签发时 Sink 为空，
 // 不得把上一轮的 T2 当默认值带进来。
 func TestS13AggregateArmReportsOnlyViaSink(t *testing.T) {
@@ -677,8 +676,8 @@ func TestS13AggregateArmReportsOnlyViaSink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Responses(ws): %v", err)
 	}
-	if got := sink.values(); len(got) != 2 || got[0] != "T1" || got[1] != "T2" {
-		t.Fatalf("Sink = %v, 期望 [T1 T2]", got)
+	if got := sink.values(); len(got) != 1 || got[0] != "T2" {
+		t.Fatalf("Sink = %v, 期望 [T2]", got)
 	}
 	body := string(resp.Raw)
 	for _, leak := range []string{"T1", "T2", HeaderTurnState} {
@@ -752,7 +751,7 @@ func TestCloseWSIdleConnectionsOnlyClearsWS(t *testing.T) {
 		WithResponsesTransport(TransportWS),
 		WithTransport(tr),
 		WithWSConnCache(2),
-		WithTurnAuto(false), WithTraceAuto(false),
+		WithTraceAuto(false),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

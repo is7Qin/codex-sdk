@@ -13,39 +13,57 @@ import (
 // 身份是**请求数据**：HTTPClient 只承载账号/传输级配置（Auth、transport、
 // readLimit、池容量、超时）；每次调用把身份经本结构传入，默认头里不允许出现
 // 身份键（保留键在构造期 panic，见 WithHeader）。
+//
+// 匿名（Session.SessionID == ""）：不发身份头、不写 client_metadata、不发
+// turn-metadata、删除 prompt_cache_key、不带 turn-state。SessionID 为空而其余
+// 字段非空时同样按匿名处理，并计入 ShapeStats.PartialIdentity。
 type Identity struct {
-	Session   Session       // 握手头 session-id / thread-id / x-client-request-id / x-codex-window-id
-	Meta      CodexMeta     // 帧内与 HTTP 体 client_metadata 的身份键
-	TurnState string        // 本请求带上的 turn-state（"" = 不带）
-	Sink      TurnStateSink // 捕获到 ts 时的落点（nil = 忽略）
+	InstallationID string        // client_metadata x-codex-installation-id / turn-metadata installation_id
+	Session        Session       // SessionID / ThreadID / WindowID("{thread}:{n}") / ClientRequestID（空=ThreadID）
+	Window         Window        // 上下文窗口
+	Turn           Turn          // 轮次
+	Sink           TurnStateSink // 上游 turn-state 落点（nil = 忽略）
+}
+
+// Window 是上下文窗口身份。
+type Window struct {
+	Number    uint64 // window_number；必须与 Session.WindowID 的 n 一致
+	ContextID string // context_window_id（UUIDv7）；空 = 每请求生成
+}
+
+// Turn 是轮次身份。
+type Turn struct {
+	ID          string // turn_id / root_turn_id；空 = 每请求生成 UUIDv7
+	StartedAtMs int64  // turn_started_at_unix_ms；0 = 取请求时刻
+	State       string // 要带给上游的 turn-state（"" = 不带）
+	First       bool   // 本请求是一轮的第一个请求（含客户端重试）
+}
+
+// anonymous 报告本身份是否按匿名整形（SessionID 为空即匿名）。
+func (id Identity) anonymous() bool { return id.Session.SessionID == "" }
+
+// partial 报告"按匿名处理但其余字段非空"的残缺身份（计数用）。
+func (id Identity) partial() bool {
+	return id.anonymous() && (id.InstallationID != "" || id.Session != (Session{}) ||
+		id.Window != (Window{}) || id.Turn != (Turn{}))
 }
 
 // TurnStateSink 接收上游签发的 turn-state。用接口而不是闭包：会话对象按指针
 // 塞进接口不产生分配（闭包会把捕获变量一起拖进堆），且把"ts 写到哪"变成显式
 // 边界。
 //
-// 实现约束：只做一次字段赋值，不得阻塞、不得回调回 SDK。Sink 只在调用/Read
-// 栈内同步执行；Body.Close 返回后 SDK 不再调用 Sink。
+// 实现约束：可做有界的非阻塞工作（原子操作、sync.Map 写、非阻塞 channel
+// 发送），不得阻塞、不得回调 SDK。Sink 只在调用/Read 栈内同步执行；
+// Body.Close 返回后 SDK 不再调用 Sink。同一轮内"首值生效"由实现方负责。
 type TurnStateSink interface{ SetTurnState(string) }
 
-// threadKey 是连接复用的线程身份：installation|session|thread。
-//
-// Meta 是主载体（与 client_metadata 的优先级一致），空项由 Session 补。
-// 三者全空 = 匿名：匿名没有会话语义，不参与连接复用（见 connKey）。
+// threadKey 是连接复用的线程身份：InstallationID|SessionID|ThreadID。
+// 匿名返回 ""：匿名没有会话语义，不参与连接复用（见 connKey）。
 func (id Identity) threadKey() string {
-	installation := id.Meta.InstallationID
-	session := id.Meta.SessionID
-	if session == "" {
-		session = id.Session.SessionID
-	}
-	thread := id.Meta.ThreadID
-	if thread == "" {
-		thread = id.Session.ThreadID
-	}
-	if installation == "" && session == "" && thread == "" {
+	if id.anonymous() {
 		return ""
 	}
-	return installation + "|" + session + "|" + thread
+	return id.InstallationID + "|" + id.Session.SessionID + "|" + id.Session.ThreadID
 }
 
 // deliverTurnState 把上游签发值交给 Sink（空值与 nil Sink 均忽略）。
@@ -102,6 +120,9 @@ type IdentityState struct {
 	// NextWindowAt 下一个窗口递增的 Turns 阈值（= Σ_{i=0..WindowN} windowSpan(ThreadID,i)）。
 	NextWindowAt uint64
 	WMax         uint64 // 本线程窗口数上限（0 = 不退休）
+	// ContextWindowID 是当前窗口的 context_window_id（UUIDv7）：开线程与每次
+	// 窗口推进时重新生成。
+	ContextWindowID string
 }
 
 // NewIdentityState 开一个新线程：新 thread_id、Turns=0、WindowN=0、下一个窗口阈值按
@@ -115,6 +136,8 @@ func NewIdentityState(installationID string, p RotatePolicy) IdentityState {
 		WindowN:        0,
 		NextWindowAt:   windowSpan(tid, 0),
 		WMax:           drawWMax(p),
+
+		ContextWindowID: NewUUIDv7(),
 	}
 }
 
@@ -126,6 +149,19 @@ func (s IdentityState) WindowID() string {
 // Session 返回注入用的会话标识（根线程语义：session_id == thread_id）。
 func (s IdentityState) Session() Session {
 	return Session{SessionID: s.ThreadID, ThreadID: s.ThreadID, WindowID: s.WindowID()}
+}
+
+// Identity 返回槽位路径的请求身份：Session 同 Session()，Window 取当前窗口，
+// Turn 只带 First（ID 空 = 每请求生成）。first 由调用方按
+// !AnalyzeConversationInput(payload).FollowUp() 给出。
+func (s IdentityState) Identity(sink TurnStateSink, first bool) Identity {
+	return Identity{
+		InstallationID: s.InstallationID,
+		Session:        s.Session(),
+		Window:         Window{Number: s.WindowN, ContextID: s.ContextWindowID},
+		Turn:           Turn{First: first},
+		Sink:           sink,
+	}
 }
 
 // Step 推进一个完成轮：Turns++；跨过本窗口阈值 → WindowN++ 并叠加下一个随机 span；
@@ -140,6 +176,7 @@ func Step(s IdentityState, p RotatePolicy) IdentityState {
 	if s.Turns >= s.NextWindowAt {
 		s.WindowN++
 		s.NextWindowAt += windowSpan(s.ThreadID, s.WindowN)
+		s.ContextWindowID = NewUUIDv7()
 	}
 	if s.WMax > 0 && s.WindowN >= s.WMax {
 		s = NewIdentityState(s.InstallationID, p)

@@ -95,7 +95,6 @@ func newWSClient(t *testing.T, up *wsResidentUpstream, opts ...Option) *HTTPClie
 	base := []Option{
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithTurnAuto(false),
 	}
 	return NewHTTPClient(PAT("pat-resident"), append(base, opts...)...)
 }
@@ -186,7 +185,6 @@ func TestWSDialErrorCarriesBody(t *testing.T) {
 	hc := NewHTTPClient(PAT("pat-400"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
-		WithTurnAuto(false),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -282,7 +280,6 @@ func TestWSDialOverHTTP2CapableTransport(t *testing.T) {
 	hc := NewHTTPClient(PAT("pat-h2"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(rt),
-		WithTurnAuto(false),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

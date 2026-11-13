@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/coder/websocket v1.8.15
+	github.com/klauspost/compress v1.17.11
 	github.com/tidwall/gjson v1.19.0
 	github.com/tidwall/sjson v1.2.5
 )

@@ -11,8 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/tidwall/gjson"
 )
 
 // defaultMaxLineSize HTTP SSE 单行上限（与 WS ReadLimit 同量级）。
@@ -35,8 +33,8 @@ type HTTPClient struct {
 	auth Auth
 	opts options
 
-	// codec 是帧编码器（无可变状态，可并发使用）。
-	codec *frameCodec
+	// shape 是请求整形配置（构造期固定，可并发使用）。
+	shape shapeConfig
 
 	mu               sync.Mutex // 保护 client 懒构建与 CloseIdleConnections 并发访问
 	client           *http.Client
@@ -57,7 +55,7 @@ func NewHTTPClient(auth Auth, opts ...Option) *HTTPClient {
 	return &HTTPClient{
 		auth:    auth,
 		opts:    cfg,
-		codec:   newFrameCodec(&cfg),
+		shape:   shapeConfigOf(&cfg),
 		wsCache: newConnCacheIf(cfg.wsConnCache, cfg.wsSweepInterval),
 	}
 }
@@ -144,9 +142,12 @@ func (e *HTTPError) Unwrap() error { return e.cause }
 // 取 message"路径就能拿到上游原文，不必为 WS 再开一条提取通道。
 func (e *HTTPError) RawJSON() string { return string(e.Raw) }
 
-// Do 发送 POST <responses 端点> 请求（端点方法族成员——固定官方端点
-// DefaultResponsesURL；payload 为完整 JSON 请求体，调用方决定 stream 等字段），
-// 原样返回非流式响应。非 2xx 返回 *HTTPError。
+// Do 发送 POST <responses 端点> 请求（固定官方端点 DefaultResponsesURL；payload
+// 为完整 JSON 请求体），原样返回非流式响应。非 2xx 返回 *HTTPError。
+//
+// Do **不归一、不注入**：不做请求整形、不带官方形态头（version / routing-hint /
+// turn-metadata / 身份头）、不压缩。它不是官方客户端的形态，**不得用于 Codex
+// responses 业务请求**——那些请求用 StreamBody / Stream / Responses。
 //
 // 401 自动轮转（OAuthWithRotation 专属）：每次 401 先做判死分类（响应体
 // error_code/error_type/detail，大小写不敏感）——判死码 → Fatal 态 +
@@ -156,7 +157,7 @@ func (e *HTTPError) RawJSON() string { return string(e.Raw) }
 // RefreshOAuthError / AccountDisabledError 等）经本方法透传，不被 HTTPError
 // 包层吞掉（errors.As 可区分）。
 func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, error) {
-	resp, err := c.do(ctx, payload, Identity{})
+	resp, err := c.do(ctx, payload, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -173,11 +174,10 @@ func (c *HTTPClient) Do(ctx context.Context, payload []byte) (*HTTPResponse, err
 // 跨回调保留需自行拷贝），[DONE] 标记流正常终止。身份与 ts 都来自 id；响应头
 // 签发的 ts 只回调 id.Sink。
 //
-// 发送前无条件归一（HTTP 白名单过滤 FilterCodexHTTPPayload + 强制 store:false），
-// 再统一注入 client_metadata（对齐真实 codex client_metadata()——
-// responses_metadata.rs:255-288；见 injectResponsesClientMetadata）。
-// Responses 内部调 Stream 走同一归一+注入点，避免两路径重复；Do 是通用非流式
-// POST 不归一也不注入（GenerateImage/Search 各自端点不受影响）。
+// 发送前按官方 codex-tui 0.169.0 形态整形（parseRequest + shapeRequest +
+// assembleHTTP：白名单、同名键首现、官方键序、指令与 lite 转换、client_metadata
+// 与 turn-metadata 合成），带官方请求头，请求体 zstd 压缩。请求体无效返回
+// ErrInvalidRequestBody（不发上游）。Responses 内部走同一路径；Do 不整形。
 //
 // fn 返回错误立即终止读取并透传该错误。非 2xx 返回 *HTTPError；
 // 401 自动轮转语义同 Do。
@@ -187,12 +187,11 @@ func (c *HTTPClient) Stream(ctx context.Context, payload []byte, id Identity, fn
 
 // streamIssued 是 Stream 的实现体：响应头签发的 ts 只回调 id.Sink。
 func (c *HTTPClient) streamIssued(ctx context.Context, payload []byte, id Identity, fn func(raw []byte) error) error {
-	payload, err := normalizeCodexHTTPPayload(payload)
+	body, rh, err := c.prepareResponsesHTTP(payload, id)
 	if err != nil {
 		return err
 	}
-	payload = injectResponsesClientMetadata(payload, id)
-	resp, err := c.do(ctx, payload, id)
+	resp, err := c.do(ctx, body, rh)
 	if err != nil {
 		return err
 	}
@@ -217,6 +216,46 @@ func (c *HTTPClient) streamIssued(ctx context.Context, payload []byte, id Identi
 		_, _ = io.Copy(io.Discard, resp.Body)
 	}
 	return nil // EOF 结束（是否截断由网关按终态事件判定）
+}
+
+// responsesHeaders 是 POST /responses 的官方形态头的来源（nil = 通用端点）。
+type responsesHeaders struct {
+	sh        *shapedRequest
+	turnState string
+}
+
+// prepareResponsesHTTP 整形 HTTP→HTTP 请求体并 zstd 压缩。401 轮转重发复用
+// 同一份已压缩字节与同一组头。
+func (c *HTTPClient) prepareResponsesHTTP(payload []byte, id Identity) ([]byte, *responsesHeaders, error) {
+	sh, err := shapeBody(payload, surfaceHTTP, id, time.Now(), c.shape)
+	if err != nil {
+		return nil, nil, err
+	}
+	body := zstdCompress(assembleHTTP(&sh))
+	return body, &responsesHeaders{sh: &sh, turnState: sh.turnState(id)}, nil
+}
+
+// apply 写 /responses 的官方形态头（小写名直接赋值）。
+func (rh *responsesHeaders) apply(h http.Header) {
+	sh := rh.sh
+	h[HeaderVersion] = []string{CodexVersion}
+	h[HeaderBetaFeatures] = []string{DefaultBetaFeatures}
+	h[HeaderRoutingHint] = []string{sh.routingHint()}
+	if sh.lite {
+		h[HeaderResponsesLite] = []string{"true"}
+	}
+	if !sh.anonymous {
+		h[HeaderSessionID] = []string{sh.sessionID}
+		h[HeaderThreadID] = []string{sh.threadID}
+		h[HeaderClientRequestID] = []string{sh.clientRequestID}
+		h[HeaderWindowID] = []string{sh.windowID}
+		h[HeaderTurnMetadata] = []string{string(sh.turnMeta)}
+	}
+	if rh.turnState != "" {
+		h[HeaderTurnState] = []string{rh.turnState}
+	}
+	h["accept"] = []string{"text/event-stream"}
+	h["content-encoding"] = []string{"zstd"}
 }
 
 // scanSSE 逐 `data:` 行扫描 SSE 字节流并交付事件帧（原 Stream 内联循环的抽出）。
@@ -265,9 +304,8 @@ func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, er
 }
 
 // StreamBody 发送 POST <responses 端点> 请求并返回**未读**的原始流式响应体，
-// 与 Stream 同源：发送前无条件归一（normalizeCodexHTTPPayload）+ client_metadata
-// 注入（injectResponsesClientMetadata），再走 do（含 401 判死/单飞 refresh/自动
-// 重试一次）。
+// 与 Stream 同源：发送前按官方形态整形 + zstd 压缩（见 Stream），再走 do（含 401
+// 判死/单飞 refresh/自动重试一次）。
 //
 // 接受状态 = **仅 200**（比 Stream 的 `>= 400` 判据更严，此为有意声明的行为）：
 //   - 200 → id.deliverTurnState（turn-state 取自**本次响应头**，无响应体变换）
@@ -278,22 +316,22 @@ func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, er
 // 读取沿用调用方 ctx（http 传输层）：调用方取消能终止后续对返回 body 的读取。
 //
 // TransportWS 时改走上游 Responses WS（见 streamBodyWS）：对外形状一致
-// （StatusCode=200 / Body=SSE 字节流），ts 不进合成响应头——只走 Identity.Sink。
-// WithWSConnCache(n) 可开启默认关闭的连接复用：连接身份 = (threadKey, readLimit)，
-// 同一 thread 的连续请求——含跨轮跨窗口——都可命中；匿名不复用；读到终态后必须
-// 关闭 Body 才能归还。与 Responses 的聚合路径不共享连接，收益边界见 TRANSPORT.md。
+// （StatusCode=200 / Body=SSE 字节流），ts 只从 response.metadata 事件取、只走
+// Identity.Sink。WithWSConnCache(n) 可开启默认关闭的连接复用：连接身份 =
+// (threadKey, readLimit)，同一 thread 的连续请求——含跨轮跨窗口——都可命中；
+// 匿名不复用；读到终态后必须关闭 Body 才能归还。与 Responses 的聚合路径不共享
+// 连接，收益边界见 TRANSPORT.md。
 func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte, id Identity) (*http.Response, error) {
 	if c.opts.responsesTransport == TransportWS {
 		return c.streamBodyWS(ctx, payload, id, wsStreamReadLimit)
 	}
-	wire, err := normalizeCodexHTTPPayload(payload)
+	body, rh, err := c.prepareResponsesHTTP(payload, id)
 	if err != nil {
 		return nil, err
 	}
-	wire = injectResponsesClientMetadata(wire, id)
 	// 仅本方法禁跟随重定向：3xx 原样返回 → 归为非 200 → *HTTPError（避免
 	// 自动跟随到 Location 目标后按 200 当成功）。
-	resp, err := c.doURL(ctx, c.clientNoRedirect(), DefaultResponsesURL, http.MethodPost, wire, id)
+	resp, err := c.doURL(ctx, c.clientNoRedirect(), DefaultResponsesURL, http.MethodPost, body, rh)
 	if err != nil {
 		return nil, err
 	}
@@ -306,76 +344,11 @@ func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte, id Identity
 	return resp, nil
 }
 
-// normalizeCodexHTTPPayload 对 HTTP /responses 请求体做 codex 形状归一：
-// HTTP 白名单过滤（FilterCodexHTTPPayload）后强制 store:false。空/非法 JSON
-// 原样返回；过滤后无任何白名单字段 → ErrEmptyFrame（空结果体不入网）。
-func normalizeCodexHTTPPayload(raw []byte) ([]byte, error) {
-	filtered, err := FilterCodexHTTPPayload(raw)
-	if err != nil {
-		return nil, err
-	}
-	return forceCodexStoreFalse(filtered), nil
-}
-
-// injectResponsesClientMetadata 在发送前注入 HTTP /responses 面的
-// client_metadata（键集严格对齐真实 codex client_metadata()——
-// responses_metadata.rs:255-288；生产模板 turn_metadata.rs:260-278
-// turn_id 恒带）：
-//   - 恒 4 key：x-codex-installation-id / session_id / thread_id /
-//     x-codex-window-id（Identity.Meta 与 Identity.Session 同 key 时 Meta 优先
-//     ——对齐 WS 组装优先级（frameCodec.metaEntries；空值跳过）；
-//   - 恒带 turn_id：CodexMeta.TurnID 静态值优先；否则每请求自动 UUIDv7
-//     （网关每请求即一轮，对齐真实"每轮新 sub_id"语义）；客户端自带 turn_id
-//     不参与透传；
-//   - 条件键（仅配置了才带）：x-openai-subagent / x-codex-parent-thread-id /
-//     parent_turn_id / x-codex-turn-metadata；
-//   - 不注入：traceparent/tracestate（HTTP 体面真实不带——trace 仅 WS
-//     帧面）、turn-state（体键不存在，其请求头属 HTTP 头面不在本方法）；
-//   - 不做 turn_metadata 回调（WS 帧面扩展——真实 HTTP client_metadata() 是
-//     静态键集）。
-//
-// 整体替换：payload 顶层 client_metadata 由网关身份**整体重建**（单次
-// sjson.SetRawBytes）——codex 面客户端自带的 client_metadata **永不透传**，
-// 连同非网关键一并丢弃（网关身份恒为准）。实测整体替换优于逐键覆盖：逐键
-// N 次重序列化整份 body，整体替换 1 次（256KB 体 ~0.73ms/25 allocs →
-// ~0.29ms/11 allocs，内存 ~1.4MB → ~0.29MB）。非法 JSON payload 放弃注入
-// 保持原样（对齐 responses.go Responses() 的 gjson.ValidBytes 前置校验先例——
-// 实测 sjson.SetRawBytes 对非法 JSON 静默产出损坏字节（err=nil），故须前置
-// gjson.ValidBytes）。
-func injectResponsesClientMetadata(payload []byte, id Identity) []byte {
-	payload = RewriteEnvironmentContextTime(payload, time.Now())
-	// codex 面客户端自带的 client_metadata **永不透传**：不做对象级短路、也不做
-	// 键级透传——下方 entries 由网关伪装身份构造，注入时覆盖请求体内已有同 key
-	//（injectClientMetadataKeys 覆盖语义）。非法 JSON 放弃注入、保持原样由上游
-	// 400 透传。
-	if !gjson.ValidBytes(payload) {
-		return payload
-	}
-	// 惰性组装 entries（与 WS 帧编码器共用 metaEntries 累积器与键序，
-	// 面特有键各自补充）；先在栈上预留 8 项，超出才转堆；零配置时仍带
-	// turn_id（真实恒发）。
-	var entryBuf [8]metadataEntry
-	entries := metaEntries(entryBuf[:0])
-	entries = entries.withCodexMetaIdentity(id.Meta)
-	entries = entries.add(codexMetaParentThreadKey, id.Meta.ParentThreadID)
-	entries = entries.add(codexMetaParentTurnKey, id.Meta.ParentTurnID)
-	entries = entries.add(codexMetaTurnMetadataKey, id.Meta.TurnMetadata)
-	// 注意：HTTP 体面不含 trace 键（真实 client_metadata() 无
-	// ws_request_header_trace* 注入——trace 仅 WS 帧面扩展）。
-	entries = entries.withSessionIdentity(id.Session)
-	// turn_id 恒带且覆盖：无静态值 → 每请求自动 UUIDv7（客户端自带 turn_id
-	// 不参与透传——网关值恒为准，对齐 WS 组装条件）。
-	if id.Meta.TurnID == "" {
-		entries = entries.add(codexMetaTurnKey, NewUUIDv7())
-	}
-	return injectClientMetadataKeys(payload, entries)
-}
-
-func (c *HTTPClient) do(ctx context.Context, payload []byte, id Identity) (*http.Response, error) {
+func (c *HTTPClient) do(ctx context.Context, payload []byte, rh *responsesHeaders) (*http.Response, error) {
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	return c.doURL(ctx, c.httpClient(), DefaultResponsesURL, http.MethodPost, payload, id)
+	return c.doURL(ctx, c.httpClient(), DefaultResponsesURL, http.MethodPost, payload, rh)
 }
 
 // doURL 发送指定 method 请求到指定完整端点并应用 401 自动轮转（do 的 URL
@@ -383,11 +356,11 @@ func (c *HTTPClient) do(ctx context.Context, payload []byte, id Identity) (*http
 // 同一传输层：判死分类 + 单飞 refresh + 自动重试一次，语义与 do 完全一致）。
 // hc 为本次使用的 http.Client——默认 httpClient()；StreamBody 传 no-redirect
 // client（仅影响重定向跟随，401 轮转语义不变）。
-func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte, id Identity) (*http.Response, error) {
+func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte, rh *responsesHeaders) (*http.Response, error) {
 	if c.auth == nil {
 		return nil, errors.New("codexsdk: auth 不能为 nil（用 PAT 或 OAuth）")
 	}
-	resp, err := c.sendRequest(ctx, hc, targetURL, method, payload, id)
+	resp, err := c.sendRequest(ctx, hc, targetURL, method, payload, rh)
 	if err != nil {
 		return nil, err
 	}
@@ -412,7 +385,7 @@ func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL strin
 		return respWithBody(resp, http.StatusUnauthorized, body), nil
 	}
 	// 自动重试一次（新 at）。
-	resp2, err := c.sendRequest(ctx, hc, targetURL, method, payload, id)
+	resp2, err := c.sendRequest(ctx, hc, targetURL, method, payload, rh)
 	if err != nil {
 		return nil, err
 	}
@@ -431,8 +404,11 @@ func (c *HTTPClient) doURL(ctx context.Context, hc *http.Client, targetURL strin
 }
 
 // sendRequest 构造指定 method 请求并执行（伪装层默认头 + 调用方 WithHeader 覆盖）。
-// hc 由调用方选定（默认/禁跟随重定向）。
-func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte, id Identity) (*http.Response, error) {
+// hc 由调用方选定（默认/禁跟随重定向）。rh 非 nil 时是 POST /responses：另写官方
+// 形态头（version、beta-features、routing-hint、lite、身份头、turn-metadata、
+// turn-state、accept、content-encoding）。头名除 User-Agent 外一律小写直接赋值；
+// Accept-Encoding SDK 不设（调用方 Transport 需 DisableCompression）。
+func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL string, method string, payload []byte, rh *responsesHeaders) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 构造请求失败: %w", err)
@@ -441,19 +417,17 @@ func (c *HTTPClient) sendRequest(ctx context.Context, hc *http.Client, targetURL
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", err)
 	}
-	req.Header.Set("Authorization", token)
-	req.Header.Set("Content-Type", "application/json")
-	// 伪装层默认头（WithHeader 可覆盖）。HTTP 不发 OpenAI-Beta 与 trace 头
-	// （真实客户端行为）；需要 beta 时调用方以 WithHeader 显式注入。
-	applyDefaultHeaders(req.Header)
-	// 账号标识头（ChatGPT 系 auth 恒发；空 = 不发，向后兼容）。
-	applyAccountID(req.Header, c.auth)
-	// 调用方 WithHeader：逐请求应用（先删后加，同名多次调用为扩展）。
-	applyHeaderOverrides(req.Header, c.opts.headers)
-	// 逐请求 turn-state 只来自 Identity（保留键已禁止经 WithHeader 注入）。
-	if id.TurnState != "" {
-		req.Header.Set(HeaderTurnState, id.TurnState)
+	h := req.Header
+	h["authorization"] = []string{token}
+	h["content-type"] = []string{"application/json"}
+	applyDefaultHeaders(h)
+	applyAccountID(h, c.auth)
+	if rh != nil {
+		rh.apply(h)
 	}
+	// 调用方 WithHeader：逐请求应用（按小写键覆盖，同名多次调用为扩展）。保留键
+	// 已在构造期拒绝，覆盖不到身份与形态头。
+	applyHeaderOverrides(h, c.opts.headers)
 	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("codexsdk: 上游请求失败: %w", err)

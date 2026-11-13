@@ -128,8 +128,10 @@ func (e *wsExchange) teardown(cause error) {
 
 // openWSExchange 建立一次请求级 WS exchange。
 //
-// 创建次序是契约（写死）：取请求身份快照 → **编码**（本地校验在此，坏请求体
-// 不烧握手）→ 拨号 → 把本次签发值交给 Sink → 发一帧。
+// 创建次序是契约（写死）：**整形**（parseRequest + shapeRequest；本地校验在此，
+// 坏请求体不烧握手）→ 查缓存 → 必要时拨号（握手带 routing-hint 与本帧形态的
+// turn-metadata）→ 组装并发一帧（发送时刻在取得写闸后写入）。握手响应头里的
+// turn-state 不取（官方只认 response.metadata 事件，由 turnStateTap 捕获）。
 //
 // T5 起 exchangeCtx 承担三件事：拨号预算、取帧预算、取消守卫。connCtx 已经
 // 与请求解耦（Background），所以请求结束不再杀 socket；但"调用方取消 ⇒ 本次
@@ -137,19 +139,12 @@ func (e *wsExchange) teardown(cause error) {
 func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identity, readLimit int64) (*wsExchange, error) {
 	exchangeCtx, cancel := exchangeContext(ctx, c.opts.timeout)
 
-	turn := uint64(0)
-	if c.opts.turnProvider != nil {
-		turn = 1 // 一次 exchange 只发一帧 ⇒ 恒为第 1 轮
-	}
-	frame, err := c.codec.encode(wire, encodeWSResponses, frameInput{
-		Identity: id,
-		Turn:     turn,
-		Now:      time.Now(),
-	})
+	sh, err := shapeBody(wire, surfaceWSFromHTTP, id, time.Now(), c.shape)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
+	frame, startOff := assembleWS(&sh, wsAssembly{turnState: sh.turnState(id)})
 	threadKey := id.threadKey()
 	key := connKey{threadKey: threadKey, readLimit: readLimit}
 	// sink 是归还口：**必须**在 nil 时保持真正的 nil 接口（typed-nil 陷阱：
@@ -179,7 +174,7 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 			// 一个响应极快的上游会在我们写完的几微秒内回帧，撞上 fenced 被判废。
 			if cc.cn.releasable() && cc.cn.inbox.unfence() {
 				cache.hits.Add(1)
-				if werr := cc.cn.write(exchangeCtx, frame); werr != nil {
+				if werr := cc.cn.writeStamped(exchangeCtx, frame, startOff); werr != nil {
 					e.teardown(werr) // 写失败不重试、不重拨（create 可能已进 socket）
 					return nil, e.writeFailure(werr)
 				}
@@ -203,16 +198,14 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 		mode:      modePumped,
 		headers:   c.opts.headers,
 		identity:  id,
+		shaped:    &sh,
 	})
 	if derr != nil {
 		cancel()
 		return nil, wsDialError(derr)
 	}
-	// 本次握手签发值只走 Sink（HTTP 臂读 resp.Header；WS 面只有这一个观测点）。
-	// 帧已按 Identity 编码，回写不会污染本轮帧。命中路径没有握手，也不回写。
-	id.deliverTurnState(hs.turnState)
 	e := c.activate(exchangeCtx, cancel, cn, key, hs, false, sink)
-	if werr := cn.write(exchangeCtx, frame); werr != nil {
+	if werr := cn.writeStamped(exchangeCtx, frame, startOff); werr != nil {
 		e.teardown(werr) // 写失败不重试、不重拨（response.create 可能已进 socket）
 		return nil, werr
 	}

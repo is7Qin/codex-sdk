@@ -283,6 +283,13 @@ func (c *conn) releasable() bool {
 
 // write 发送一帧（取门前/后各查一次终止原因）。
 func (c *conn) write(ctx context.Context, wire []byte) error {
+	return c.writeStamped(ctx, wire, -1)
+}
+
+// writeStamped 同 write，但在取得写闸之后、ws.Write 之前用当时毫秒原地覆写
+// wire[off:off+13]（x-codex-ws-stream-request-start-ms 的数字；off<0 不覆写，
+// 零分配）。在写闸上排队的时间因此不会算进"发送时刻"之前。
+func (c *conn) writeStamped(ctx context.Context, wire []byte, off int) error {
 	if cause := c.err(); cause != nil {
 		return cause
 	}
@@ -296,8 +303,15 @@ func (c *conn) write(ctx context.Context, wire []byte) error {
 	if cause := c.err(); cause != nil {
 		return cause
 	}
+	if writeStampHook != nil {
+		writeStampHook()
+	}
+	stampStartMs(wire, off, time.Now())
 	return c.ws.Write(ctx, coderws.MessageText, wire)
 }
+
+// writeStampHook 是测试挂点（生产恒为 nil）：取得写闸之后、覆写发送时刻之前调用。
+var writeStampHook func()
 
 // probe 发送 WS 层 ping 并等待 pong：公开 Ping 用，完全沿用调用方 ctx
 // （与既有 Client.Ping 语义一致，不加任何封顶）。

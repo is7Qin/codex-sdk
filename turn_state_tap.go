@@ -35,10 +35,16 @@ var turnStateHeaderKey = []byte(HeaderTurnState)
 // 帧契约：一帧进、一帧出，不复制、不改写、不重排、不丢弃任何帧。三个方法必须
 // 全部转发——`Release` 是**唯一**把连接交回缓存的出口，漏了复用直接失效。
 type turnStateTap struct {
-	inner   frameStream
-	sink    TurnStateSink // 捕获到本轮新值（非空）时的落点；nil = 忽略
-	seenID  string        // 从 response.created 记下的本轮 response_id
-	dropped *atomic.Int64 // 归属判定丢弃计数（跨 goroutine 读，必须原子）
+	inner frameStream
+	obs   turnStateObserver
+}
+
+// turnStateObserver 是 turn-state 的逐帧观测状态（HTTP→WS 的 tap 与 WS→WS 的
+// Client.Recv 共用）。只在单个读 goroutine 内使用，无锁。
+type turnStateObserver struct {
+	sink    TurnStateSink // 捕获到本次 response 的值（非空）时的落点；nil = 忽略
+	seenID  string        // 从 response.created 记下的本次 response_id
+	dropped *atomic.Int64 // 归属判定丢弃计数（可空）
 }
 
 var _ frameStream = (*turnStateTap)(nil)
@@ -49,7 +55,7 @@ func (t *turnStateTap) Next(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return raw, err
 	}
-	t.observe(raw)
+	t.obs.observe(raw)
 	return raw, nil
 }
 
@@ -63,7 +69,7 @@ func (t *turnStateTap) Release() bool { return t.inner.Release() }
 func (t *turnStateTap) Close() error { return t.inner.Close() }
 
 // observe 按上面的判定顺序观测一帧；不修改 raw。
-func (t *turnStateTap) observe(raw []byte) {
+func (t *turnStateObserver) observe(raw []byte) {
 	typ := frameEventType(raw)
 	if !bytes.HasSuffix(typ, metadataEventSuffix) {
 		if bytesAre(typ, responseEventCreated) {
@@ -115,8 +121,7 @@ func metadataTurnState(raw []byte) (id, ts string) {
 // 请求结束后仍可读（测试与运维诊断都不必持有 exchange）。
 func (c *HTTPClient) turnStateTapFor(inner frameStream, sink TurnStateSink) *turnStateTap {
 	return &turnStateTap{
-		inner:   inner,
-		sink:    sink,
-		dropped: &c.turnStateDropped,
+		inner: inner,
+		obs:   turnStateObserver{sink: sink, dropped: &c.turnStateDropped},
 	}
 }

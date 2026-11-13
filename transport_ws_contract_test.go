@@ -92,7 +92,6 @@ func contractClient(t *testing.T, srvURL string, opts ...Option) *HTTPClient {
 	base := []Option{
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srvURL)),
-		WithTurnAuto(false),
 		WithTraceAuto(false),
 	}
 	return NewHTTPClient(PAT("pat-contract"), append(base, opts...)...)
@@ -212,7 +211,7 @@ func TestWSDialRefusedIsNotHTTPError(t *testing.T) {
 		WithResponsesTransport(TransportWS),
 		// 127.0.0.1:1 恒拒绝（确定性触发，不依赖端口耗尽）。
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", "http://127.0.0.1:1")),
-		WithTurnAuto(false), WithTraceAuto(false),
+		WithTraceAuto(false),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

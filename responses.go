@@ -7,7 +7,6 @@ import (
 	"net/http"
 
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // responses 聚合白名单事件类型（白名单外跳过——上游扩展兼容）。
@@ -50,16 +49,7 @@ const (
 // failed / incomplete 仍按聚合器与截断规则报错）。这也覆盖"终态帧已入队、
 // deadline 随即到点"的次序：已拿到的帧先被交付。
 func (c *HTTPClient) Responses(ctx context.Context, payload []byte, id Identity) (*HTTPResponse, error) {
-	wire := payload
-	// 无条件覆盖 stream:true（含显式 stream:false）；非法 JSON 放弃注入保持原样
-	// （对齐 injectClientMetadataKeys 失败语义 + FilterCodexWsPayload/
-	// FilterCodexHTTPPayload 的 gjson.ValidBytes 先例——sjson.SetBytes 对非法 JSON
-	// 不报错而是静默产出损坏字节，须前置有效性校验）。
-	if gjson.ValidBytes(payload) {
-		if injected, err := sjson.SetBytes(payload, "stream", true); err == nil {
-			wire = injected
-		}
-	}
+	wire := payload // stream:true 由整形强制
 	agg := &responsesAggregator{}
 	if c.opts.responsesTransport == TransportWS {
 		// ws 臂：responsesStreamWS 直接从 exchange 取帧喂聚合器（不经 sseView

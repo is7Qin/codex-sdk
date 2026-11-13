@@ -202,13 +202,10 @@ func TestStreamBodyWSRendersFramesAsSSE(t *testing.T) {
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
 		WithHeader("x-custom", "custom-value"),
-		WithTurnAuto(false),
 	)
 	id := Identity{
-		Session: Session{SessionID: "sess-1", ThreadID: "thread-1", WindowID: "thread-1:0"},
-		Meta: CodexMeta{
-			InstallationID: "inst-1", SessionID: "sess-1", ThreadID: "thread-1", WindowID: "thread-1:0",
-		},
+		InstallationID: "inst-1",
+		Session:        Session{SessionID: "sess-1", ThreadID: "thread-1", WindowID: "thread-1:0"},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -269,8 +266,8 @@ func TestStreamBodyWSRendersFramesAsSSE(t *testing.T) {
 			t.Fatalf("client_metadata.%s = %q, 期望 %q（帧 %s）", key, got, want, frame)
 		}
 	}
-	if cm.Get(codexMetaTurnKey).Exists() {
-		t.Fatalf("WithTurnAuto(false) 时帧不应带 turn_id: %s", frame)
+	if !uuidv7Re.MatchString(cm.Get(codexMetaTurnKey).String()) {
+		t.Fatalf("Turn.ID 为空时每请求生成 UUIDv7 turn_id: %s", frame)
 	}
 	if cm.Get(codexMetaTurnStateKey).Exists() {
 		t.Fatalf("首轮不应回传 turn-state: %s", frame)
@@ -279,13 +276,13 @@ func TestStreamBodyWSRendersFramesAsSSE(t *testing.T) {
 	// 握手头：会话标识 + 调用方头 + beta 头（HTTPClient 的 opts 沿用到 WS 握手）。
 	hdr := up.handshakeHeaders(t, 0)
 	for key, want := range map[string]string{
-		"Authorization":       "Bearer pat-ws",
+		"authorization":       "Bearer pat-ws",
 		HeaderSessionID:       "sess-1",
 		HeaderThreadID:        "thread-1",
 		HeaderClientRequestID: "thread-1",
 		HeaderWindowID:        "thread-1:0",
 		"x-custom":            "custom-value",
-		"OpenAI-Beta":         "responses_websockets=" + DefaultBetaWS,
+		"openai-beta":         "responses_websockets=" + DefaultBetaWS,
 	} {
 		if got := hdr.Get(key); got != want {
 			t.Fatalf("握手头 %s = %q, 期望 %q", key, got, want)
@@ -302,7 +299,7 @@ func TestStreamBodyWSFailedFramePassthroughNotDone(t *testing.T) {
 	hc := NewHTTPClient(PAT("pat-ws"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithTurnAuto(false), WithTraceAuto(false))
+		WithTraceAuto(false))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), Identity{})
@@ -348,7 +345,7 @@ func TestResponsesWSMatchesHTTPComposite(t *testing.T) {
 	httpURL := sseUpstream(t, events...)
 	httpClient := NewHTTPClient(PAT("pat"),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", httpURL)),
-		WithTurnAuto(false), WithTraceAuto(false))
+		WithTraceAuto(false))
 	httpResp, err := httpClient.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("HTTP 臂 Responses: %v", err)
@@ -359,7 +356,7 @@ func TestResponsesWSMatchesHTTPComposite(t *testing.T) {
 	wsClient := NewHTTPClient(PAT("pat"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithTurnAuto(false), WithTraceAuto(false))
+		WithTraceAuto(false))
 	wsResp, err := wsClient.Responses(context.Background(), []byte(`{"model":"gpt-5.6","input":[]}`), Identity{})
 	if err != nil {
 		t.Fatalf("WS 臂 Responses: %v", err)
@@ -407,7 +404,7 @@ func TestResponsesWSFailedMatchesHTTPError(t *testing.T) {
 	httpURL := sseUpstream(t, wsCreatedEv, wsFailedEv)
 	httpClient := NewHTTPClient(PAT("pat"),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", httpURL)),
-		WithTurnAuto(false), WithTraceAuto(false))
+		WithTraceAuto(false))
 	_, httpErr := httpClient.Responses(context.Background(), []byte(`{"model":"m","input":[]}`), Identity{})
 
 	up := newWSUpstream(t)
@@ -415,7 +412,7 @@ func TestResponsesWSFailedMatchesHTTPError(t *testing.T) {
 	wsClient := NewHTTPClient(PAT("pat"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithTurnAuto(false), WithTraceAuto(false))
+		WithTraceAuto(false))
 	_, wsErr := wsClient.Responses(context.Background(), []byte(`{"model":"m","input":[]}`), Identity{})
 
 	var httpHE, wsHE *HTTPError
@@ -447,7 +444,7 @@ func TestResponsesWSTruncatedOnIncomplete(t *testing.T) {
 	hc := NewHTTPClient(PAT("pat"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithTurnAuto(false), WithTraceAuto(false))
+		WithTraceAuto(false))
 	_, err := hc.Responses(context.Background(), []byte(`{"model":"m","input":[]}`), Identity{})
 	if err == nil {
 		t.Fatal("期望截断错误, got nil")
@@ -463,8 +460,8 @@ func TestResponsesWSTruncatedOnIncomplete(t *testing.T) {
 
 // ---- 3. turn-state 握手签发 → 回写；请求侧不回落缓存 ----
 
-// TestWSIdentityTurnStateNoReplay：握手/事件签发的 ts 只进 Identity.Sink；
-// 请求帧的 ts 只来自 Identity.TurnState，不自动重放上一轮值；合成响应头不带 ts，
+// TestWSIdentityTurnStateNoReplay：握手响应头签发的 ts 不取（官方只认事件）；
+// 请求帧的 ts 只来自 Identity.Turn.State，不自动重放上一轮值；合成响应头不带 ts，
 // 升级头也不带 ts。
 func TestWSIdentityTurnStateNoReplay(t *testing.T) {
 	up := newWSUpstream(t)
@@ -476,7 +473,7 @@ func TestWSIdentityTurnStateNoReplay(t *testing.T) {
 	hc := NewHTTPClient(PAT("pat-ws"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithTurnAuto(false), WithTraceAuto(false))
+		WithTraceAuto(false))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -489,8 +486,8 @@ func TestWSIdentityTurnStateNoReplay(t *testing.T) {
 		t.Fatalf("合成响应头 %s = %q, 期望空（ts 只走 Sink）", HeaderTurnState, got)
 	}
 	_ = readAllBody(t, resp.Body)
-	if got := sink1.values(); len(got) != 1 || got[0] != "ts-issued-1" {
-		t.Fatalf("Sink = %v, 期望 [ts-issued-1]", got)
+	if got := sink1.values(); len(got) != 0 {
+		t.Fatalf("Sink = %v, 期望空（握手响应头的 ts 不取）", got)
 	}
 	first := up.sentFrames(t)
 	if len(first) != 1 {
@@ -500,7 +497,7 @@ func TestWSIdentityTurnStateNoReplay(t *testing.T) {
 		t.Fatalf("首轮不应带 turn-state, got %s", got.Raw)
 	}
 
-	// 第 2 轮：请求侧显式带 ts；本轮重新握手（缓存关闭），握手签发值进 Sink，
+	// 第 2 轮：请求侧显式带 ts；本轮重新握手（缓存关闭），握手签发值不取，
 	// 帧内带上请求值，升级头不带 ts。
 	up.setTurnState("ts-issued-2")
 	var sink2 turnStateSink
@@ -510,8 +507,8 @@ func TestWSIdentityTurnStateNoReplay(t *testing.T) {
 		t.Fatalf("第 2 次 StreamBody: %v", err)
 	}
 	_ = readAllBody(t, resp2.Body)
-	if got := sink2.values(); len(got) != 1 || got[0] != "ts-issued-2" {
-		t.Fatalf("Sink = %v, 期望 [ts-issued-2]", got)
+	if got := sink2.values(); len(got) != 0 {
+		t.Fatalf("Sink = %v, 期望空（握手响应头的 ts 不取）", got)
 	}
 	frames := up.sentFrames(t)
 	if len(frames) != 2 {
@@ -527,14 +524,22 @@ func TestWSIdentityTurnStateNoReplay(t *testing.T) {
 
 // ---- 4. 帧构造五条规则 + 非对象根 ----
 
-// TestBuildResponsesCreateFrame：覆写 type、删 previous_response_id/generate、
-// 强制 stream:true、过 WS 白名单；非对象根（null/123/"str"/[1]）与坏 JSON 报错。
-func TestBuildResponsesCreateFrame(t *testing.T) {
+// TestWSFromHTTPFrameRules：HTTP→WS 帧：type 覆写、删客户端 previous_response_id /
+// generate、强制 stream:true、过白名单；非对象根、坏 JSON、缺 model 本地拒绝。
+func TestWSFromHTTPFrameRules(t *testing.T) {
+	build := func(in string) ([]byte, error) {
+		sh, err := shapeBody([]byte(in), surfaceWSFromHTTP, Identity{}, time.Now(), shapeConfig{})
+		if err != nil {
+			return nil, err
+		}
+		frame, _ := assembleWS(&sh, wsAssembly{})
+		return frame, nil
+	}
 	t.Run("重写与删除", func(t *testing.T) {
 		in := `{"model":"gpt-5.6","type":"wrong.type","stream":false,"previous_response_id":"resp_old","generate":true,"junk":1,"input":[{"type":"message"}]}`
-		frame, err := buildResponsesCreateFrame([]byte(in))
+		frame, err := build(in)
 		if err != nil {
-			t.Fatalf("buildResponsesCreateFrame: %v", err)
+			t.Fatalf("build: %v", err)
 		}
 		if typ := gjson.GetBytes(frame, "type").String(); typ != responseCreateTypeWant {
 			t.Fatalf("type = %q, 期望 %q（覆写而非补缺）", typ, responseCreateTypeWant)
@@ -555,34 +560,11 @@ func TestBuildResponsesCreateFrame(t *testing.T) {
 		}
 	})
 
-	t.Run("空对象补齐", func(t *testing.T) {
-		frame, err := buildResponsesCreateFrame([]byte(`{}`))
-		if err != nil {
-			t.Fatalf("buildResponsesCreateFrame: %v", err)
-		}
-		if got := string(frame); got != `{"type":"response.create","stream":true}` {
-			t.Fatalf("帧 = %s, 期望补 type/stream 的最简帧", got)
-		}
-	})
-
-	t.Run("白名单外全空", func(t *testing.T) {
-		frame, err := buildResponsesCreateFrame([]byte(`{"foo":1}`))
-		if err != nil {
-			t.Fatalf("buildResponsesCreateFrame: %v", err)
-		}
-		if gjson.GetBytes(frame, "foo").Exists() {
-			t.Fatalf("白名单外键应被过滤: %s", frame)
-		}
-	})
-
-	t.Run("非对象根", func(t *testing.T) {
-		for _, in := range []string{`null`, `123`, `"str"`, `[1]`, `true`, `  null  `} {
-			frame, err := buildResponsesCreateFrame([]byte(in))
-			if err == nil {
-				t.Fatalf("输入 %q 应报错, got frame %s", in, frame)
-			}
-			if !errors.Is(err, errResponsesFrameInvalid) {
-				t.Fatalf("输入 %q 期望 errResponsesFrameInvalid, got %v", in, err)
+	t.Run("无效请求体", func(t *testing.T) {
+		for _, in := range []string{`{}`, `{"foo":1}`, `null`, `123`, `"str"`, `[1]`, `true`, `  null  `, ``, `{`, `{"a":}`, `{"a":1,}`, `{"model":1}`} {
+			frame, err := build(in)
+			if !errors.Is(err, ErrInvalidRequestBody) {
+				t.Fatalf("输入 %q 期望 ErrInvalidRequestBody, got %v", in, err)
 			}
 			if frame != nil {
 				t.Fatalf("输入 %q 报错时不应返回帧: %s", in, frame)
@@ -590,16 +572,8 @@ func TestBuildResponsesCreateFrame(t *testing.T) {
 		}
 	})
 
-	t.Run("坏 JSON", func(t *testing.T) {
-		for _, in := range []string{``, `{`, `{"a":}`, `{"a":1,}`} {
-			if _, err := buildResponsesCreateFrame([]byte(in)); !errors.Is(err, errResponsesFrameInvalid) {
-				t.Fatalf("输入 %q 期望 errResponsesFrameInvalid, got %v", in, err)
-			}
-		}
-	})
-
 	t.Run("对象根前导空白", func(t *testing.T) {
-		if _, err := buildResponsesCreateFrame([]byte(" \n\t{\"model\":\"m\"}")); err != nil {
+		if _, err := build(" \n\t{\"model\":\"m\"}"); err != nil {
 			t.Fatalf("带前导空白的对象根应通过: %v", err)
 		}
 	})
@@ -610,8 +584,8 @@ func TestBuildResponsesCreateFrame(t *testing.T) {
 		hc := NewHTTPClient(PAT("pat"),
 			WithResponsesTransport(TransportWS),
 			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)))
-		if _, err := hc.StreamBody(context.Background(), []byte(`null`), Identity{}); !errors.Is(err, errResponsesFrameInvalid) {
-			t.Fatalf("期望 errResponsesFrameInvalid, got %v", err)
+		if _, err := hc.StreamBody(context.Background(), []byte(`null`), Identity{}); !errors.Is(err, ErrInvalidRequestBody) {
+			t.Fatalf("期望 ErrInvalidRequestBody, got %v", err)
 		}
 		if n := up.dialCount(); n != 0 {
 			t.Fatalf("坏输入不应拨号, 实际握手 %d 次", n)
@@ -661,7 +635,7 @@ func TestStreamBodyWSCloseSemantics(t *testing.T) {
 			hc := NewHTTPClient(PAT("pat-ws"),
 				WithResponsesTransport(TransportWS),
 				WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-				WithTurnAuto(false), WithTraceAuto(false))
+				WithTraceAuto(false))
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			resp, err := hc.StreamBody(ctx, []byte(`{"model":"m","input":[]}`), Identity{})
@@ -741,7 +715,7 @@ func TestResponsesTransportHTTPKeepsHTTPPath(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := append([]Option{WithTransport(tr), WithTurnAuto(false), WithTraceAuto(false)}, tc.opt...)
+			opts := append([]Option{WithTransport(tr), WithTraceAuto(false)}, tc.opt...)
 			hc := NewHTTPClient(PAT("pat"), opts...)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -780,7 +754,7 @@ func TestStreamBodyWSConcurrent(t *testing.T) {
 	hc := NewHTTPClient(PAT("pat-ws"),
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithTurnAuto(true), WithTraceAuto(true))
+		WithTraceAuto(true))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 

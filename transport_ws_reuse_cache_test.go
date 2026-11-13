@@ -109,7 +109,6 @@ func (u *reuseUpstream) client(t *testing.T, opts ...Option) *HTTPClient {
 	base := []Option{
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", u.srv.URL)),
-		WithTurnAuto(false),
 		WithTraceAuto(false),
 	}
 	return NewHTTPClient(PAT("pat-reuse"), append(base, opts...)...)
@@ -238,7 +237,7 @@ func TestWSConnCacheClearedByCloseIdle(t *testing.T) {
 // ---- S1：turn-state 变化不影响连接身份 ----
 
 // TestWSConnReuseIgnoresTurnState：连接身份不含 ts——第二个请求带不同
-// Identity.TurnState 仍复用同一条连接；握手 ts 只进各自请求的 Sink。
+// Identity.Turn.State 仍复用同一条连接；握手响应头的 ts 不进 Sink。
 func TestWSConnReuseIgnoresTurnState(t *testing.T) {
 	up := newReuseUpstream(t)
 	up.setTurnSeq("A", "B")
@@ -246,8 +245,8 @@ func TestWSConnReuseIgnoresTurnState(t *testing.T) {
 
 	var sink1 turnStateSink
 	doStreamBodyID(t, hc, identityFor("thread-reuse", "thread-reuse:0", "", &sink1))
-	if got := sink1.values(); len(got) != 1 || got[0] != "A" {
-		t.Fatalf("Sink = %v，期望 [A]", got)
+	if got := sink1.values(); len(got) != 0 {
+		t.Fatalf("Sink = %v，期望空（握手响应头的 ts 不取）", got)
 	}
 	var sink2 turnStateSink
 	doStreamBodyID(t, hc, identityFor("thread-reuse", "thread-reuse:1", "B", &sink2))
@@ -346,10 +345,15 @@ func TestWSConnCacheTTLExpires(t *testing.T) {
 		hc.wsCache.mu.Unlock()
 		return n == 0
 	})
+	// sweep 在锁内摘表、锁外 terminate：摘表与关闭之间本来就有窗口，测试必须
+	// 等关闭完成（有界），不能在看到空表的瞬间非阻塞检查（那是测试自身的竞态）。
 	select {
 	case <-cc.closeDone:
-	default:
-		t.Fatal("空闲条目已摘表但连接尚未关闭")
+	case <-time.After(2 * time.Second):
+		t.Fatal("空闲条目已摘表但连接 2s 内未关闭")
+	}
+	if !errors.Is(cc.err(), errConnExpired) {
+		t.Fatalf("退役原因 = %v，期望 errConnExpired", cc.err())
 	}
 	doStreamBody(t, hc)
 	if got := up.accepts.Load(); got != 2 {
@@ -454,7 +458,7 @@ func TestWSConnCacheTokenBinding(t *testing.T) {
 	hc := NewHTTPClient(auth,
 		WithResponsesTransport(TransportWS),
 		WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", up.srv.URL)),
-		WithTurnAuto(false), WithTraceAuto(false),
+		WithTraceAuto(false),
 		WithWSConnCache(2),
 	)
 	doStreamBody(t, hc)

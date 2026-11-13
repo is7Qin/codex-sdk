@@ -134,7 +134,7 @@ func startReader(t *testing.T, c *Client) chan []byte {
 func TestDialPATAuthAndRoundtrip(t *testing.T) {
 	url, st := startEchoServer(t, "")
 	c, err := Dial(context.Background(), PAT("test-pat"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
-		WithTraceAuto(false), WithTurnAuto(false))
+		WithTraceAuto(false))
 
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -157,8 +157,8 @@ func TestDialPATAuthAndRoundtrip(t *testing.T) {
 	}
 	if gjson.GetBytes(data, "type").String() != "response.create" ||
 		gjson.GetBytes(data, "model").String() != "gpt-5" ||
-		gjson.GetBytes(data, "input").String() != "hi" {
-		t.Fatalf("白名单字段应保留: %s", data)
+		gjson.GetBytes(data, "input.0.content.0.text").String() != "hi" {
+		t.Fatalf("白名单字段应保留（字符串 input 转成 user 消息）: %s", data)
 	}
 	if gjson.GetBytes(data, "store").Type != gjson.False {
 		t.Fatalf("store 应被强制 false: %s", data)
@@ -289,7 +289,7 @@ func TestBetaAndCustomHeaders(t *testing.T) {
 func TestPing(t *testing.T) {
 	url, _ := startEchoServer(t, "")
 	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
-		WithTraceAuto(false), WithTurnAuto(false))
+		WithTraceAuto(false))
 
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -302,12 +302,12 @@ func TestPing(t *testing.T) {
 	if err := c.Ping(ctx); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
-	if err := c.Send(ctx, []byte(`{"type":"ping"}`)); err != nil {
+	if err := c.Send(ctx, []byte(`{"type":"ping","model":"m"}`)); err != nil {
 		t.Fatalf("ping 后 Send: %v", err)
 	}
 	select {
 	case got := <-frames:
-		if gjson.GetBytes(got, "type").String() != "ping" {
+		if gjson.GetBytes(got, "type").String() != "response.create" {
 			t.Fatalf("echo = %s", got)
 		}
 		if gjson.GetBytes(got, "store").Type != gjson.False {
@@ -384,7 +384,7 @@ func TestReadLimit(t *testing.T) {
 	}
 	defer c.Close(StatusGoingAway, "")
 
-	big := bytes.Repeat([]byte("x"), 100)
+	big := []byte(`{"model":"m","input":"` + strings.Repeat("x", 100) + `"}`)
 	if err := c.Send(context.Background(), big); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -473,7 +473,7 @@ func TestBinaryFrameRecv(t *testing.T) {
 func TestRecvBufferOwnership(t *testing.T) {
 	url, _ := startEchoServer(t, "")
 	c, err := Dial(context.Background(), PAT("t"), Identity{}, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", url)),
-		WithTraceAuto(false), WithTurnAuto(false))
+		WithTraceAuto(false))
 
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -496,10 +496,10 @@ func TestRecvBufferOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recv: %v", err)
 	}
-	if gjson.GetBytes(buf1, "input").String() != "a" {
+	if gjson.GetBytes(buf1, "input.0.content.0.text").String() != "a" {
 		t.Fatalf("第一次 Recv 缓冲被后续 Recv 污染: %s", buf1)
 	}
-	if gjson.GetBytes(buf2, "input").String() != "b" {
+	if gjson.GetBytes(buf2, "input.0.content.0.text").String() != "b" {
 		t.Fatalf("第二次 Recv 内容不符: %s", buf2)
 	}
 }
@@ -607,14 +607,14 @@ func TestWSTurnState(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	var sink turnStateSink
-	id := Identity{TurnState: "st-req", Sink: &sink}
+	id := identityFor("t-ts", "t-ts:0", "st-req", &sink)
 	c, err := Dial(context.Background(), PAT("t"), id, WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer c.Close(StatusGoingAway, "")
-	if got := sink.values(); len(got) != 1 || got[0] != "st-1" {
-		t.Fatalf("Sink = %v, 期望 [st-1]（握手响应头）", got)
+	if got := sink.values(); len(got) != 0 {
+		t.Fatalf("Sink = %v, 期望空（握手响应头的 ts 不取）", got)
 	}
 	if err := c.Send(context.Background(), []byte(`{"type":"response.create","model":"gpt-5"}`)); err != nil {
 		t.Fatalf("Send: %v", err)
