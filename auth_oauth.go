@@ -231,7 +231,8 @@ func (r *rotationAuth) refresh(ctx context.Context) error {
 }
 
 // refreshIfCurrent 是 401 轮转入口（refreshTrigger 接口）：rejected 是被上游
-// 401 拒绝的请求所用的 Authorization 头值。只有它仍是当前缓存的 at 时才
+// 401 拒绝的那次请求发出前 Auth.Authorization 的返回值（不是最终请求头——
+// WithHeader 可覆盖 Authorization 头，覆盖值不参与比较）。只有它仍是当前缓存的 at 时才
 // refresh；当前 at 已换成别的值（其他请求已完成轮转）时不发 refresh、直接
 // 返回 nil，调用方以当前 at 重试。进行中的单飞 refresh 照常加入等待。
 func (r *rotationAuth) refreshIfCurrent(ctx context.Context, rejected string) error {

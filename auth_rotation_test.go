@@ -1098,6 +1098,31 @@ func (s *signalOnClose) Close() error {
 	return err
 }
 
+// waitCh 是时序屏障的失败保护：等 ch 关闭，但最多等 5 秒——回归时测试快速
+// 失败并指出卡在哪一步，而不是挂到 go test 默认的 10 分钟超时。它不参与时序
+// 判定（不引入 sleep、不放宽断言），只是把"永远等不到"变成一次明确的失败。
+func waitCh(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("等待 %s 超时（5s）", what)
+	}
+}
+
+// waitRecv 是 waitCh 带接收值的形态：等 ch 上的结果，最多 5 秒（同一失败保护）。
+func waitRecv[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(5 * time.Second):
+		t.Fatalf("等待 %s 超时（5s）", what)
+		var zero T
+		return zero
+	}
+}
+
 // TestRotationLateStale401SkipsRefresh：失败请求所用的 token 已不是当前 token
 // 时不再 refresh，直接用当前 token 重试一次（R-1）。时序全部由 channel 屏障决定。
 func TestRotationLateStale401SkipsRefresh(t *testing.T) {
@@ -1122,7 +1147,7 @@ func TestRotationLateStale401SkipsRefresh(t *testing.T) {
 			_, err := late.Do(context.Background(), []byte(`{}`))
 			lateErr <- err
 		}()
-		<-g.arrived // late 的旧 token 请求已在上游被扣住
+		waitCh(t, g.arrived, "late 的旧 token 请求被上游扣住")
 
 		// other：旧 token 401 → refresh → 新 token 重试成功，轮转整体完成。
 		if _, err := other.Do(context.Background(), []byte(`{}`)); err != nil {
@@ -1133,7 +1158,7 @@ func TestRotationLateStale401SkipsRefresh(t *testing.T) {
 		}
 
 		g.open() // 放行迟到的 401
-		if err := <-lateErr; err != nil {
+		if err := waitRecv(t, lateErr, "late 的迟到 401 处理完成"); err != nil {
 			t.Fatalf("late Do: %v", err)
 		}
 		if m.callCount() != 1 {
@@ -1166,23 +1191,23 @@ func TestRotationLateStale401SkipsRefresh(t *testing.T) {
 			_, err := late.Do(context.Background(), []byte(`{}`))
 			lateErr <- err
 		}()
-		<-g.arrived
+		waitCh(t, g.arrived, "late 的旧 token 请求被上游扣住")
 
 		otherErr := make(chan error, 1)
 		go func() {
 			_, err := other.Do(context.Background(), []byte(`{}`))
 			otherErr <- err
 		}()
-		<-m.started // other 的 refresh 已在途（被 refreshGate 扣住）
+		waitCh(t, m.started, "other 的 refresh 已在途")
 
-		g.open()     // late 收到旧 token 401
-		<-sig.closed // late 已读完 401 体，随即进入轮转
+		g.open() // late 收到旧 token 401
+		waitCh(t, sig.closed, "late 读完 401 体并进入轮转")
 		openRefresh()
 
-		if err := <-otherErr; err != nil {
+		if err := waitRecv(t, otherErr, "other Do 返回"); err != nil {
 			t.Fatalf("other Do: %v", err)
 		}
-		if err := <-lateErr; err != nil {
+		if err := waitRecv(t, lateErr, "late Do 返回"); err != nil {
 			t.Fatalf("late Do: %v", err)
 		}
 		if m.callCount() != 1 {
@@ -1219,7 +1244,7 @@ func TestRotationLateStale401SkipsRefresh(t *testing.T) {
 			c, err := Dial(context.Background(), auth, Identity{}, dialOpt())
 			lateRes <- dialResult{c, err}
 		}()
-		<-g.arrived
+		waitCh(t, g.arrived, "late 的旧 token 升级请求被上游扣住")
 
 		other, err := Dial(context.Background(), auth, Identity{}, dialOpt())
 		if err != nil {
@@ -1231,7 +1256,7 @@ func TestRotationLateStale401SkipsRefresh(t *testing.T) {
 		}
 
 		g.open()
-		res := <-lateRes
+		res := waitRecv(t, lateRes, "late Dial 返回")
 		if res.err != nil {
 			t.Fatalf("late Dial: %v", res.err)
 		}
@@ -1300,4 +1325,177 @@ func TestRotationRefreshIfCurrent(t *testing.T) {
 			t.Fatalf("refresh 次数 = %d, 期望 0", m.callCount())
 		}
 	})
+}
+
+// headerGate 按自定义请求头扣住第一个匹配请求：Authorization 被 WithHeader 覆盖后
+// 不能再用它区分客户端。被扣住的请求在 release 后返回 401，其余请求交给 ok。
+type headerGate struct {
+	srv     *httptest.Server
+	arrived chan struct{}
+	release chan struct{}
+	once    sync.Once
+	first   atomic.Bool
+}
+
+func newHeaderGate(t *testing.T, header, value string, ok http.HandlerFunc) *headerGate {
+	t.Helper()
+	g := &headerGate{arrived: make(chan struct{}), release: make(chan struct{})}
+	g.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(header) == value && g.first.CompareAndSwap(false, true) {
+			close(g.arrived)
+			<-g.release
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_exceeded"}}`))
+			return
+		}
+		ok(w, r)
+	}))
+	t.Cleanup(g.srv.Close)
+	t.Cleanup(g.open) // 后注册先执行：失败路径上先放行被扣住的 handler
+	return g
+}
+
+func (g *headerGate) open() { g.once.Do(func() { close(g.release) }) }
+
+// TestRotationRefreshIgnoresHeaderOverride：WithHeader("Authorization", ...) 覆盖
+// 时，401 轮转比较的是 Auth.Authorization 的返回值（发请求前取得的 token），
+// 不是最终发出去的请求头——覆盖值不参与代际判定。两个方向各守护一侧：
+// 覆盖值不等于当前 token 时仍要 refresh；覆盖值恰是当前 token 时仍要跳过。
+func TestRotationRefreshIgnoresHeaderOverride(t *testing.T) {
+	const target = "https://chatgpt.com/backend-api/codex/responses"
+	okJSON := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x"}`))
+	}
+
+	t.Run("覆盖值不等于当前 token：仍以 Auth 返回值判定并 refresh", func(t *testing.T) {
+		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
+		var n atomic.Int32
+		var mu sync.Mutex
+		var auths []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			auths = append(auths, r.Header.Get("Authorization"))
+			mu.Unlock()
+			if n.Add(1) == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_exceeded"}}`))
+				return
+			}
+			okJSON(w, r)
+		}))
+		t.Cleanup(srv.Close)
+
+		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
+		hc := NewHTTPClient(auth, WithTransport(newFixedTransport(t, target, srv.URL)),
+			WithHeader("Authorization", "Bearer custom"))
+		resp, err := hc.Do(context.Background(), []byte(`{}`))
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("StatusCode = %d, 期望 200（被拒 token 仍是当前 token，应 refresh 后重试）", resp.StatusCode)
+		}
+		if m.callCount() != 1 {
+			t.Fatalf("refresh 次数 = %d, 期望 1（按 Auth 返回值判定；用覆盖值会误判为已替换而跳过）", m.callCount())
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(auths) != 2 || auths[0] != "Bearer custom" || auths[1] != "Bearer custom" {
+			t.Fatalf("请求头序列 = %v, 期望两次都是覆盖值 Bearer custom", auths)
+		}
+	})
+
+	t.Run("覆盖值恰是当前 token：仍按 Auth 返回值跳过 refresh", func(t *testing.T) {
+		m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
+		// 上游按 Auth 代际判定：旧 token 401，新 token 200。
+		g := newHeaderGate(t, "X-Late-Client", "1", func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") == "Bearer at-old" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_exceeded"}}`))
+				return
+			}
+			okJSON(w, r)
+		})
+		auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
+		// late 把 Authorization 覆盖成轮转后的那个值：覆盖值看起来"仍是当前
+		// token"，但真正发请求时 Auth 返回的是 at-old。
+		late := NewHTTPClient(auth, WithTransport(newFixedTransport(t, target, g.srv.URL)),
+			WithHeader("X-Late-Client", "1"), WithHeader("Authorization", "Bearer at-new"))
+		other := NewHTTPClient(auth, WithTransport(newFixedTransport(t, target, g.srv.URL)))
+
+		lateErr := make(chan error, 1)
+		go func() {
+			_, err := late.Do(context.Background(), []byte(`{}`))
+			lateErr <- err
+		}()
+		waitCh(t, g.arrived, "late 的旧 token 请求被上游扣住")
+
+		// other 完成轮转：at-old 401 → refresh → at-new 200。
+		if _, err := other.Do(context.Background(), []byte(`{}`)); err != nil {
+			t.Fatalf("other Do: %v", err)
+		}
+		if m.callCount() != 1 {
+			t.Fatalf("轮转后 refresh 次数 = %d, 期望 1", m.callCount())
+		}
+
+		g.open() // 放行迟到的 401
+		if err := waitRecv(t, lateErr, "late 的迟到 401 处理完成"); err != nil {
+			t.Fatalf("late Do: %v", err)
+		}
+		if m.callCount() != 1 {
+			t.Fatalf("refresh 次数 = %d, 期望 1（Auth 返回值 at-old 已被替换；用覆盖值会误判为仍是当前 token）", m.callCount())
+		}
+	})
+}
+
+// TestWSDial401UsesIssuedToken：WS 升级 401 交给 refreshIfCurrent 的必须是发该
+// 请求时所用的 token（issuedToken，取自 Auth.Authorization），不能用
+// WithHeader 覆盖后的最终升级头值。覆盖值恒定，用它判定会一律误判为"已替换"
+// 而跳过 refresh，重连仍是 401。
+func TestWSDial401UsesIssuedToken(t *testing.T) {
+	const target = "https://chatgpt.com/backend-api/codex/responses"
+	m := newMockRefresh(t, refreshStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
+	var mu sync.Mutex
+	var upgrades []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		upgrades = append(upgrades, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if m.callCount() == 0 { // 尚未轮转：升级 401（覆盖值恒定，不能靠它区分两次拨号）
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		for {
+			if _, _, err := c.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	auth := OAuthWithRotation("rt-0", WithInitialAccessToken("at-old"))
+	c, err := Dial(context.Background(), auth, Identity{},
+		WithTransport(newFixedTransport(t, target, srv.URL)),
+		WithHeader("Authorization", "Bearer custom"))
+	if err != nil {
+		t.Fatalf("Dial: %v（用覆盖后的升级头值判定会跳过 refresh，重连仍 401）", err)
+	}
+	defer c.Close(StatusGoingAway, "")
+	if m.callCount() != 1 {
+		t.Fatalf("refresh 次数 = %d, 期望 1（交给 refreshIfCurrent 的应是 issuedToken=Bearer at-old）", m.callCount())
+	}
+	if err := c.Send(context.Background(), []byte(`{"type":"ping","model":"m"}`)); err != nil {
+		t.Fatalf("重连后 Send: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(upgrades) != 2 || upgrades[0] != "Bearer custom" || upgrades[1] != "Bearer custom" {
+		t.Fatalf("升级头序列 = %v, 期望两次都是覆盖值 Bearer custom", upgrades)
+	}
 }
