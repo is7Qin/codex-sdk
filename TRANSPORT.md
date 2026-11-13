@@ -354,7 +354,10 @@ response 的第一个 ts。
   发布快照并把"本帧身份"压入容量 16 的 FIFO（FIFO 顺序 = 线上顺序，上游再快的
   `response.created` 也不会先于登记到达；取得写闸时 ctx 已取消则不登记、不写（撤销条目
   不会因已取消的 Send 堆积占满 FIFO）；写失败在闸内撤销：FIFO 条目标记撤销、快照换回，
-  无让出等待）；`Recv`：`response.created` 取最早一份绑定，
+  无让出等待。残余窗口：ctx 恰在 coder 取锁、并与 ping/pong 争锁时到期（已过闸内 ctx
+  检查；coder 此处失败不关连接），可能留下 1 个已撤销的 FIFO 条目。这只在 ctx 恰好在
+  此刻到期时发生，不会像"已取消 ctx 反复 Send"那样稳定堆积，不会累积；写中途到期
+  coder 会关连接，占位无害）；`Recv`：`response.created` 取最早一份绑定，
   completed/failed/incomplete 清除绑定；没有已绑定 response 时的 `error` 弹掉一份（该
   create 被拒），流中途的 `error` 只结束绑定；`response.metadata` 只交给 id 匹配的身份：
   快照当前轮次号相同且 ts 空或 owner 不同时 CAS 写入，轮次已换则计数（迟到），会话簿

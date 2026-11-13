@@ -230,6 +230,8 @@
 // 预热帧拿到的 ts 存进连接快照，随后本连接新开的一轮没有同 owner 的 ts 时带上它
 // （只用一次）。每帧在写闸内、写帧之前发布快照并把"本帧身份"压入容量 16 的
 // FIFO（取得写闸时 ctx 已取消则不登记、不写；写失败在闸内撤销），因此 FIFO 顺序等于线上顺序、created 不会先于登记到达；
+// 残余窗口：ctx 恰在 coder 取锁并与 ping/pong 争锁时到期，可能留下 1 个已撤销的 FIFO
+// 条目，不会累积。
 // Recv 在 response.created 时按顺序绑定（只回 error、没有 created 的帧被弹掉；FIFO
 // 满则整条连接停止捕获 ts），response.metadata 的 ts 先按轮次号 CAS 进连接快照，
 // 会话簿开的轮次再交给会话簿 Sink。Send 与 Recv 可并发（并发 Send 时轮次推进顺序
