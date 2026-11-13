@@ -118,7 +118,7 @@ func WithResponsesTransport(t Transport) Option
 |---|---|---|
 | `StreamBody` | `*http.Response{200, 未读 SSE body, 上游头}` | `*http.Response{200 OK, 帧渲染的 SSE body, 合成头只有 Content-Type: text/event-stream}`（不带 ts） |
 | `Responses` | `Stream` → `responsesAggregator` → `HTTPResponse{200, Raw}`（**无 ts 字段**：签发值只走 `Identity.Sink`） | `responsesStreamWS` **直接从 exchange 取帧**喂同一个聚合器（不经 `sseView`/`scanSSE` 的渲染-回扫回路）→ 同形态、逐字段同构 |
-| turn-state | 请求头 `x-codex-turn-state`（值来自 `Identity.Turn.State`，逐请求传入）；捕获点：HTTP 响应头 | 帧 `client_metadata."x-codex-turn-state"`（同一来源）；捕获点：属于本次 response 的 `response.metadata` 事件（**握手响应头不取**，官方只认事件）；统一回调 `Identity.Sink`；**合成响应头不带 ts**，SDK 不保留任何 ts 状态 |
+| turn-state | 请求头 `x-codex-turn-state`（值来自 `Identity.Turn.State`，逐请求传入）；捕获点：HTTP 响应头 | 帧 `client_metadata."x-codex-turn-state"`（同一来源；例外：HTTP→WS 预热且 `Turn.State` 为空时带预热签发的 ts，见「HTTP→WS 预热」）；捕获点：属于本次 response 的 `response.metadata` 事件（**握手响应头不取**，官方只认事件）；统一回调 `Identity.Sink`；**合成响应头不带 ts**，SDK 不保留任何 ts 状态 |
 | 读上限 | 聚合器单行 16MiB；裸 body 由下游决定 | 按取数路径固定：聚合 16MiB / 流式 64MiB（`WithReadLimit` 只作用于公开 `Dial`，传输臂的上限由取数路径决定）；两条取数路径不共享连接（16MiB / 64MiB） |
 | 请求整形 | `parseRequest(surfaceHTTP)` → `shapeRequest` → `assembleHTTP`（官方 HTTP 键序）→ zstd 压缩，`content-encoding: zstd` | `parseRequest(surfaceWSFromHTTP)` → `shapeRequest` → `assembleWS`（`type:"response.create"`、丢弃客户端 `previous_response_id`/`generate`、官方 WS 键序）；`x-codex-ws-stream-request-start-ms` 取得写闸后写入 |
 | 401 轮转 | 判死分类 + 单飞 refresh + 重试一次 | 同（`dialConn` 内，`OAuthWithRotation`） |
@@ -261,11 +261,13 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
 | `previous_response_id` | 无 | text 相等时 = 预热 response id；否则无 |
 | `text` | 去掉 `format` | 原值 |
 | `generate` | `false` | 不写 |
-| `client_metadata` / turn-metadata | prewarm 形态（`turn_id:""`，无 `root_turn_id`、ts） | turn 形态；ts = 预热 `response.metadata` 签发的值（无则 `Identity.Turn.State`） |
+| `client_metadata` / turn-metadata | prewarm 形态（`turn_id:""`，无 `root_turn_id`、ts） | turn 形态；ts = `Identity.Turn.State`（非空时优先），为空则用预热 `response.metadata` 签发的值 |
 
 预热事件不进 `StreamBody` / `Responses` 的结果、不计用量、不调用 `Release`；归还判定（fence）
-只在真实帧终态后发生。预热 ts 同时交给 `Identity.Sink`（首值生效由 Sink 负责）；真实帧带同一预热
-response 的第一个 ts。
+只在真实帧终态后发生。预热 ts 同时交给 `Identity.Sink`（首值生效由 Sink 负责）；`Identity.Turn.State` 为空时真实帧带
+同一预热 response 的第一个 ts，非空时真实帧仍带 `Identity.Turn.State`（官方 turn_state 是 OnceLock：
+已有值优先；与 WS→WS 会话路径 `takePrewarmTS` 一致。典型场景：会话簿对同一轮首请求的重试返回
+`First=true` 并带已记录的同 owner ts，重试落到新连接时预热签发的新 ts 不得盖掉它）。
 
 **失败**：
 
@@ -273,7 +275,7 @@ response 的第一个 ts。
 |---|---|
 | 写预热帧失败、EOF / 连接错误、空闲超时、ctx 取消或超时 | 连接终止，返回连接类错误（`codexsdk: websocket 预热未完成（真实请求未发出）: %w`；不是 `*HTTPError`；`errors.Is(context.Canceled / DeadlineExceeded / ErrWSIdleTimeout / io.EOF)` 照旧成立），调用方按连接错误重试/故障转移 |
 | `error` 帧带 4xx（含 429）状态 | `*HTTPError` 直接返回，不重拨 |
-| `response.failed` / `response.incomplete`、无状态或 5xx 的 `error` 帧 | 关闭该连接，同一 ctx 内重拨一次（turn 形态握手）、不预热、发全量、不带 `previous_response_id`；预热已拿到的 ts 照样带上（与交给 Sink 的一致；官方 turn_state 是 OnceLock，重连不重置）。调用方此时已取消则不重拨，按上面的连接类错误返回 |
+| `response.failed` / `response.incomplete`、无状态或 5xx 的 `error` 帧 | 关闭该连接，同一 ctx 内重拨一次（turn 形态握手）、不预热、发全量、不带 `previous_response_id`；ts 规则同成功路径：`Identity.Turn.State` 非空则带它，否则带预热已拿到的 ts（与交给 Sink 的一致；官方 turn_state 是 OnceLock，重连不重置）。调用方此时已取消则不重拨，按上面的连接类错误返回 |
 
 **计数**（进程级，`ShapeStatsSnapshot()`）：`Prewarms`、`PrewarmConnFailures`、`PrewarmRejections`、
 `PrewarmRedials`、`PrewarmChained`（真实帧带预热 id）、`PrewarmUnchained`（预热成功但真实帧不带）。
@@ -289,9 +291,12 @@ response 的第一个 ts。
   给出 `Raw` 的文本视图——网关 `upstreamBody` 的信封协议，WS 错误帧翻成的
   `*HTTPError` 也走同一条路）。
   无升级响应的失败不再是 `DialError`（`StatusCode==0` 形态消失）。
-- **turn-state 的来源与跨轮**：请求侧只有一个来源——`Identity.Turn.State`（`""` = 本次不带）。
-  捕获到的签发值只回调 `Identity.Sink`，SDK **不缓存、不回落、不回填响应头**：重放策略由调用方
-  在构造 `Identity` 时决定（网关侧是会话对象上的一个策略位）。会话簿（`ConversationBook`）
+- **turn-state 的来源与跨轮**：请求侧的主来源是 `Identity.Turn.State`（`""` = 调用方不提供）。
+  唯一例外是 HTTP→WS 预热：新连接且 `Turn.First` 时，若 `Turn.State` 为空，真实帧带预热
+  `response.metadata` 签发的 ts（`Turn.State` 非空则仍带它，规则见「HTTP→WS 预热」）；调用方
+  要求"本次一定不带 ts"只能用 `Turn.First=false`（同时关掉预热）。除此之外，捕获到的签发值只回调
+  `Identity.Sink`，SDK **不跨请求缓存、不回填响应头**：重放策略由调用方在构造 `Identity` 时决定
+  （网关侧是会话对象上的一个策略位）。会话簿（`ConversationBook`）
   是这条规则之上的调用方组件：它的 `Prepare` 产出带 `Turn.State` 与 Sink 的 `Identity`，
   传输层照旧只认 `Identity`。
   **身份头与形态头是保留键**：`WithHeader` 遇到 `session-id` / `thread-id` / `x-client-request-id` /
@@ -433,7 +438,7 @@ WS→WS 三种面的组装结果与抓包逐字节相等（`client_metadata` 按
 
 `transport_ws_test.go`（`httptest` + `websocket.Accept` 假上游）：帧→SSE 逐字节
 断言（含 `[DONE]` 位置）、与 HTTP 臂合成体逐字段相等、
-`response.failed` 两臂同形、身份与 turn-state（请求侧只认 `Identity.Turn.State`；升级头不携带；
+`response.failed` 两臂同形、身份与 turn-state（请求侧取 `Identity.Turn.State`，HTTP→WS 预热且其为空时取预热 ts；升级头不携带；
 只有 `response.metadata` 事件捕获后回调 `Identity.Sink`，握手响应头不取；匿名时 payload 自带的
 `client_metadata` 被删除；连接身份 = `(threadKey, routingHint, readLimit)`，跨 window 复用、匿名不复用；
 `RetireThread` 只摘 idle）、HTTP→WS 帧构造规则 + 无效请求体、关闭

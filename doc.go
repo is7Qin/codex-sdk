@@ -33,7 +33,8 @@
 //     WS beta 头（现役唯一 2026-02-06）、头常量导出；身份完全请求级（Identity：
 //     InstallationID / Session / Window / Turn / Sink），默认头不得携带身份或形态
 //     键（WithHeader 遇保留键构造期 panic）；x-codex-turn-state 请求侧取
-//     Identity.Turn.State（HTTP 走请求头、WS 走帧内 client_metadata，握手不带），
+//     Identity.Turn.State（HTTP 走请求头、WS 走帧内 client_metadata，握手不带；
+//     例外：HTTP→WS 预热且 Turn.State 为空时真实帧带预热签发的 ts），
 //     响应侧只认 HTTP 响应头与 response.metadata 事件，只回调 Identity.Sink；
 //     ChatGPT-Account-ID（AccountIDProvider 可选接口：rotationAuth 经
 //     WithOAuthAccountID / patAuth 经 WithPATAccountID 显式注入——空 = 不发；
@@ -242,14 +243,15 @@
 // （非输入字段同真实帧、text 去掉 format；输入 lite 为空、非 lite 只有 SDK 生成的
 // 指令消息；握手 turn-metadata 为 prewarm 形态），在内部读到 response.completed：
 // 预热事件不进返回流、不计用量、不触发归还；预热 response.metadata 的 ts 交给
-// Identity.Sink，并作为真实帧的 x-codex-turn-state。真实 text 不带 format 时真实帧
+// Identity.Sink，并在 Identity.Turn.State 为空时作为真实帧的 x-codex-turn-state
+// （非空则 Turn.State 优先，同官方 OnceLock）。真实 text 不带 format 时真实帧
 // 带 previous_response_id = 预热 response id 并跳过预热输入；否则不带、发全量。
 // 复用连接与一轮的后续请求不预热，一律全量、不带 previous_response_id（与官方的
 // 一处已知差异：官方复用连接时发增量）。预热失败：连接错误 / EOF / 空闲超时 /
 // ctx 结束 ⇒ 连接类错误（真实请求未发出，不是 *HTTPError，errors.Is 原因照旧）；
 // 4xx（含 429）error 帧 ⇒ *HTTPError 直接返回；response.failed / incomplete、无状态
-// 或 5xx error ⇒ 关闭连接、重拨一次（turn 形态握手）、不预热、发全量，预热已拿到的
-// ts 照样带上；调用方已取消则不重拨（返回取消错误）。匿名身份不预热。代价：每条新连接多一次往返；
+// 或 5xx error ⇒ 关闭连接、重拨一次（turn 形态握手）、不预热、发全量，ts 规则同上
+// （Turn.State 优先，否则预热已拿到的 ts）；调用方已取消则不重拨（返回取消错误）。匿名身份不预热。代价：每条新连接多一次往返；
 // 判定只读已整形的部件（无额外整包扫描或复制）。计数在 ShapeStatsSnapshot 的
 // Prewarm* 字段（进程级）。
 //

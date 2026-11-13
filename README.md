@@ -132,12 +132,13 @@ With `WithResponsesTransport(TransportWS)`, when a request opens a **new** upstr
 consumes its response internally (events are hidden, usage is not counted, the connection is not released),
 and then sends the real frame with `previous_response_id` = the prewarm response id (unless the real
 `text` carries a `format`, in which case the full input is sent without it). The turn-state issued for the
-prewarm response goes to `Identity.Sink` and into the real frame (the first value wins). Reused connections,
+prewarm response goes to `Identity.Sink`; the real frame carries `Identity.Turn.State` when it is non-empty,
+otherwise the prewarm-issued value (OnceLock semantics: an existing value wins). Reused connections,
 follow-up requests and anonymous identities never prewarm. Failures: connection errors during prewarm return
 a non-`*HTTPError` connection error (`errors.Is` still matches the cause); 4xx error frames return
 `*HTTPError`; `response.failed` / `response.incomplete` / 5xx / status-less errors close the connection and
-redial once (turn-shaped handshake, no prewarm, full input, still carrying any turn-state the prewarm already
-issued) — unless the caller has already cancelled, in which case the cancellation is returned. The connection cache key now also
+redial once (turn-shaped handshake, no prewarm, full input, carrying `Identity.Turn.State` if set, else any
+turn-state the prewarm already issued) — unless the caller has already cancelled, in which case the cancellation is returned. The connection cache key now also
 includes the routing hint (model / service tier). Counters: `ShapeStatsSnapshot().Prewarm*`.
 
 ## Conversation book

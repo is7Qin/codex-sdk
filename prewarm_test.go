@@ -1071,3 +1071,97 @@ func TestPrewarmClientValuesNeverEgress(t *testing.T) {
 		assertNoSentinel(t, "握手头", headerBytes(up.handshakeHeaders(t, i)))
 	}
 }
+
+// TestPrewarmCallerTurnStateWins：调用方已给 Turn.State（同 owner 的已记录 ts）时，
+// 预热签发的新 ts 只交给 Sink，不盖掉它——真实帧带 Turn.State（官方 OnceLock：已有
+// 值优先；与 WS→WS 会话路径 takePrewarmTS 一致）。Turn.State 为空时才用预热 ts。
+func TestPrewarmCallerTurnStateWins(t *testing.T) {
+	payload := []byte(`{"model":"gpt-6.1-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+
+	t.Run("会话簿重试落到新连接", func(t *testing.T) {
+		// 一轮第一个请求的客户端重试（同一 TurnKey）：会话簿给 First=true 且带已记录的
+		// 同 owner ts S1；重试落到新连接（新 client）⇒ 预热，上游签发 S2。
+		book := NewConversationBook(NewMemoryConversationStore())
+		req := ConversationRequest{
+			Key: NewConversationKey("d", 1, "conv-retry-ts"), InstallationID: "inst",
+			Owner: [16]byte{1}, Input: AnalyzeConversationInput(payload),
+		}
+		up := newPrewarmUpstream(t)
+		up.mu.Lock()
+		up.ts = "S1"
+		up.mu.Unlock()
+		id1 := book.Prepare(context.Background(), req)
+		doStreamBodyPayload(t, up.client(t), id1, payload)
+		if err := book.Flush(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		up.mu.Lock()
+		up.ts = "S2"
+		up.mu.Unlock()
+		id2 := book.Prepare(context.Background(), req)
+		if !id2.Turn.First || id2.Turn.State != "S1" {
+			t.Fatalf("重试身份 First=%v State=%q, 期望 First=true State=S1", id2.Turn.First, id2.Turn.State)
+		}
+		doStreamBodyPayload(t, up.client(t), id2, payload)
+		frames := up.sentFrames(t)
+		if len(frames) != 4 || !isPrewarmFrame(frames[2]) || isPrewarmFrame(frames[3]) {
+			t.Fatalf("期望 4 帧（两次 预热+真实），实际 %d", len(frames))
+		}
+		if got := frameTurnState(t, frames[3]); got != "S1" {
+			t.Fatalf("重试的真实帧 ts = %q, 期望 S1（Turn.State 优先，不得被预热 ts S2 覆盖）", got)
+		}
+		// 会话簿仍保留 S1：本轮后续请求与真实帧一致。
+		if err := book.Flush(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		next := req
+		next.Input = AnalyzeConversationInput([]byte(`{"model":"gpt-6.1-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"function_call","call_id":"c","name":"x","arguments":"{}"},{"type":"function_call_output","call_id":"c","output":"o"}]}`))
+		id3 := book.Prepare(context.Background(), next)
+		if id3.Turn.First || id3.Turn.State != "S1" {
+			t.Fatalf("后续请求 First=%v State=%q, 期望 First=false State=S1", id3.Turn.First, id3.Turn.State)
+		}
+	})
+
+	t.Run("预热成功", func(t *testing.T) {
+		up := newPrewarmUpstream(t) // 默认脚本：预热签发 T-prewarm
+		var sink turnStateSink
+		id := prewarmIdentity("thread-pw-caller-ts", &sink)
+		id.Turn.State = "S1"
+		doStreamBodyPayload(t, up.client(t), id, payload)
+		frames := up.sentFrames(t)
+		if len(frames) != 2 || !isPrewarmFrame(frames[0]) {
+			t.Fatalf("期望 预热+真实 两帧，实际 %d", len(frames))
+		}
+		if got := frameTurnState(t, frames[1]); got != "S1" {
+			t.Fatalf("真实帧 ts = %q, 期望调用方的 S1", got)
+		}
+		if got := sink.values(); len(got) != 1 || got[0] != "T-prewarm" {
+			t.Fatalf("Sink = %v, 期望 [T-prewarm]（预热 ts 照样交给 Sink）", got)
+		}
+	})
+
+	t.Run("预热失败重拨", func(t *testing.T) {
+		up := newPrewarmUpstream(t)
+		up.script(func(conn, _ int, frame []byte) prewarmReply {
+			if isPrewarmFrame(frame) {
+				return prewarmReply{events: []string{
+					tsCreatedFrame("resp_pw"),
+					tsMetadataFrame("resp_pw", "T-held"),
+					`{"type":"response.failed","response":{"id":"resp_pw","object":"response","status":"failed"}}`,
+				}}
+			}
+			id := "resp_real_" + strconv.Itoa(conn)
+			return prewarmReply{events: []string{tsCreatedFrame(id), tsCompletedFrame(id)}}
+		})
+		id := prewarmIdentity("thread-pw-caller-ts-redial", nil)
+		id.Turn.State = "S1"
+		doStreamBodyPayload(t, up.client(t), id, payload)
+		frames := up.sentFrames(t)
+		if len(frames) != 2 || up.upgrades.Load() != 2 {
+			t.Fatalf("期望重拨一次共 2 帧，实际 %d 帧 / %d 次握手", len(frames), up.upgrades.Load())
+		}
+		if got := frameTurnState(t, frames[1]); got != "S1" {
+			t.Fatalf("重拨后真实帧 ts = %q, 期望调用方的 S1", got)
+		}
+	})
+}

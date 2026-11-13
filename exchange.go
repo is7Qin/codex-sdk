@@ -233,7 +233,8 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 		if redial {
 			// 预热响应以失败结束：这条连接不再用。重拨一次，握手为 turn 形态，
 			// 不再预热，真实帧发全量、不带 previous_response_id；预热已拿到的
-			// turn-state 照样带上（a.turnState，官方 OnceLock 重连不重置）。
+			// turn-state 照样带上（a.turnState；Identity.Turn.State 非空时仍是它，
+			// 官方 OnceLock：已有值优先，重连不重置）。
 			e.abandon(io.EOF)
 			spec.prewarm = false
 			cn, hs, derr = dialConn(exchangeCtx, spec)
@@ -258,7 +259,9 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 //
 // 返回真实帧的组装参数：
 //   - 预热 response.metadata 给的 turn-state（属于预热 response 的）交给 sink，
-//     并作为真实帧的 turn-state（无则沿用 real.turnState，即 Identity.Turn.State）；
+//     并在 real.turnState（即 Identity.Turn.State）为空时作为真实帧的
+//     turn-state；Identity.Turn.State 非空则它优先（官方 OnceLock：已有值优先，
+//     与 WS→WS 会话路径 takePrewarmTS 一致）；
 //   - prewarmChains 时 previous_response_id = 预热 response id、跳过预热输入项；
 //     否则不带、全量。
 //
@@ -270,8 +273,9 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 //   - 4xx（含 429）error 帧：上游的确定性拒绝，*HTTPError 直接返回，不重拨；
 //   - response.failed / response.incomplete、无状态或 5xx 的 error 帧：redial =
 //     true，exchange 未收尾，由调用方 abandon 后重拨；返回的 a 不带
-//     previous_response_id、全量，但带预热已拿到的 turn-state。调用方此时已
-//     取消（exchange ctx 已结束）则不重拨，按连接类失败返回（取消错误链保留）。
+//     previous_response_id、全量，turn-state 规则同上（Identity.Turn.State 优先，
+//     否则预热已拿到的值）。调用方此时已取消（exchange ctx 已结束）则不重拨，
+//     按连接类失败返回（取消错误链保留）。
 func (e *wsExchange) prewarm(sh *shapedRequest, sink TurnStateSink, real wsAssembly) (a wsAssembly, redial bool, err error) {
 	shapeStats.prewarms.Add(1)
 	frame, off := assembleWS(sh, wsAssembly{prewarm: true})
@@ -294,7 +298,7 @@ func (e *wsExchange) prewarm(sh *shapedRequest, sink TurnStateSink, real wsAssem
 			if respID == "" {
 				respID = gjson.GetBytes(raw, "response.id").String()
 			}
-			if held.v != "" {
+			if held.v != "" && real.turnState == "" {
 				real.turnState = held.v
 			}
 			if respID != "" && sh.prewarmChains() {
@@ -320,7 +324,7 @@ func (e *wsExchange) prewarm(sh *shapedRequest, sink TurnStateSink, real wsAssem
 			return real, false, e.prewarmConnFailure(cerr) // 调用方已放弃：不白拨一次
 		}
 		shapeStats.prewarmRedials.Add(1)
-		if held.v != "" {
+		if held.v != "" && real.turnState == "" {
 			real.turnState = held.v
 		}
 		return real, true, nil
