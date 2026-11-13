@@ -27,7 +27,7 @@ func topKeys(t *testing.T, b []byte) []string {
 	return keys
 }
 
-// TestShapeThirdPartyRequests（A-2）：第三方客户端的各种形态。
+// TestShapeThirdPartyRequests：第三方客户端的各种形态。
 func TestShapeThirdPartyRequests(t *testing.T) {
 	before := ShapeStatsSnapshot()
 	in := []byte(" {\n  \"tools\": [{\"type\":\"function\",\"function\":{\"parameters\":{\"type\":\"object\"},\"strict\":true,\"name\":\"sh\",\"description\":\"run\"}}],\n" +
@@ -124,7 +124,7 @@ func TestShapeThirdPartyRequests(t *testing.T) {
 	}
 }
 
-// TestShapeLiteRules（A-3）：lite / 非 lite 的工具分组、reasoning、parallel_tool_calls、
+// TestShapeLiteRules：lite / 非 lite 的工具分组、reasoning、parallel_tool_calls、
 // tool_choice、text 键序与默认值。
 func TestShapeLiteRules(t *testing.T) {
 	tools := `[{"type":"web_search"},` +
@@ -213,7 +213,7 @@ func TestShapeLiteRules(t *testing.T) {
 	}
 }
 
-// TestClientMetadataKeySets（A-6）：HTTP / WS 真实帧 / WS 预热帧的 client_metadata 键集合。
+// TestClientMetadataKeySets：HTTP / WS 真实帧 / WS 预热帧的 client_metadata 键集合。
 func TestClientMetadataKeySets(t *testing.T) {
 	base := []string{"session_id", "thread_id", "x-codex-window-id", "x-codex-installation-id", "x-codex-turn-metadata", "mcp_attribution", "guardian_credits_requested"}
 	keysOf := func(b []byte) map[string]string {
@@ -267,7 +267,7 @@ func TestClientMetadataKeySets(t *testing.T) {
 	}
 }
 
-// TestClientMetadataOrderRandomized（A-6）：100 次组装至少出现 2 种键序。
+// TestClientMetadataOrderRandomized：100 次组装至少出现 2 种键序。
 func TestClientMetadataOrderRandomized(t *testing.T) {
 	sh := mustShape(t, []byte(`{"model":"gpt-6.1-sol"}`), surfaceWSFromHTTP, testID())
 	orders := map[string]bool{}
@@ -282,7 +282,7 @@ func TestClientMetadataOrderRandomized(t *testing.T) {
 	}
 }
 
-// TestEncodeZeroCopyAllocFree（A-11）：匿名 + 规范键序与规范值的输入 → 返回原切片、
+// TestEncodeZeroCopyAllocFree：匿名 + 规范键序与规范值的输入 → 返回原切片、
 // 整条整形链（parse + shape + assemble）零分配。
 func TestEncodeZeroCopyAllocFree(t *testing.T) {
 	cases := []struct {
@@ -323,7 +323,7 @@ func TestEncodeZeroCopyAllocFree(t *testing.T) {
 	}
 }
 
-// TestModelTableMatchesOfficial0169（A-12）：12 行，逐项取自 rust-v0.169.0 models.json。
+// TestModelTableMatchesOfficial0169：12 行，逐项取自 rust-v0.169.0 models.json。
 func TestModelTableMatchesOfficial0169(t *testing.T) {
 	want := map[string]modelInfo{
 		"gpt-6-astra":              {true, true, false, true, "low", "low"},
@@ -349,7 +349,7 @@ func TestModelTableMatchesOfficial0169(t *testing.T) {
 	}
 }
 
-// TestAnalyzeConversationInput（A-14）。
+// TestAnalyzeConversationInput。
 func TestAnalyzeConversationInput(t *testing.T) {
 	user := `{"type":"message","role":"user","content":"hi"}`
 	cases := []struct {
@@ -403,7 +403,7 @@ func TestAnalyzeConversationInput(t *testing.T) {
 	}
 }
 
-// TestSlotIdentityShape（A-15）：槽位路径的 IdentityState.Identity 整形结果：身份来自
+// TestSlotIdentityShape：槽位路径的 IdentityState.Identity 整形结果：身份来自
 // 槽位，形态为新形态；窗口推进时 ContextWindowID 更换。
 func TestSlotIdentityShape(t *testing.T) {
 	st := NewIdentityState("inst-slot", RotatePolicy{})
@@ -442,7 +442,7 @@ func TestSlotIdentityShape(t *testing.T) {
 	}
 }
 
-// TestTurnMetadataIgnoresClientValues（A-17）：客户端 client_metadata 里的
+// TestTurnMetadataIgnoresClientValues：客户端 client_metadata 里的
 // turn-metadata（任意 sandbox / sandbox_mode / workspaces，含带凭据的远端 URL）
 // 不影响出网：恒为 none / danger-full-access、无 workspaces，哨兵不出网。
 func TestTurnMetadataIgnoresClientValues(t *testing.T) {

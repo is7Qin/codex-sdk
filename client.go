@@ -305,6 +305,11 @@ func WithMaxLineSize(n int) Option {
 
 // WithTransport 注入 HTTP 传输层（自定义 RoundTripper，如代理）；默认使用
 // http.DefaultTransport（连接池复用）。
+//
+// 官方客户端不发 Accept-Encoding；SDK 自己不设这个头，但 Go 的 *http.Transport
+// 在 DisableCompression=false 时会自动加 "Accept-Encoding: gzip"。要与官方形态
+// 一致，调用方传入的 Transport 需设置 DisableCompression（SDK 拿到的可能是包装型
+// RoundTripper，不能替调用方改）。
 func WithTransport(rt http.RoundTripper) Option {
 	return func(o *options) { o.transport = rt }
 }

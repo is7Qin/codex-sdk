@@ -15,6 +15,12 @@ func appendJSONString(dst []byte, s string) []byte {
 	return appendJSONStringMode(dst, s, false)
 }
 
+// appendJSONStringBytes 同 appendJSONString，输入为字节（编译器对 string(b) 作参数
+// 且不逃逸时不复制）。
+func appendJSONStringBytes(dst, b []byte) []byte {
+	return appendJSONStringMode(dst, string(b), false)
+}
+
 // appendASCIIJSONString 等价官方 to_ascii_json_string 的字符串规则：在 serde_json
 // 规则之上，非 ASCII 字符写成小写十六进制 \uxxxx，BMP 外字符写成 UTF-16 代理对。
 // turn-metadata 同时出现在 HTTP 头里，必须是纯 ASCII。

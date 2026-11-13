@@ -26,12 +26,25 @@ channel API.
   pending/expired/denied through sentinel errors or exchanges the code and
   returns tokens. Stateless by design: the caller keeps the pending session, and
   there is no blocking loop in the library.
-- **Fingerprint alignment**: headers, send-frame top-level key whitelist, and
-  `client_metadata` assembly aligned with the real Codex client.
-- **Request-scoped identity**: `Identity` carries session/meta/turn-state per
-  call; the SDK keeps no identity state and reports issued turn-state only
-  through `Identity.Sink`. Identity headers are reserved: `WithHeader` panics at
-  construction time if they are used.
+- **Request shaping (codex-tui 0.169.0)**: every Responses request
+  (HTTP→HTTP, HTTP→WS, WS→WS) is shaped in two stages — a single top-level
+  parse (whitelist, first-occurrence wins for duplicate keys) and an
+  identity/model-aware shaping step — then written in the official key order.
+  Official headers (`version`, `x-codex-beta-features`, `x-codex-routing-hint`,
+  identity headers, `x-codex-turn-metadata`, lower-case names), zstd request
+  bodies on `POST /responses`, `instructions` → developer message (official
+  UUIDv5 id), responses-lite `additional_tools` conversion from a static model
+  table, randomized `client_metadata` key order, ASCII turn-metadata, and
+  `permessage-deflate` negotiation on the WS handshake (outbound frames are not
+  compressed). Invalid bodies fail locally with `ErrInvalidRequestBody`.
+  Counters: `ShapeStatsSnapshot()`. `HTTPClient.Do` is **not** shaped and must
+  not be used for Codex responses.
+- **Request-scoped identity**: `Identity` (`InstallationID`, `Session`,
+  `Window`, `Turn`, `Sink`) is passed per call; the SDK keeps no identity state
+  and reports issued turn-state only through `Identity.Sink` (HTTP response
+  headers and `response.metadata` events; never WS handshake headers). Identity
+  and shape headers are reserved: `WithHeader` panics at construction time if
+  they are used.
 - **Protocol-aware transport**: the SDK owns framing and the SSE representation
   (no active heartbeat — aligned with the real Codex client, which only answers
   pings), and reports attributable transport errors
@@ -87,11 +100,22 @@ The old identity options (`WithSession`, `WithCodexMeta`,
 turn-state getters/setters (`HTTPClient.TurnState`, `HTTPResponse.TurnState`,
 `Client.TurnState`/`SetTurnState`) are removed.
 
-`Identity.Session` supplies the WS handshake headers, `Identity.Meta` supplies
-the frame/body `client_metadata`, `Identity.TurnState` is the per-request
-turn-state, and `Identity.Sink` receives any turn-state issued by upstream.
-Because `x-codex-turn-state` and the other identity headers are reserved,
-`WithHeader` panics at construction time when they are used.
+`Identity` is `{InstallationID, Session, Window, Turn, Sink}`. `Session`
+supplies the session/thread/window ids, `Window` the window number and
+`context_window_id`, `Turn` the turn id, start time and the turn-state to send
+(`Turn.State`), and `Sink` receives any turn-state issued by upstream. The
+`client_metadata` and `x-codex-turn-metadata` are synthesized entirely from the
+identity (whatever the client sent is dropped). A zero `Session.SessionID`
+means anonymous: no identity headers, no `client_metadata`, no turn-metadata,
+no `prompt_cache_key`. `CodexMeta`, `Identity.Meta`, `Identity.TurnState`,
+`WithTurnMetadata` and `WithTurnAuto` are removed; `WithTraceAuto` now
+defaults to `false`. Slot-pool callers use `IdentityState.Identity(sink, first)`
+with `first = !AnalyzeConversationInput(payload).FollowUp()`.
+
+For WS→WS (`Dial`), pass the first frame with `WithFirstFrame(frame)` so the
+handshake carries `x-codex-routing-hint` and the first frame's
+`x-codex-turn-metadata`. Callers should give the SDK a transport with
+`DisableCompression` (official clients send no `Accept-Encoding`).
 
 For the full API reference, see the package documentation in
 [doc.go](./doc.go).

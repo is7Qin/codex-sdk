@@ -45,11 +45,9 @@ const (
 	HeaderClientRequestID = "x-client-request-id"
 	HeaderInstallationID  = "x-codex-installation-id"
 	HeaderWindowID        = "x-codex-window-id"
-	HeaderParentThreadID  = "x-codex-parent-thread-id"
 	HeaderBetaFeatures    = "x-codex-beta-features"
 	HeaderTurnState       = "x-codex-turn-state"
 	HeaderTurnMetadata    = "x-codex-turn-metadata"
-	HeaderSubagent        = "x-openai-subagent"
 	HeaderMemgenRequest   = "x-openai-memgen-request"
 	HeaderOAIAAttestation = "x-oai-attestation"
 	HeaderTraceparent     = "traceparent"
@@ -152,45 +150,76 @@ var (
 	jsonNullBytes  = []byte("null")
 )
 
+// envContextTag 是环境上下文的开标签（原样出现在 JSON 字符串里；转义写法不改写）。
+var envContextTag = []byte("<environment_context>")
+
 // RewriteEnvironmentContextTime 把 Codex 环境上下文中的本地时间改成美东时间。
-// 只替换 <current_date> 与 <timezone> 的文本内容，其余字节保持不变。
+// 只替换 <current_date> 与 <timezone> 的文本内容，其余字节保持不变；被改写的
+// 字符串按 serde_json 规则重新编码（不做 HTML 转义，与官方请求体一致）。
+// 非法 JSON 原样返回。
 func RewriteEnvironmentContextTime(raw []byte, now time.Time) []byte {
-	if len(raw) == 0 || !bytes.Contains(raw, []byte("<environment_context>")) || !gjson.ValidBytes(raw) {
+	if len(raw) == 0 || !bytes.Contains(raw, envContextTag) || !gjson.ValidBytes(raw) {
 		return raw
 	}
-	date := now.In(easternTime).Format("2006-01-02")
+	return rewriteEnvironmentContextTime(raw, now)
+}
+
+// rewriteEnvironmentContextTime 是改写本体，调用方保证 raw 是合法 JSON。
+//
+// 只解析含开标签的字符串 token：用 bytes.Index 找标签，再从上次的位置向前跳过
+// 字符串 token（合法 JSON 里字符串之外不会出现 '"'），找到包含标签的那个
+// token。整体是一次线性扫描，不展开整棵树、不解码其它字符串。
+func rewriteEnvironmentContextTime(raw []byte, now time.Time) []byte {
 	var out []byte
-	cursor := 0
-	changed := false
-	root := gjson.ParseBytes(raw)
-	var rewrite func(gjson.Result)
-	rewrite = func(v gjson.Result) {
-		if v.Type == gjson.String && strings.Contains(v.Str, "<environment_context>") {
-			next := replaceEnvironmentTime(v.Str, date)
-			if next != v.Str {
-				// serde_json 规则编码（不做 HTML 转义）：官方请求体里 < > & 原样。
-				value := appendJSONString(nil, next)
-				start := v.Index
-				end := start + len(v.Raw)
-				if !envContextSpliceOK(cursor, start, end, len(raw)) {
-					return // 游标异常：保守跳过该次改写（不越界 panic）
-				}
-				out = append(out, raw[cursor:start]...)
-				out = append(out, value...)
-				cursor = end
-				changed = true
-				return
+	cursor := 0 // raw[cursor:] 尚未写入 out
+	scan := 0   // 字符串 token 扫描位置
+	date := ""
+	for {
+		k := bytes.Index(raw[scan:], envContextTag)
+		if k < 0 {
+			break
+		}
+		target := scan + k
+		start, end := -1, -1
+		for scan < len(raw) {
+			q := bytes.IndexByte(raw[scan:], '"')
+			if q < 0 {
+				scan = len(raw)
+				break
+			}
+			s := scan + q
+			e := skipJSONString(raw, s)
+			if e < 0 {
+				scan = len(raw)
+				break
+			}
+			scan = e
+			if e > target {
+				start, end = s, e
+				break
 			}
 		}
-		if v.IsArray() || v.IsObject() {
-			v.ForEach(func(_, child gjson.Result) bool {
-				rewrite(child)
-				return true
-			})
+		if start < 0 {
+			break
+		}
+		if start < target {
+			tok := raw[start:end]
+			str := gjson.ParseBytes(tok).Str
+			if date == "" {
+				date = now.In(easternTime).Format("2006-01-02")
+			}
+			next := replaceEnvironmentTime(str, date)
+			if next != str && envContextSpliceOK(cursor, start, end, len(raw)) {
+				if out == nil {
+					out = make([]byte, 0, len(raw)+64)
+				}
+				out = append(out, raw[cursor:start]...)
+				out = appendJSONString(out, next)
+				cursor = end
+			}
 		}
 	}
-	rewrite(root)
-	if !changed {
+	if out == nil {
 		return raw
 	}
 	return append(out, raw[cursor:]...)

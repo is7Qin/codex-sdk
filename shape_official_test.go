@@ -132,7 +132,7 @@ func mustShape(t testing.TB, raw []byte, s surface, id Identity) shapedRequest {
 	return sh
 }
 
-// TestShapeMatchesOfficialCapture（A-1）：抓包请求体作输入、给定同一身份，三种面
+// TestShapeMatchesOfficialCapture：抓包请求体作输入、给定同一身份，三种面
 // 的组装结果与抓包逐字节相等（client_metadata 按集合比较，发送时刻除外）。
 func TestShapeMatchesOfficialCapture(t *testing.T) {
 	now := time.Now()
@@ -226,7 +226,7 @@ func TestShapeMatchesOfficialCapture(t *testing.T) {
 	}
 }
 
-// TestInstructionsIDMatchesOfficialV5（A-4）：非 lite 指令消息 id 用官方算法
+// TestInstructionsIDMatchesOfficialV5：非 lite 指令消息 id 用官方算法
 // UUIDv5(UUIDv5(NAMESPACE_OID, thread_id), 指令原文)，与 gpt-5.5 抓包逐字节一致。
 func TestInstructionsIDMatchesOfficialV5(t *testing.T) {
 	text := loadOfficial(t, "gpt55-instructions.txt")
@@ -248,7 +248,7 @@ func TestInstructionsIDMatchesOfficialV5(t *testing.T) {
 	}
 }
 
-// TestTurnMetadataMatchesOfficial（A-5）：turn 与 prewarm 两种形态逐字节等于 tui
+// TestTurnMetadataMatchesOfficial：turn 与 prewarm 两种形态逐字节等于 tui
 // 抓包（sandbox / sandbox_mode 替换为固定值）；ASCII 编码器的官方测试向量。
 func TestTurnMetadataMatchesOfficial(t *testing.T) {
 	turn := loadOfficial(t, "tui-turn.json")

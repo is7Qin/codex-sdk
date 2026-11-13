@@ -28,7 +28,7 @@ func WithResponsesTransport(t Transport) Option
 | 队列 | `conn.go` | `frameInbox`：pumped 的有界入站队列（帧数 + 字节双闸） |
 | 拨号 | `dial.go` | `dialConn`：升级头组装 / 401 轮转 / 升级错误面 |
 | 请求 | `exchange.go` | `wsExchange`：一次请求 = 一次 exchange；连接可跨请求（含跨轮）复用（默认关）；**不驻留 turn-state**（ts 每请求随 `Identity` 进帧，签发值只经 `Identity.Sink` 出去）；`Next` 取帧 / `Release` 归还 |
-| wire 编码 | `codec.go` | `frameCodec`：无可变状态；`encode` = 单遍快路径（`encodeOnePass`）+ 回退链（非常规形态） |
+| 请求整形 | `shape.go` | 两段式：`parseRequest`（一次顶层扫描）→ `shapeRequest`（身份与模型相关变换）→ `assembleHTTP` / `assembleWS`（官方键序一次写出）；无可变状态 |
 | SSE 表示 | `sse.go` | `sseView`：帧 → SSE 字节流（仅 `StreamBody`） |
 
 ### 两种连接模式（构造期固定、互斥）
@@ -118,9 +118,9 @@ func WithResponsesTransport(t Transport) Option
 |---|---|---|
 | `StreamBody` | `*http.Response{200, 未读 SSE body, 上游头}` | `*http.Response{200 OK, 帧渲染的 SSE body, 合成头只有 Content-Type: text/event-stream}`（不带 ts） |
 | `Responses` | `Stream` → `responsesAggregator` → `HTTPResponse{200, Raw}`（**无 ts 字段**：签发值只走 `Identity.Sink`） | `responsesStreamWS` **直接从 exchange 取帧**喂同一个聚合器（不经 `sseView`/`scanSSE` 的渲染-回扫回路）→ 同形态、逐字段同构 |
-| turn-state | 请求头 `x-codex-turn-state`（值来自 `Identity.TurnState`，逐请求传入） | 帧 `client_metadata."x-codex-turn-state"`（同一来源）；捕获点三处（HTTP 响应头 / WS 握手头 / `response.metadata` 事件）统一回调 `Identity.Sink`；**合成响应头不带 ts**，SDK 不保留任何 ts 状态 |
+| turn-state | 请求头 `x-codex-turn-state`（值来自 `Identity.Turn.State`，逐请求传入）；捕获点：HTTP 响应头 | 帧 `client_metadata."x-codex-turn-state"`（同一来源）；捕获点：属于本次 response 的 `response.metadata` 事件（**握手响应头不取**，官方只认事件）；统一回调 `Identity.Sink`；**合成响应头不带 ts**，SDK 不保留任何 ts 状态 |
 | 读上限 | 聚合器单行 16MiB；裸 body 由下游决定 | 按取数路径固定：聚合 16MiB / 流式 64MiB（`WithReadLimit` 只作用于公开 `Dial`，传输臂的上限由取数路径决定）；两条取数路径不共享连接（16MiB / 64MiB） |
-| 请求体归一 | `FilterCodexHTTPPayload` + `store:false` + HTTP `client_metadata` | `frameCodec.encode(encodeWSResponses)`：协议形状差（`type`/续接键/`stream`）+ 白名单 + `store:false` + WS `client_metadata` 由**单遍编码器**一次落地；非常规形态回退 `buildResponsesCreateFrame` → 归一链 |
+| 请求整形 | `parseRequest(surfaceHTTP)` → `shapeRequest` → `assembleHTTP`（官方 HTTP 键序）→ zstd 压缩，`content-encoding: zstd` | `parseRequest(surfaceWSFromHTTP)` → `shapeRequest` → `assembleWS`（`type:"response.create"`、丢弃客户端 `previous_response_id`/`generate`、官方 WS 键序）；`x-codex-ws-stream-request-start-ms` 取得写闸后写入 |
 | 401 轮转 | 判死分类 + 单飞 refresh + 重试一次 | 同（`dialConn` 内，`OAuthWithRotation`） |
 
 帧渲染（`sseView`，一帧一块）：
@@ -141,20 +141,14 @@ data:<帧字节 verbatim>\n
   只有 `CloseStatus == -1`（对端没发 close frame：直接断 TCP / 连接重置 / 超
   ReadLimit）才是传输错误，且原样返回底层错误。
 
-帧构造规则（五条，`encodeOnePass` 与回退链 `buildResponsesCreateFrame` 同义）：
-JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
-`previous_response_id` / `generate` → 强制 `stream:true` → 过 WS 19 键白名单
-（空帧报错）。**全部在拨号之前完成**。
+帧构造规则：JSON 合法 + **对象根** + 字符串 `model` → 白名单（同名键只认第一次）→
+覆写 `type:"response.create"`、`stream:true`、`store:false` → 丢弃客户端
+`previous_response_id` / `generate`（HTTP→WS）→ 官方键序写出。**全部在拨号之前完成**；
+握手头 `x-codex-routing-hint` 与 `x-codex-turn-metadata` 取自这一帧的整形结果。
 
-单遍只接**紧凑 / 无转义键 / 无重复键 / 顶层键全在白名单内**的对象（此时旧链只
-原位换值、键序不变，逐字节等价）；其余形态（空白、转义键、重复键、白名单外键）
-一律回退旧链——回退不是保守，是字节一致性的**唯一**保证方式（`codec.go` 的条件表
-与 `codec_internal_test.go` 的逐字节护栏钉住这条边界）。
-
-顶层身份键 `client_metadata` **出现多次**（普通/转义拼写任意组合）也算"需要重建"：
-重复成员在 JSON 里是"后者生效"的歧义，而覆写只写第一处，留着第二处等于把 payload
-的旧身份送上游。重建按有序白名单逐键写一次，天然收敛成唯一成员；此后注入/删除只
-面对这一个成员，所以不存在"删了第一个、第二个漏网"。
+整形后的字节不再做任何 sjson 改写；唯一的原地改写是发送时刻的 13 位数字
+（`conn.writeStamped` 在取得写闸后覆写）。重复顶层键（含转义拼写）只认第一次出现，
+其余丢弃并计数——`store:true`、`previous_response_id` 的第二份不会出网。
 
 ## 终态提交
 
@@ -188,13 +182,9 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 | 复用连接写失败 | — | 原始错误链（终止连接，不重试、不轮转）；**复用命中**时错误文案额外带「连接年龄 + 本轮已交付帧数」诊断（`%w` 包装，分类不变） |
 | 复用连接的首帧 | — | **不做任何判定**：首帧就是普通帧，不认识的事件由消费者忽略（旧尾帧也一样） |
 | 服务端 60min 上限 | — | 本地 30min 在空闲时提前退役；若仍收到 `websocket_connection_limit_reached`（该帧不带 status），按普通 in-band error 透传，不重试 |
-| 坏请求体（坏 JSON / 非对象根） | 原样发上游，由上游 400 兜底 | 本地错误 `errResponsesFrameInvalid`：**不拨号、不发帧** |
+| 坏请求体（坏 JSON / 非对象根 / 缺字符串 `model`） | 本地错误 `ErrInvalidRequestBody`：**不发请求** | 本地错误 `ErrInvalidRequestBody`：**不拨号、不发帧** |
 
-`errResponsesFrameInvalid` / `ErrEmptyFrame` 是本地输入错误（裸 error，不是
-`*HTTPError`）。WS 面没有"把坏 body 原样发出去让上游 400"的等价路径：`sjson` 对
-顶层标量会**静默**把请求体改写成 `{}`，`null` 会变成
-`{"type":"response.create","stream":true}`——那与 HTTP 臂语义立刻不同，所以只能
-本地拒绝。
+`ErrInvalidRequestBody` 是本地输入错误（裸 error，不是 `*HTTPError`），两臂一致。
 
 `HTTPError` 新增未导出 `cause` + `Unwrap()`：WS 臂的升级失败在保持
 `StatusCode`/`Raw` 形状的同时，让 `errors.As` 能回溯 `*DialError`、
@@ -203,8 +193,8 @@ JSON 合法 + **对象根** → 覆写 `type:"response.create"` → 删
 ## 连接复用
 
 默认关闭，`WithWSConnCache(n)`（n > 0，建议 2）开启每个 `HTTPClient` 的空闲连接缓存。
-连接身份是 `(threadKey, readLimit)`，`threadKey = installation|session|thread`（`Meta` 优先、空项由
-`Session` 补；三者全空 = 匿名）：同一 thread、同取数路径才复用；流式 64MiB 与聚合 16MiB 不共享连接；
+连接身份是 `(threadKey, readLimit)`，`threadKey = InstallationID|Session.SessionID|Session.ThreadID`
+（`Session.SessionID` 为空 = 匿名）：同一 thread、同取数路径才复用；流式 64MiB 与聚合 16MiB 不共享连接；
 **window 变化不换连接**（与真实 codex 一致——换连接条件里没有 window），ts 每请求下发、不进连接身份。
 **匿名（`Identity{}`）不复用**：不取缓存、读完即终止，因为匿名没有会话语义，共享连接等于让无关请求
 互相污染路由状态。
@@ -258,12 +248,17 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   给出 `Raw` 的文本视图——网关 `upstreamBody` 的信封协议，WS 错误帧翻成的
   `*HTTPError` 也走同一条路）。
   无升级响应的失败不再是 `DialError`（`StatusCode==0` 形态消失）。
-- **turn-state 的来源与跨轮**：请求侧只有一个来源——`Identity.TurnState`（`""` = 本次不带）。
+- **turn-state 的来源与跨轮**：请求侧只有一个来源——`Identity.Turn.State`（`""` = 本次不带）。
   捕获到的签发值只回调 `Identity.Sink`，SDK **不缓存、不回落、不回填响应头**：重放策略由调用方
   在构造 `Identity` 时决定（网关侧是会话对象上的一个策略位）。
-  **身份头是保留键**：`WithHeader` 遇到 `session-id` / `thread-id` / `x-client-request-id` /
-  `x-codex-window-id` / `x-codex-installation-id` / `x-codex-turn-state` 会在构造期 panic——
-  身份只能经 `Identity` 传入，默认头不能成为第二条通道。
+  **身份头与形态头是保留键**：`WithHeader` 遇到 `session-id` / `thread-id` / `x-client-request-id` /
+  `x-codex-window-id` / `x-codex-installation-id` / `x-codex-turn-state` / `version` /
+  `x-codex-routing-hint` / `x-codex-beta-features` / `x-codex-turn-metadata` /
+  `x-openai-internal-codex-responses-lite` / `accept` / `content-encoding` 会在构造期 panic——
+  身份只能经 `Identity` 传入、形态头只由 SDK 合成，默认头不能成为第二条通道。
+- **与官方的已知偏差**：握手压缩扩展是 `permessage-deflate`（官方另带
+  `client_max_window_bits`，coder 产不出）；HTTP/1.1 头顺序由 Go 决定；
+  `Accept-Encoding` 由调用方 Transport 的 `DisableCompression` 关闭。
 - **真实上游 in-band 429 未实测**：真实上游在 WS 帧里以 `type:"error"` + `status:429`
   表达额度耗尽的情况尚未拿到活体验证。代码侧已按参考实现处理：带 `status`/`status_code`
   且 ∈ 4xx/5xx → 翻译成 `*HTTPError{StatusCode}`（流式与非流式两臂都是）；**缺 status 的
@@ -334,20 +329,19 @@ go test -run '^$' -bench '^BenchmarkSSEViewRender1KB$'       -benchmem -count=10
 go test -run '^$' -bench '^BenchmarkWSStreamBodyPerRequest$' -benchmem -benchtime=20x -count=3 .
 ```
 
-单遍编码器的字节等价不靠"读代码相信"，靠 `codec_internal_test.go`：把回退链当
-参考实现，对同一批输入（52 条语料 + 2,000 帧固定种子随机帧 × 2 模式 × 3 种
-metadata 组合）逐字节比对，另有两例分别钉住"运行期 3.7KB 形状必须走单遍"与
-"该回退的形态确实回退"——防止护栏退化成"回退链 vs 回退链"的空转。
+整形的官方一致性不靠"读代码相信"，靠 `shape_official_test.go`：用
+`testdata/official-0.169.0/` 的脱敏抓包作输入、给定抓包里的身份，HTTP / HTTP→WS /
+WS→WS 三种面的组装结果与抓包逐字节相等（`client_metadata` 按集合比较，发送时刻除外；
+替换规则见夹具 README）。
 
 ## 测试
 
 `transport_ws_test.go`（`httptest` + `websocket.Accept` 假上游）：帧→SSE 逐字节
 断言（含 `[DONE]` 位置）、与 HTTP 臂合成体逐字段相等、
-`response.failed` 两臂同形、身份与 turn-state（请求侧只认 `Identity.TurnState`；升级头不携带；
-握手头与 `response.metadata` 事件捕获后只回调 `Identity.Sink`；空身份且自动字段关闭
-（`WithTurnAuto(false)` + `WithTraceAuto(false)`，否则 `turn_id` 仍会补齐对象）时 payload 自带的
+`response.failed` 两臂同形、身份与 turn-state（请求侧只认 `Identity.Turn.State`；升级头不携带；
+只有 `response.metadata` 事件捕获后回调 `Identity.Sink`，握手响应头不取；匿名时 payload 自带的
 `client_metadata` 被删除；连接身份 = `(threadKey, readLimit)`，跨 window 复用、匿名不复用；
-`RetireThread` 只摘 idle）、帧构造五条规则 + 非对象根、关闭
+`RetireThread` 只摘 idle）、HTTP→WS 帧构造规则 + 无效请求体、关闭
 语义（1011 / 1005 / 1000 / 无 close 帧）、默认路径零 WS 连接、并发（`-race`）。
 
 `transport_ws_contract_test.go`（连接内核验收面，W1–W16）：

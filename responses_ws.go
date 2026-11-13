@@ -51,8 +51,9 @@ const responseEventIncomplete = "response.incomplete"
 // 输入错误，不能为它烧一次上游握手（否则拨号失败会盖掉本地错误，两臂状态面
 // 不等价）。
 //
-// turn-state：请求侧只来自 Identity.TurnState（"" = 不带）；捕获到的签发值
-// 只回调 Identity.Sink。ts 不进升级头（真实客户端只在帧里带），也不改连接身份。
+// turn-state：请求侧只来自 Identity.Turn.State（"" = 不带）；只从属于本次
+// response 的 response.metadata 事件捕获并回调 Identity.Sink（握手响应头不取）。
+// ts 不进升级头（真实客户端只在帧里带），也不改连接身份。
 //
 // ctx 只是 exchange 的构造输入（含超时预算）：**取帧用 ex.ctx**，连接 ctx 已与
 // 请求解耦。调用方取消能终止后续对 Body 的读取；已入队的帧仍先交付（取帧即提交）。

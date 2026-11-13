@@ -121,11 +121,13 @@ type parsedRequest struct {
 // 解码后的名字匹配，同名键只认第一次出现）→ 白名单 → model 必须是字符串。
 func parseRequest(raw []byte, s surface, now time.Time) (parsedRequest, error) {
 	p := parsedRequest{surface: s, compact: true, inputCompact: true}
-	raw = RewriteEnvironmentContextTime(raw, now)
-	p.raw = raw
 	if len(raw) == 0 || !gjson.ValidBytes(raw) {
 		return p, ErrInvalidRequestBody
 	}
+	if bytes.Contains(raw, envContextTag) {
+		raw = rewriteEnvironmentContextTime(raw, now) // 已校验；改写结果仍是合法 JSON
+	}
+	p.raw = raw
 	i := skipSpace(raw, 0)
 	if i != 0 {
 		p.compact = false
@@ -604,7 +606,7 @@ func shapeRequest(p *parsedRequest, id Identity, now time.Time, cfg shapeConfig)
 				st.nonStringInstructions.Add(1)
 			}
 		case len(text) > 0:
-			instrItem = make([]byte, 0, len(text)+160)
+			instrItem = make([]byte, 0, len(text)+len(text)/16+320)
 			instrItem = append(instrItem, `{"type":"message",`...)
 			if !sh.anonymous {
 				instrItem = append(instrItem, `"id":"msg_`...)
@@ -620,7 +622,7 @@ func shapeRequest(p *parsedRequest, id Identity, now time.Time, cfg shapeConfig)
 				instrItem = append(instrItem, `",`...)
 			}
 			instrItem = append(instrItem, `"role":"developer","content":[{"type":"input_text","text":`...)
-			instrItem = appendJSONString(instrItem, string(text))
+			instrItem = appendJSONStringBytes(instrItem, text)
 			// 官方每请求重建的指令消息带这一段元数据（gpt-5.5 抓包）；lite 官方是
 			// 窗口开始时写进历史的版本（另带 turn_id / create_time），网关没有历史，
 			// 两类模型都用这份稳定形态，保证同一内容同一字节。
@@ -668,8 +670,12 @@ func shapeRequest(p *parsedRequest, id Identity, now time.Time, cfg shapeConfig)
 			model:          sh.model,
 			effort:         effort,
 		}
-		sh.turnMeta = appendTurnMetadata(make([]byte, 0, 768), &tm, false)
-		sh.prewarmMeta = appendTurnMetadata(make([]byte, 0, 640), &tm, true)
+		// 两种形态写进同一块缓冲（一次分配）；三下标切片防止后续 append 互相覆盖。
+		buf := appendTurnMetadata(make([]byte, 0, 1600), &tm, false)
+		n := len(buf)
+		buf = appendTurnMetadata(buf, &tm, true)
+		sh.turnMeta = buf[:n:n]
+		sh.prewarmMeta = buf[n:len(buf):len(buf)]
 	}
 	return sh
 }
@@ -1095,7 +1101,8 @@ type wsAssembly struct {
 // metaEntry 是一条 client_metadata（未序列化）。
 type metaEntry struct {
 	key, val string
-	startMs  bool // 值为发送时刻毫秒占位（返回其偏移）
+	raw      []byte // 非 nil 时以它为值（避免 []byte→string 的复制）
+	startMs  bool   // 值为发送时刻毫秒占位（返回其偏移）
 }
 
 // assembleHTTP 按官方 HTTP 键序写出请求体。
@@ -1318,11 +1325,11 @@ func (sh *shapedRequest) writeMeta(w *jsonWriter, kind metaKind, a *wsAssembly) 
 	}
 	if kind == metaWSPrewarm {
 		add("turn_id", "")
-		add("x-codex-turn-metadata", string(sh.prewarmMeta))
+		e = append(e, metaEntry{key: "x-codex-turn-metadata", raw: sh.prewarmMeta})
 	} else {
 		add("turn_id", sh.turnID)
 		add("root_turn_id", sh.turnID)
-		add("x-codex-turn-metadata", string(sh.turnMeta))
+		e = append(e, metaEntry{key: "x-codex-turn-metadata", raw: sh.turnMeta})
 	}
 	add("mcp_attribution", litMCPAttribution)
 	add("guardian_credits_requested", "true")
@@ -1355,6 +1362,10 @@ func (sh *shapedRequest) writeMeta(w *jsonWriter, kind metaKind, a *wsAssembly) 
 			off = len(w.buf)
 			w.buf = appendStartMs(w.buf, time.Now())
 			w.byte('"')
+			continue
+		}
+		if m.raw != nil {
+			w.buf = appendJSONStringBytes(w.buf, m.raw)
 			continue
 		}
 		w.buf = appendJSONString(w.buf, m.val)

@@ -27,24 +27,17 @@
 //     token 端点 401 / 账号禁用类 → 账号级终止（导出错误类型 errors.As 区分，
 //     OnAuthFatal 通知），Invalidate() / Fatal(err) 显式入口（网关解析 WS 判死
 //     事件帧时调用）
-//   - 伪装层（逐点对齐真实 codex 客户端源码）：默认
-//     codex-tui UA/originator（0.154.0 + Ubuntu 指纹）、beta 头（现役唯一 2026-02-06）、头常量导出、
-//     WS/HTTP 各自顶层白名单过滤（含 store:false 强制），无条件生效、client_metadata **整体替换**组装
-//     （WS 帧面 8 key 恒发：installation_id/session_id/thread_id/turn_id/
-//     window_id/turn-metadata/traceparent/tracestate；HTTP 体面恒 4 key +
-//     turn_id + 条件键，不含 trace/turn-state，见 injectResponsesClientMetadata；
-//     客户端自带的 client_metadata 永不透传）、身份完全请求级（Identity：
-//     Session/Meta/TurnState/Sink；WS 帧与 HTTP 体 client_metadata、WS 握手头都从
-//     Identity 取；默认头不得携带身份键——WithHeader 遇保留键构造期 panic）、
-//     x-codex-turn-state（轮级 token：请求侧 Identity.TurnState，值落 HTTP 请求头
-//     或 WS 帧内 client_metadata；响应侧 HTTP 头 / WS 握手头 / WS
-//     response.metadata 事件三处捕获后只回调 Identity.Sink，SDK 不保留状态）、
-//     每帧新 trace 与 turn_id（UUIDv7）
+//   - 伪装层（逐点对齐官方 codex-tui 0.169.0 源码与抓包，见下文「请求整形」）：
+//     UA / originator / version / x-codex-beta-features / x-codex-routing-hint、
+//     WS beta 头（现役唯一 2026-02-06）、头常量导出；身份完全请求级（Identity：
+//     InstallationID / Session / Window / Turn / Sink），默认头不得携带身份或形态
+//     键（WithHeader 遇保留键构造期 panic）；x-codex-turn-state 请求侧取
+//     Identity.Turn.State（HTTP 走请求头、WS 走帧内 client_metadata，握手不带），
+//     响应侧只认 HTTP 响应头与 response.metadata 事件，只回调 Identity.Sink；
 //     ChatGPT-Account-ID（AccountIDProvider 可选接口：rotationAuth 经
-//     WithOAuthAccountID / patAuth 经 WithPATAccountID 显式注入——空 = 不发，
-//     向后兼容；OAuth(tokenProvider) 回调型不实现该接口）：上线形态经 Go
-//     textproto 规范化为 Chatgpt-Account-Id（头名大小写不敏感）；来源二选一——
-//     OAuth 系 AccountIDFromToken 离线解析 access_token/id_token JWT 的
+//     WithOAuthAccountID / patAuth 经 WithPATAccountID 显式注入——空 = 不发；
+//     OAuth(tokenProvider) 回调型不实现该接口）：以小写 chatgpt-account-id 写出；
+//     来源二选一——OAuth 系 AccountIDFromToken 离线解析 access_token/id_token JWT 的
 //     https://api.openai.com/auth.chatgpt_account_id（不验签/exp，rt 无 claims），
 //     PAT 系 FetchPATMetadata 在线 whoami（base 默认
 //     https://auth.openai.com/api/accounts，env CODEX_AUTHAPI_BASE_URL 覆盖，
@@ -102,13 +95,17 @@
 //
 //   - 无全局可变状态：连接/客户端均按需构建，唯一的常驻 goroutine 是 pumped 读者
 //     （以及每个 WS 缓存一个维护 ticker），都只在所属对象存活期间存在
-//   - WS 帧编码是**单遍**：一次顶层扫描、一份输出缓冲，把协议形状差（type/续接键/
-//     stream）、白名单过滤、store:false 与 client_metadata 注入合并落地；只在
-//     "紧凑 / 无转义键 / 无重复键 / 顶层键全在白名单内"时走快路径，其余形态回退旧链
-//     （每步整帧重写）以保证字节一致（3.7KB 体实测 6.2µs / 5 allocs；旧链 34.9µs / 26）
-//   - 帧未被改写时零拷贝：快路径判定"一个字节都不用改"时返回原切片；含
-//     <environment_context> 的帧先经 RewriteEnvironmentContextTime 改写值内文本
-//     （该步有 payload 级分配，非本路径）
+//   - 请求整形是两段式：parseRequest 一次顶层扫描（白名单、同名键首现，值只
+//     记原始片段不复制）→ shapeRequest 只做身份与模型相关的变换 → assembleHTTP /
+//     assembleWS 按官方键序一次写出。匿名且输入已是规范键序与规范值时返回原切片、
+//     整条链零分配（TestEncodeZeroCopyAllocFree）；其余请求按官方形态重建一次
+//     （3.7KB 体约 20–30µs / 11 allocs，84KB 官方体整形 + zstd 约 0.8ms）。
+//     含 <environment_context> 的请求先改写值内时间文本（线性扫描，只解码含标签
+//     的字符串）
+//   - HTTP /responses 请求体 zstd 压缩：编码器经 sync.Pool 复用，每次
+//     Reset → Write → Flush → Close（帧头与官方一致 28b52ffd0058）
+//   - WS 出站帧不压缩（协商 permessage-deflate，阈值 MaxInt）：不建常驻 flate
+//     写入器（context takeover 每连接约 1.2MB）
 //   - WS 帧收发零额外分配：Send 直传帧字节；Recv 返回 coder/websocket 每次 Read
 //     独立分配的读缓冲（跨次调用有效，无需拷贝即可保留）
 //   - 连接读模型分两种模式（构造期固定、互斥；同一条连接只有一个 socket 读点、
@@ -145,46 +142,49 @@
 //     首次 Do/Stream 才创建 http.Client
 //     （连接池复用；WithTransport 可注入自定义 RoundTripper）
 //
-// # 上游协议与参考
+// # 请求整形（官方 codex-tui 0.169.0 形态）
 //
-// 目标协议为 OpenAI Responses WebSocket（现役唯一 beta：responses_websockets=
-// 2026-02-06，仅 WS 握手注入；HTTP 默认不发 OpenAI-Beta，需要时 WithHeader
-// 显式注入）。真实客户端行为对齐：WS 握手与 HTTP 请求均不发 trace 头（trace
-// 只进每帧 client_metadata，每帧新值）；session-id/thread-id/x-client-request-id/
-// x-codex-window-id 会话级握手头；x-codex-turn-state 是轮级机制（真实源码
-// 行号实证，防未来误删 WS 帧注入）：
-//   - HTTP 面：真实客户端请求头携带 x-codex-turn-state（client.rs:1202
-//     build_responses_headers(..., Some(&self.turn_state))）；本 SDK 的请求侧
-//     取值是 Identity.TurnState，响应侧捕获后只回调 Identity.Sink
-//   - WS 面：帧 metadata 恒带（Identity.TurnState 非空时）——真实发送路径
-//     client.rs:1626-1631（stream_responses_websocket）在 build_ws_client_metadata
-//     （:779-792，辅助函数本身无 turn-state）之后显式追加
-//     client_metadata.insert(X_CODEX_TURN_STATE_HEADER, ...)，流入
-//     ResponseCreateWsRequest.client_metadata（:1702-1711 帧体携带）；SDK 帧注入
-//     （frameCodec.encode 的 client_metadata 落地：单遍快路径直接写入，回退链经
-//     normalize → injectClientMetadataObject）逐点一致：每请求取值 → 帧内回传。
-//     跨轮不得重放：请求侧只读 Identity.TurnState，SDK 不缓存、不回落。
+// StreamBody / Stream / Responses（HTTP→HTTP、HTTP→WS）与 Client.Send（WS→WS）发出的
+// 每个 Responses 请求都按官方形态整形（HTTPClient.Do 不整形，不得用于 Codex
+// responses）：
+//   - 白名单：model, instructions, input, tools, tool_choice, parallel_tool_calls,
+//     reasoning, store, stream, stream_options, include, service_tier,
+//     prompt_cache_key, text, access_programs；WS→WS 另认 previous_response_id、
+//     generate（原样，由上游判断）。type、client_metadata 与白名单外键丢弃；同名键
+//     只认第一次出现（按解码后的名字，转义拼写同样）。请求体不是 JSON 对象或缺少
+//     字符串 model → ErrInvalidRequestBody（本地拒绝）。
+//   - stream:true、store:false；reasoning 恒写（effort 按模型表补，lite 写
+//     context:"all_turns"，非 lite 删 context）；include、tool_choice、
+//     parallel_tool_calls、text.verbosity 按官方缺省补；键序按官方
+//     ResponsesApiRequest / ResponseCreateWsRequest。
+//   - 顶层 instructions → developer 消息（非 lite 的 id 与官方 UUIDv5 逐字节一致，
+//     lite 由窗口 UUID 时间戳 + 内容哈希派生）；lite 模型（静态表 models.go，或
+//     input 已有 additional_tools）的顶层 tools 转成 additional_tools 项（按官方
+//     分组规则，Chat Completions 风格先拍平）。
+//   - client_metadata 与 x-codex-turn-metadata 全部由 Identity 合成（客户端自带的
+//     整个丢弃，其中的 sandbox / workspaces 也不取）：client_metadata 键序每次随机
+//     （官方是 HashMap），turn-metadata 固定键序、纯 ASCII，sandbox 恒为 none、
+//     sandbox_mode 恒为 danger-full-access。匿名（Session.SessionID 为空）不写
+//     client_metadata、不发身份头与 turn-metadata、删除 prompt_cache_key。
+//   - 请求头小写直接赋值（User-Agent 除外）：version、x-codex-beta-features、
+//     x-codex-routing-hint、身份头、x-codex-turn-metadata；HTTP 另有 accept、
+//     content-encoding: zstd、lite 标记头；WS 握手带这条连接第一帧的 turn-metadata
+//     （WS→WS 经 WithFirstFrame 提供首帧）。Accept-Encoding 由调用方 Transport 的
+//     DisableCompression 关闭。
+//   - WS 帧的 x-codex-ws-stream-request-start-ms 在取得写闸之后写入发送时刻。
+//   - 计数见 ShapeStatsSnapshot（进程级；SDK 不打日志）。
 //
 // WS 传输臂的连接身份 = (threadKey, readLimit)：连接是 thread 级、跨轮跨窗口
-// 复用，ts 是轮级、每请求下发——与真实 codex 的换连接条件一致（因为
-// responses_headers 不含 ts）。TS 的发现通道只有 Sink：握手响应头在解析响应头时
-// 同步回调，事件级 ts（response.metadata 的 headers）经 turnStateTap 在 Read 栈内
-// 逐帧旁路捕获：created 先记 response_id，归属匹配才写 Sink，fail-safe 是
-// "created 之前的 metadata 一律不捕获"。Body.Close 之后不再回调。
+// 复用，ts 是轮级、每请求下发。turn-state 的发现通道只有 Sink：HTTP 响应头在解析
+// 响应头时同步回调；事件级 ts（response.metadata 的 headers）经 turnStateTap
+// （HTTP→WS）或 Client.Recv（WS→WS 静态身份）在读栈内逐帧旁路捕获：created 先记
+// response_id，归属匹配才写 Sink，"created 之前的 metadata 一律不捕获"。握手响应头
+// 里的 turn-state 不取（官方只认事件）。Body.Close 之后不再回调。
 //
-// responses-lite 非独立端点：与 /responses 同端点同事件集，仅 internal 标记区分
-// ——HTTP 头 x-openai-internal-codex-responses-lite 可用 WithHeader 透传；S4 起
-// 不再提供任意 WS client_metadata 透传入口。
-// 传输常量对齐参考实现：16MiB ReadLimit（coder 默认 32KB 过小）、
-// CompressionContextTakeover 压缩、data: SSE 行提取与 [DONE] 终止、
-// response.create 19 字段白名单、
-// client_metadata 恒发 8 key 集合（session_id/thread_id/turn_id 为 snake_case，
-// trace 的 metadata key 名与头名不同）。HTTP /responses 面注入（Stream
-// 发送前统一执行）恒 4 key（x-codex-installation-id/session_id/thread_id/
-// x-codex-window-id）+ 恒带 turn_id + 条件键（x-openai-subagent/
-// x-codex-parent-thread-id/parent_turn_id/x-codex-turn-metadata）——不含
-// trace/turn-state（trace 仅 WS 帧面；turn-state 在 HTTP 面走请求头，不在体面）。
+// 传输常量对齐参考实现：16MiB ReadLimit（coder 默认 32KB 过小）、data: SSE 行提取
+// 与 [DONE] 终止。
 //
 // 依赖：github.com/coder/websocket（纯标准库实现，无 CGO）+
-// github.com/tidwall/gjson / github.com/tidwall/sjson（raw JSON 修补）。
+// github.com/tidwall/gjson（raw JSON 读取）+ github.com/klauspost/compress/zstd
+// （/responses 请求体压缩，钉 v1.17.11）。
 package codexsdk
