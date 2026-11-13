@@ -318,7 +318,7 @@ func scanSSE(body io.Reader, maxLine int, feed func(raw []byte) error) (bool, er
 // TransportWS 时改走上游 Responses WS（见 streamBodyWS）：对外形状一致
 // （StatusCode=200 / Body=SSE 字节流），ts 只从 response.metadata 事件取、只走
 // Identity.Sink。WithWSConnCache(n) 可开启默认关闭的连接复用：连接身份 =
-// (threadKey, readLimit)，同一 thread 的连续请求——含跨轮跨窗口——都可命中；
+// (threadKey, routingHint, readLimit)，同一 thread 的连续请求——含跨轮跨窗口——都可命中；
 // 匿名不复用；读到终态后必须关闭 Body 才能归还。与 Responses 的聚合路径不共享
 // 连接，收益边界见 TRANSPORT.md。
 func (c *HTTPClient) StreamBody(ctx context.Context, payload []byte, id Identity) (*http.Response, error) {

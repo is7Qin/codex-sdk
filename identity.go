@@ -36,7 +36,7 @@ type Turn struct {
 	ID          string // turn_id / root_turn_id；空 = 每请求生成 UUIDv7
 	StartedAtMs int64  // turn_started_at_unix_ms；0 = 取请求时刻
 	State       string // 要带给上游的 turn-state（"" = 不带）
-	First       bool   // 本请求是一轮的第一个请求（含客户端重试）
+	First       bool   // 本请求是一轮的第一个请求（含客户端重试）；HTTP→WS 新建连接时据此预热
 }
 
 // anonymous 报告本身份是否按匿名整形（SessionID 为空即匿名）。

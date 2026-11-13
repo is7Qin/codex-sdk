@@ -23,7 +23,7 @@ const (
 )
 
 // Responses 在 WS 臂可用 WithWSConnCache(n) 开启默认关闭的连接复用：连接身份 =
-// (threadKey, readLimit)（不含 turn-state/window），同一 HTTPClient 上同一
+// (threadKey, routingHint, readLimit)（不含 turn-state/window），同一 HTTPClient 上同一
 // thread 的连续请求——包括跨轮跨窗口——都可命中；消费终态后自动归还；匿名不
 // 复用；与 StreamBody 不共享连接。收益边界见 TRANSPORT.md。
 //

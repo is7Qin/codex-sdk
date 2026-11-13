@@ -16,6 +16,9 @@
 | `tui-prewarm.json` | 同上 seq 29 | 预热帧（`generate:false`、空输入），lite 模型 `gpt-6.1-sol` |
 | `tui-turn.json` | 同上 seq 35 | 一轮的第一个真实帧（全量输入，非 resume、`thread_source=user`） |
 | `tui-followup.json` | 同上 seq 40 | 同一轮的增量帧（`previous_response_id` + 工具输出） |
+| `tui-chained-handshake.headers.json` | `log169b-tui.jsonl` seq 21 | 同一交互式客户端的另一次运行（假上游的 `response.completed` 带 response id）：握手头（prewarm 形态 turn-metadata） |
+| `tui-chained-prewarm.json` / `tui-chained-turn.json` | 同上 seq 29 / 35 | 预热帧；预热后的真实帧（`previous_response_id` = 预热 id、全量输入、预热签发的 ts） |
+| `title-prewarm.json` / `title-turn.json` | 同上 seq 39 / 42 | 标题线程（`gpt-5.6-luna`，`text.format` = JSON schema）：预热帧；真实帧不带预热 id、全量输入。`thread_source` 是 `thread_title`，比对时替换为 `user`，且 turn-metadata 不比（标题线程没有 `turn_trigger`；网关不产生这类请求） |
 | `exec-ws-handshake.headers.json` | `log169-ws.jsonl` seq 11 | `codex exec` WS 握手头 |
 | `exec-ws-prewarm.json` / `exec-ws-turn.json` / `exec-ws-followup.json` | 同上 seq 14 / 19 / 21 | `codex exec` 的预热、全量、增量帧 |
 | `exec-http-turn.json` (+`.headers.json`) | `log169-http.jsonl` seq 18 | `codex exec` HTTP 请求体与请求头（第一轮第一个请求） |

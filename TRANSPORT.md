@@ -195,8 +195,10 @@ data:<帧字节 verbatim>\n
 ## 连接复用
 
 默认关闭，`WithWSConnCache(n)`（n > 0，建议 2）开启每个 `HTTPClient` 的空闲连接缓存。
-连接身份是 `(threadKey, readLimit)`，`threadKey = InstallationID|Session.SessionID|Session.ThreadID`
-（`Session.SessionID` 为空 = 匿名）：同一 thread、同取数路径才复用；流式 64MiB 与聚合 16MiB 不共享连接；
+连接身份是 `(threadKey, routingHint, readLimit)`，`threadKey = InstallationID|Session.SessionID|Session.ThreadID`
+（`Session.SessionID` 为空 = 匿名），`routingHint` 是握手头 `x-codex-routing-hint`（`model=<model>[;tier=<tier>]`，
+上游按它路由，换模型/档位不复用；独立字段，不拼进 `threadKey`，`RetireThread` 仍按 `threadKey` 摘该线程全部路由）：
+同一 thread、同路由、同取数路径才复用；流式 64MiB 与聚合 16MiB 不共享连接；
 **window 变化不换连接**（与真实 codex 一致——换连接条件里没有 window），ts 每请求下发、不进连接身份。
 **匿名（`Identity{}`）不复用**：不取缓存、读完即终止，因为匿名没有会话语义，共享连接等于让无关请求
 互相污染路由状态。
@@ -241,6 +243,41 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
 `hits + misses == 请求数`。
 从同一 thread 的**第 2 个请求**起就有收益（跨轮同样命中），收益 ∝ 命中次数；
 每实例、每条取数路径各留一条空闲连接，容量按 2 规划。
+
+## HTTP→WS 预热
+
+对齐官方 codex-tui（`core/src/client.rs` 的预热与 `previous_response_id` 判定；抓包见设计 §7）。
+
+**何时**：新建上游连接（缓存未命中，或命中但连接已死后重拨）且 `Identity.Turn.First`。
+复用连接、一轮的后续请求、`IdentityState.Identity(sink, false)` 都不预热。匿名不预热。
+
+**次序**（`openWSExchange`）：整形 → 查缓存 → 拨号（握手 `x-codex-turn-metadata` 为 prewarm 形态）
+→ 写预热帧 → SDK 内部读到 `response.completed` → 组装并写真实帧。
+
+| | 预热帧 | 真实帧 |
+|---|---|---|
+| 输入 | lite：空；非 lite：SDK 由顶层 `instructions` 生成的那条消息（没有则空） | text 相等时跳过预热输入项；否则全量 |
+| `previous_response_id` | 无 | text 相等时 = 预热 response id；否则无 |
+| `text` | 去掉 `format` | 原值 |
+| `generate` | `false` | 不写 |
+| `client_metadata` / turn-metadata | prewarm 形态（`turn_id:""`，无 `root_turn_id`、ts） | turn 形态；ts = 预热 `response.metadata` 签发的值（无则 `Identity.Turn.State`） |
+
+预热事件不进 `StreamBody` / `Responses` 的结果、不计用量、不调用 `Release`；归还判定（fence）
+只在真实帧终态后发生。预热 ts 同时交给 `Identity.Sink`（首值生效由 Sink 负责）。
+
+**失败**：
+
+| 预热阶段发生 | 处理 |
+|---|---|
+| 写预热帧失败、EOF / 连接错误、空闲超时、ctx 取消或超时 | 连接终止，返回连接类错误（`codexsdk: websocket 预热未完成（真实请求未发出）: %w`；不是 `*HTTPError`；`errors.Is(context.Canceled / DeadlineExceeded / ErrWSIdleTimeout / io.EOF)` 照旧成立），调用方按连接错误重试/故障转移 |
+| `error` 帧带 4xx（含 429）状态 | `*HTTPError` 直接返回，不重拨 |
+| `response.failed` / `response.incomplete`、无状态或 5xx 的 `error` 帧 | 关闭该连接，同一 ctx 内重拨一次（turn 形态握手）、不预热、发全量 |
+
+**计数**（进程级，`ShapeStatsSnapshot()`）：`Prewarms`、`PrewarmConnFailures`、`PrewarmRejections`、
+`PrewarmRedials`、`PrewarmChained`（真实帧带预热 id）、`PrewarmUnchained`（预热成功但真实帧不带）。
+
+**代价**：每条新连接多一次往返；判定只比较已整形的 `text` 部件、真实帧在预热后组装一次
+（不预热的路径组装次数不变），没有额外整包扫描或复制。
 
 ## 已知限制
 
@@ -393,9 +430,15 @@ WS→WS 三种面的组装结果与抓包逐字节相等（`client_metadata` 按
 断言（含 `[DONE]` 位置）、与 HTTP 臂合成体逐字段相等、
 `response.failed` 两臂同形、身份与 turn-state（请求侧只认 `Identity.Turn.State`；升级头不携带；
 只有 `response.metadata` 事件捕获后回调 `Identity.Sink`，握手响应头不取；匿名时 payload 自带的
-`client_metadata` 被删除；连接身份 = `(threadKey, readLimit)`，跨 window 复用、匿名不复用；
+`client_metadata` 被删除；连接身份 = `(threadKey, routingHint, readLimit)`，跨 window 复用、匿名不复用；
 `RetireThread` 只摘 idle）、HTTP→WS 帧构造规则 + 无效请求体、关闭
 语义（1011 / 1005 / 1000 / 无 close 帧）、默认路径零 WS 连接、并发（`-race`）。
+
+`prewarm_test.go`（HTTP→WS 预热）：lite / 非 lite / 标题线程三组抓包逐字节比对预热帧与真实帧
+（真实帧带预热 id 与预热 ts，或 text 不等时全量）；复用、后续请求、槽位 `First=false` 不预热；
+失败三类（EOF / ctx 取消与超时 / 空闲超时 → 连接类错误；429 → `*HTTPError` 不重拨；failed / 5xx /
+无状态 → 重拨一次全量）；预热事件不进结果、不计用量、真实帧终态前不归还；缓存键含 routing-hint 且
+`RetireThread` 仍生效；客户端身份哨兵不出网（预热帧、真实帧、握手头）。
 
 `transport_ws_contract_test.go`（连接内核验收面，W1–W16）：
 

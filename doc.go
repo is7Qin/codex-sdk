@@ -147,8 +147,9 @@
 //     静默超过预算会关闭整条 WS 会话（Closed() 语义不变，仍只表示本地 Close）。
 //   - WithWSConnCache(n) 开启默认关闭的 WS 连接复用：同一个 HTTPClient 上同一
 //     thread 的连续请求——含跨轮跨窗口——命中后不再付握手（连接身份 =
-//     (threadKey, readLimit)）；匿名（Identity{}）不参与复用。线程退休走
-//     HTTPClient.RetireThread（只摘 idle，不设墓碑）。
+//     (threadKey, routingHint, readLimit)，routingHint = x-codex-routing-hint，
+//     换模型/档位不复用）；匿名（Identity{}）不参与复用。线程退休走
+//     HTTPClient.RetireThread（按 threadKey 摘该线程全部路由的 idle，不设墓碑）。
 //   - HTTP 流式解析零拷贝：bufio.Scanner 复用缓冲 + 行切片提取 data: 帧内容，
 //     回调内的原始字节引用 scanner 缓冲（仅在回调执行期间有效）
 //   - HTTP 客户端懒构建：NewHTTPClient 不创建 http.Client（只做选项快照），
@@ -234,8 +235,23 @@
 // 会话簿开的轮次再交给会话簿 Sink。Send 与 Recv 可并发（并发 Send 时轮次推进顺序
 // 不保证）。计数见 ConversationBook.Stats。
 //
-// WS 传输臂的连接身份 = (threadKey, readLimit)：连接是 thread 级、跨轮跨窗口
-// 复用，ts 是轮级、每请求下发。turn-state 的发现通道只有 Sink：HTTP 响应头在解析
+// HTTP→WS 预热（对齐官方 codex-tui）：新建上游连接（含缓存命中但连接已死后的
+// 重拨）且 Identity.Turn.First 时，SDK 先在这条连接上发 generate:false 的预热帧
+// （非输入字段同真实帧、text 去掉 format；输入 lite 为空、非 lite 只有 SDK 生成的
+// 指令消息；握手 turn-metadata 为 prewarm 形态），在内部读到 response.completed：
+// 预热事件不进返回流、不计用量、不触发归还；预热 response.metadata 的 ts 交给
+// Identity.Sink，并作为真实帧的 x-codex-turn-state。真实 text 不带 format 时真实帧
+// 带 previous_response_id = 预热 response id 并跳过预热输入；否则不带、发全量。
+// 复用连接与一轮的后续请求不预热，一律全量、不带 previous_response_id（与官方的
+// 一处已知差异：官方复用连接时发增量）。预热失败：连接错误 / EOF / 空闲超时 /
+// ctx 结束 ⇒ 连接类错误（真实请求未发出，不是 *HTTPError，errors.Is 原因照旧）；
+// 4xx（含 429）error 帧 ⇒ *HTTPError 直接返回；response.failed / incomplete、无状态
+// 或 5xx error ⇒ 关闭连接、重拨一次、不预热、发全量。代价：每条新连接多一次往返；
+// 判定只读已整形的部件（无额外整包扫描或复制）。计数在 ShapeStatsSnapshot 的
+// Prewarm* 字段（进程级）。
+//
+// WS 传输臂的连接身份 = (threadKey, routingHint, readLimit)：连接是 thread 级、
+// 跨轮跨窗口复用，ts 是轮级、每请求下发。turn-state 的发现通道只有 Sink：HTTP 响应头在解析
 // 响应头时同步回调；事件级 ts（response.metadata 的 headers）经 turnStateTap
 // （HTTP→WS）或 Client.Recv（WS→WS 静态身份）在读栈内逐帧旁路捕获：created 先记
 // response_id，归属匹配才写 Sink，"created 之前的 metadata 一律不捕获"。握手响应头

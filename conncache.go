@@ -326,7 +326,7 @@ func (c *connCache) dropIdle(markClosed bool) {
 //
 // 默认 **0 = 关闭**（每请求一条连接，与历史行为完全一致）。开启后，同一个
 // HTTPClient、同一条取数路径（流式 64MiB / 聚合 16MiB）的**连续**请求会复用
-// 上一条连接、不再付握手成本。连接身份 = (threadKey, readLimit)：与真实 codex
+// 上一条连接、不再付握手成本。连接身份 = (threadKey, routingHint, readLimit)：与真实 codex
 // 一致，连接是 thread 级、跨轮跨窗口复用；ts 是轮级、每请求随 client_metadata
 // 下发；匿名（threadKey == ""）不复用。
 //
