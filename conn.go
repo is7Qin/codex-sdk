@@ -290,6 +290,13 @@ func (c *conn) write(ctx context.Context, wire []byte) error {
 // wire[off:off+13]（x-codex-ws-stream-request-start-ms 的数字；off<0 不覆写，
 // 零分配）。在写闸上排队的时间因此不会算进"发送时刻"之前。
 func (c *conn) writeStamped(ctx context.Context, wire []byte, off int) error {
+	return c.writeStampedThen(ctx, wire, off, nil)
+}
+
+// writeStampedThen 同 writeStamped；写成功后在仍持有写闸时调用 after（nil =
+// 不调用）。WS→WS 会话用它按线上顺序登记"本帧身份"（并发 Send 时 FIFO 顺序与
+// 帧的写出顺序一致）。after 不得阻塞。
+func (c *conn) writeStampedThen(ctx context.Context, wire []byte, off int, after func()) error {
 	if cause := c.err(); cause != nil {
 		return cause
 	}
@@ -307,7 +314,13 @@ func (c *conn) writeStamped(ctx context.Context, wire []byte, off int) error {
 		(*hook)()
 	}
 	stampStartMs(wire, off, time.Now())
-	return c.ws.Write(ctx, coderws.MessageText, wire)
+	if err := c.ws.Write(ctx, coderws.MessageText, wire); err != nil {
+		return err
+	}
+	if after != nil {
+		after()
+	}
+	return nil
 }
 
 // writeStampHook 是测试挂点（生产恒为 nil）：取得写闸之后、覆写发送时刻之前调用。

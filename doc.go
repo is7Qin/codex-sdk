@@ -197,6 +197,36 @@
 //   - WS 帧的 x-codex-ws-stream-request-start-ms 在取得写闸之后写入发送时刻。
 //   - 计数见 ShapeStatsSnapshot（进程级；SDK 不打日志）。
 //
+// # 会话簿（ConversationBook）
+//
+// 对话标识（缓存域、API key ID、客户端对话标识）经 NewConversationKey 哈希成
+// ConversationKey，原文不落盘、不出网。ConversationBook.Prepare 由键与
+// AnalyzeConversationInput 的结果合成整份 Identity（线程、窗口、轮次、turn-state、
+// Sink），跨副本经 ConversationStore 共享（内存实现 NewMemoryConversationStore；
+// Redis 实现在子包 redisstore，只用 redis.Scripter、全部是 Lua，只支持单节点）：
+//   - 存储调用次数：一轮的后续请求本地两缓存命中则零次，否则只 Load（对话记录缺失
+//     才 Open）；新的一轮本地有对话记录则零次，否则只 Open；新压缩项同步 Advance；
+//     新一轮的轮次记录与上游 turn-state 进有界写入队列（8192，满则丢弃计数），由
+//     调用方 worker 每 50ms 调 Flush 批量 SaveTurns（256 一批）。SDK 不起 goroutine。
+//   - 降级：Open/Advance/Load 预算 30ms；连续失败 5 次熔断 5 秒，到期半开只放一个
+//     探测。失败、超时、熔断一律降级为一次性身份（新线程、窗口 0、Sink 为 nil），
+//     不进缓存，Prepare 永不返回错误。
+//   - turn-state：Sink 绑定（对话键、轮次键、轮次号、凭据 owner）；同 owner 首值
+//     生效、换 owner 覆盖；Turn.State 只在记录 owner 等于本次 owner 时带。
+//   - 本地缓存是两个 sync.Map（不可变条目指针 + 原子 lastUsed），热路径只有
+//     sync.Map.Load、原子操作与非阻塞 channel 发送（命中路径 1 次分配、零存储调用，
+//     命中计数按对话键分条避免多核争用）；容量（对话 10 万、轮次 5 万）与 TTL（1h、
+//     10min）只在 Flush 内每 ≥30s 清扫一次。
+//
+// WS→WS：Dial 的 WithConversation(book, req, first) 让连接逐帧合成身份（Dial 的 id
+// 必须为零值，与 WithFirstFrame 互斥）。首帧在 Dial 时算一次（generate:false 只取
+// 对话记录、握手为 prewarm 形态；否则 Prepare），首次 Send 复用；之后全量帧
+// Prepare，增量帧在连接内续轮或开轮（不读不写存储）。帧写成功后"本帧身份"进容量
+// 16 的 FIFO，Recv 在 response.created 时按顺序绑定（只回 error、没有 created 的帧
+// 被弹掉；FIFO 满则整条连接停止捕获 ts），response.metadata 的 ts 先按轮次号 CAS
+// 进连接快照，会话簿开的轮次再交给会话簿 Sink。Send 与 Recv 可并发。计数见
+// ConversationBook.Stats。
+//
 // WS 传输臂的连接身份 = (threadKey, readLimit)：连接是 thread 级、跨轮跨窗口
 // 复用，ts 是轮级、每请求下发。turn-state 的发现通道只有 Sink：HTTP 响应头在解析
 // 响应头时同步回调；事件级 ts（response.metadata 的 headers）经 turnStateTap
@@ -209,5 +239,6 @@
 //
 // 依赖：github.com/coder/websocket（纯标准库实现，无 CGO）+
 // github.com/tidwall/gjson（raw JSON 读取）+ github.com/klauspost/compress/zstd
-// （/responses 请求体压缩，钉 v1.17.11）。
+// （/responses 请求体压缩，钉 v1.17.11）；子包 redisstore 另依赖
+// github.com/redis/go-redis/v9（v9.22.0，只用 redis.Scripter），不导入它就不编译它。
 package codexsdk

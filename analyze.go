@@ -45,13 +45,23 @@ func AnalyzeConversationInput(payload []byte) ConversationInput {
 	if !gjson.ValidBytes(payload) {
 		return out
 	}
-	// input 的值从起点直接交给 forEachElement（它在匹配的 ']' 处停止），不先
-	// 跳过整个值再回头扫——整个 input 只遍历一次。
+	// input 的值从起点直接交给 analyzeInputValue（forEachElement 在匹配的 ']'
+	// 处停止），不先跳过整个值再回头扫——整个 input 只遍历一次。
 	start, ok := memberValueStart(payload, "input")
 	if !ok {
 		return out
 	}
-	input := payload[start:]
+	return analyzeInputValue(payload[start:])
+}
+
+// analyzeInputValue 分析从 input 值起点开始的字节（数组或字符串；其后可以跟着
+// 别的字节，遍历在值结束处停止；其他类型返回零值，Anchor=-1）。WS→WS 会话路径
+// 直接用 parseRequest 已切出的片段，不再扫整包。
+func analyzeInputValue(input []byte) ConversationInput {
+	out := ConversationInput{Anchor: -1}
+	if len(input) == 0 {
+		return out
+	}
 	switch input[0] {
 	case '"':
 		out.Items = 1

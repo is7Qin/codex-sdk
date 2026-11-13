@@ -125,6 +125,36 @@ before the first `Send`, and is released after it. On a WS→WS connection,
 insertion only has the top-level fields removed. Callers should give the SDK a transport with
 `DisableCompression` (official clients send no `Accept-Encoding`).
 
+## Conversation book
+
+`ConversationBook` synthesizes the whole `Identity` (thread, window, turn,
+turn-state, sink) from a hashed `ConversationKey`
+(`NewConversationKey(cacheDomain, apiKeyID, conversation)`) and shares it
+across replicas through a `ConversationStore`:
+
+```go
+book := codexsdk.NewConversationBook(redisstore.New(rdb)) // or NewMemoryConversationStore()
+// worker: every 50ms
+_ = book.Flush(ctx)
+// per request (never fails; degrades to a one-shot identity)
+id := book.Prepare(ctx, codexsdk.ConversationRequest{
+	Key: key, InstallationID: inst, Owner: owner,
+	Input: codexsdk.AnalyzeConversationInput(payload),
+})
+```
+
+A follow-up request served by the replica that saw the turn touches the store
+zero times; on another replica it costs exactly one `Load`. Store calls have a
+30ms budget and a 5-failures/5-seconds circuit breaker. `redisstore` uses only
+`redis.Scripter` (Lua via `EVALSHA`, falling back to `EVAL` on `NOSCRIPT`) and
+supports single-node Redis only.
+
+For WS→WS, `Dial(ctx, auth, codexsdk.Identity{}, codexsdk.WithConversation(book, req, first))`
+synthesizes identity per frame (mutually exclusive with `WithFirstFrame`; the
+`Identity` argument must be zero). Full frames go through `Prepare`,
+incremental frames continue or open turns locally, and upstream turn-state is
+attributed to the frame that produced each `response.created`.
+
 For the full API reference, see the package documentation in
 [doc.go](./doc.go).
 

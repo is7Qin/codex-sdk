@@ -252,7 +252,9 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   无升级响应的失败不再是 `DialError`（`StatusCode==0` 形态消失）。
 - **turn-state 的来源与跨轮**：请求侧只有一个来源——`Identity.Turn.State`（`""` = 本次不带）。
   捕获到的签发值只回调 `Identity.Sink`，SDK **不缓存、不回落、不回填响应头**：重放策略由调用方
-  在构造 `Identity` 时决定（网关侧是会话对象上的一个策略位）。
+  在构造 `Identity` 时决定（网关侧是会话对象上的一个策略位）。会话簿（`ConversationBook`）
+  是这条规则之上的调用方组件：它的 `Prepare` 产出带 `Turn.State` 与 Sink 的 `Identity`，
+  传输层照旧只认 `Identity`。
   **身份头与形态头是保留键**：`WithHeader` 遇到 `session-id` / `thread-id` / `x-client-request-id` /
   `x-codex-window-id` / `x-codex-installation-id` / `x-codex-turn-state` / `version` /
   `x-codex-routing-hint` / `x-codex-beta-features` / `x-codex-turn-metadata` /
@@ -300,11 +302,25 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
 - **WS→WS 首帧**：`WithFirstFrame(first)` 不复制 `first`（整形结果直接引用它），
   该切片在第一次 `Send` 之前不得被修改；第一次 `Send` 用 `Swap(nil)` 取出后 SDK
   不再引用它，首帧不随连接常驻。
+- **WS→WS 会话（`WithConversation`）**：身份由会话簿逐帧合成（`Dial` 的 `id` 必须为
+  零值，与 `WithFirstFrame` 互斥，构造期 panic）。首帧在 `Dial` 时算一次：
+  `generate:false` 只取对话记录（握手 prewarm 形态），否则 `Prepare`（turn 形态）；首次
+  `Send` 复用，不再 `Prepare`。之后：`generate:false` 帧不开轮；不带
+  `previous_response_id` 的全量帧 `Prepare`；增量帧以工具输出结尾 → 沿用当前轮次（没有
+  则连接内临时轮次，计数），否则连接内开新轮（不读不写存储），ts 取连接快照。连接状态
+  是 `atomic.Pointer` 不可变快照。写帧成功后（仍持写闸，FIFO 顺序 = 线上顺序）"本帧
+  身份"进容量 16 的 FIFO；`Recv`：`response.created` 取最早一份绑定，
+  completed/failed/incomplete 清除绑定；没有已绑定 response 时的 `error` 弹掉一份（该
+  create 被拒），流中途的 `error` 只结束绑定；`response.metadata` 只交给 id 匹配的身份：
+  快照当前轮次号相同且 ts 空或 owner 不同时 CAS 写入，轮次已换则计数（迟到），会话簿
+  开的轮次无论如何再交给会话簿 Sink。FIFO 满 ⇒ 整条连接停止捕获 ts（计数）。
+  `response.created` 到达而 FIFO 为空、且有 `Send` 正在写时，`Recv` 短暂让出等入队
+  （写成功与入队之间只隔几条指令）。
 - **WS→WS 插入项去重**：连接记下上次实际插入的指令/工具项哈希；带
   `previous_response_id` 的增量帧哈希相同则只删顶层 `instructions` / `tools`、
   不再插入，不同则插入；本连接此前已有插入记录时计入
-  `ShapeStats.IncrementalReinjects`（连接上的第一次插入不计）。哈希只在 WS→WS
-  计算。
+  `ShapeStats.IncrementalReinjects`（连接上的第一次插入不计；会话连接另计入
+  `ConversationStats.WSIncrementalInjects`）。哈希只在 WS→WS 计算。
 - **zstd 编码器**：容量 = `GOMAXPROCS` 的有界空闲列表（不是 `sync.Pool`）；单个
   编码器约 3.7MB（`WithLowerEncoderMem`，输出字节与默认编码器相同），并发超过
   上限时临时新建、用完丢弃。空闲编码器不随 GC 释放：常驻量 = 历史峰值并发（上限
@@ -314,7 +330,7 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   Go 管理的头 Host / Content-Length / Transfer-Encoding / Connection /
   Accept-Encoding / TE / Trailer / Upgrade / User-Agent 保持规范写法交给 Go）/
   trace（`WithTraceContext`、`WithTraceAuto`）/ compression（只影响协商，出站恒
-  不压缩）/ ping（无效果）/ beta / `WithFirstFrame`（仅 `Dial`）；身份
+  不压缩）/ ping（无效果）/ beta / `WithFirstFrame`、`WithConversation`（仅 `Dial`）；身份
   `Identity{InstallationID, Session, Window, Turn, Sink}` 不在此列——它随 `Dial` /
   `StreamBody` / `Responses` 的 `Identity` 实参进入握手头与帧/体的 `client_metadata`
   和 `x-codex-turn-metadata`。
@@ -338,6 +354,7 @@ AMD Ryzen 7 7840H 上 `-count=10` 的中位数，换机器只比"与基线的比
 | P1' HTTP 整形 + zstd（官方 84KB 体） | `BenchmarkHTTPShapeZstd84KB` | — | **0.78–0.86 ms / 272 KB / 20 allocs** | zstd 约占 60% |
 | P2 帧→SSE 渲染（1KB 帧） | `BenchmarkSSEViewRender1KB` | 2,312 ns / 2,720 B / 3 allocs | **72 ns / 0 B / 0 allocs** | 只判 `0 B / 0 allocs`（口径从"构建一块"变成"三段渲染 + 读尽"，ns/op 不与 T0 纵向比） |
 | P3 WS 每请求（整链路含握手） | `BenchmarkWSStreamBodyPerRequest` | 468 allocs | **475 allocs**（整形新增 client_metadata / turn-metadata 合成） | 不得劣化：≤ T0 × 1.05 |
+| P4 会话簿命中（后续请求，两缓存命中） | `BenchmarkBookPrepareHit`（`RunParallel`，`-cpu 1,8,20`） | — | **1 alloc / 96 B，零存储调用**；ns/op 随核数下降（见实现报告） | `TestBookPrepareHitBounds`：≤ 4 allocs、零存储调用 |
 
 P1 的 11 allocs 来自整形本身必需的工作（官方形态重建）：输出缓冲、
 `prompt_cache_key`、两种 turn-metadata 合一的缓冲、指令 developer 消息、插入项切片、

@@ -118,6 +118,8 @@ type options struct {
 	// firstFrame 是 WithFirstFrame 的首帧（仅 Dial 读）：握手头的 routing-hint
 	// 与 turn-metadata 取自它。
 	firstFrame []byte
+	// conversation 是 WithConversation 的参数（仅 Dial 读）：身份由会话簿合成。
+	conversation *conversationOption
 
 	// HTTP 专用。
 	timeout     time.Duration
@@ -367,6 +369,9 @@ type Client struct {
 	// response 的 response.metadata turn-state 交给 id.Sink。
 	observer turnStateObserver
 
+	// conv 是 WithConversation 的会话状态（nil = 静态身份）。
+	conv *wsConversation
+
 	// closed 标记本地已发起关闭（Close/CloseNow）。对端关闭由常驻读者观测。
 	closed atomic.Bool
 }
@@ -401,6 +406,16 @@ func Dial(ctx context.Context, auth Auth, id Identity, opts ...Option) (*Client,
 	}
 	cfg := resolveOptions(opts)
 	c := &Client{shape: shapeConfigOf(&cfg), id: id}
+	if co := cfg.conversation; co != nil {
+		switch {
+		case cfg.firstFrame != nil:
+			panic("codexsdk: WithConversation 与 WithFirstFrame 不能同时设置")
+		case !isZeroIdentity(id):
+			panic("codexsdk: 设置 WithConversation 时 Dial 的 id 必须为零值（身份由会话簿合成）")
+		case co.book == nil:
+			panic("codexsdk: WithConversation 的 book 不能为 nil")
+		}
+	}
 	spec := dialSpec{
 		auth:      auth,
 		opts:      cfg,
@@ -420,6 +435,16 @@ func Dial(ctx context.Context, auth Auth, id Identity, opts ...Option) (*Client,
 		spec.shaped = &st.sh
 		c.first.Store(st)
 	}
+	if co := cfg.conversation; co != nil {
+		cv, cid, st, err := dialConversation(ctx, co, c.shape)
+		if err != nil {
+			return nil, err
+		}
+		spec.opts.conversation = nil // 首帧只经 c.first 引用，首次 Send 后释放
+		spec.identity, spec.shaped = cid, &st.sh
+		c.conv = cv
+		c.first.Store(st)
+	}
 	cn, _, err := dialConn(ctx, spec)
 	if err != nil {
 		return nil, err
@@ -437,10 +462,14 @@ func Dial(ctx context.Context, auth Auth, id Identity, opts ...Option) (*Client,
 // （turn_id 为空串、prewarm 形态 turn-metadata、不带 turn-state）。顶层
 // instructions / tools 生成的插入项按连接去重：带 previous_response_id 的增量帧
 // 与本连接上次插入的内容相同时不再插入（顶层字段照样删除）。
-// 请求体无效返回 ErrInvalidRequestBody（不入网）。
+// 请求体无效返回 ErrInvalidRequestBody（不入网）。WithConversation 连接的身份由
+// 会话簿逐帧合成（见 WithConversation）。
 // x-codex-ws-stream-request-start-ms 在取得写闸之后写入发送时刻。Write 同步
 // 消费——Send 返回前不得复用 frame。
 func (c *Client) Send(ctx context.Context, frame []byte) error {
+	if c.conv != nil {
+		return c.sendConversation(ctx, frame)
+	}
 	var sh shapedRequest
 	if p := c.first.Swap(nil); p != nil && bytes.Equal(p.frame, frame) {
 		sh = p.sh
@@ -485,8 +514,9 @@ func (c *Client) Send(ctx context.Context, frame []byte) error {
 //
 // turn-state：帧是 response.metadata 且其 response_id 等于最近一次
 // response.created 的 id 时，把其中的 x-codex-turn-state 交给 Identity.Sink
-// （只读顶层 type，其余帧零解析）。握手响应头里的 turn-state 不取（官方只认
-// 事件）。
+// （只读顶层 type，其余帧零解析）。WithConversation 连接按 response.created 的
+// 顺序把 ts 归给对应帧的轮次（见 WithConversation）。握手响应头里的 turn-state
+// 不取（官方只认事件）。
 //
 // 直读 socket（pull 模式无 pump、无队列）。data 为 coder/websocket 每次 Read
 // 独立分配的缓冲，跨次调用有效。对端关闭/网络断开/超 ReadLimit 时返回错误
@@ -508,7 +538,7 @@ func (c *Client) Recv(ctx context.Context) ([]byte, error) {
 	if budget <= 0 {
 		data, err := c.cn.readFrame(ctx) // 既有行为（显式 opt-out）
 		if err == nil {
-			c.observer.observe(data)
+			c.observe(data)
 		}
 		return data, err
 	}
@@ -516,7 +546,7 @@ func (c *Client) Recv(ctx context.Context) ([]byte, error) {
 	defer cancel()
 	data, err := c.cn.readFrame(rctx)
 	if err == nil {
-		c.observer.observe(data)
+		c.observe(data)
 		return data, nil
 	}
 	if ctx.Err() != nil {
@@ -527,6 +557,16 @@ func (c *Client) Recv(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("%w（%s 内未收到任何帧）", ErrWSIdleTimeout, budget)
 	}
 	return nil, err
+}
+
+// observe 是 Recv 的 turn-state 观测：会话连接按帧身份归属，静态身份交给
+// Identity.Sink。
+func (c *Client) observe(data []byte) {
+	if c.conv != nil {
+		c.conv.observe(data)
+		return
+	}
+	c.observer.observe(data)
 }
 
 // Ping 发送 WS 层 ping 并等待 pong（对端库自动回 pong；ctx 控制等待上限）。
