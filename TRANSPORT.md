@@ -263,7 +263,8 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
 | `client_metadata` / turn-metadata | prewarm 形态（`turn_id:""`，无 `root_turn_id`、ts） | turn 形态；ts = 预热 `response.metadata` 签发的值（无则 `Identity.Turn.State`） |
 
 预热事件不进 `StreamBody` / `Responses` 的结果、不计用量、不调用 `Release`；归还判定（fence）
-只在真实帧终态后发生。预热 ts 同时交给 `Identity.Sink`（首值生效由 Sink 负责）。
+只在真实帧终态后发生。预热 ts 同时交给 `Identity.Sink`（首值生效由 Sink 负责）；真实帧带同一预热
+response 的第一个 ts。
 
 **失败**：
 
@@ -271,7 +272,7 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
 |---|---|
 | 写预热帧失败、EOF / 连接错误、空闲超时、ctx 取消或超时 | 连接终止，返回连接类错误（`codexsdk: websocket 预热未完成（真实请求未发出）: %w`；不是 `*HTTPError`；`errors.Is(context.Canceled / DeadlineExceeded / ErrWSIdleTimeout / io.EOF)` 照旧成立），调用方按连接错误重试/故障转移 |
 | `error` 帧带 4xx（含 429）状态 | `*HTTPError` 直接返回，不重拨 |
-| `response.failed` / `response.incomplete`、无状态或 5xx 的 `error` 帧 | 关闭该连接，同一 ctx 内重拨一次（turn 形态握手）、不预热、发全量 |
+| `response.failed` / `response.incomplete`、无状态或 5xx 的 `error` 帧 | 关闭该连接，同一 ctx 内重拨一次（turn 形态握手）、不预热、发全量、不带 `previous_response_id`；预热已拿到的 ts 照样带上（与交给 Sink 的一致；官方 turn_state 是 OnceLock，重连不重置）。调用方此时已取消则不重拨，按上面的连接类错误返回 |
 
 **计数**（进程级，`ShapeStatsSnapshot()`）：`Prewarms`、`PrewarmConnFailures`、`PrewarmRejections`、
 `PrewarmRedials`、`PrewarmChained`（真实帧带预热 id）、`PrewarmUnchained`（预热成功但真实帧不带）。
@@ -434,10 +435,14 @@ WS→WS 三种面的组装结果与抓包逐字节相等（`client_metadata` 按
 `RetireThread` 只摘 idle）、HTTP→WS 帧构造规则 + 无效请求体、关闭
 语义（1011 / 1005 / 1000 / 无 close 帧）、默认路径零 WS 连接、并发（`-race`）。
 
-`prewarm_test.go`（HTTP→WS 预热）：lite / 非 lite / 标题线程三组抓包逐字节比对预热帧与真实帧
-（真实帧带预热 id 与预热 ts，或 text 不等时全量）；复用、后续请求、槽位 `First=false` 不预热；
-失败三类（EOF / ctx 取消与超时 / 空闲超时 → 连接类错误；429 → `*HTTPError` 不重拨；failed / 5xx /
-无状态 → 重拨一次全量）；预热事件不进结果、不计用量、真实帧终态前不归还；缓存键含 routing-hint 且
+`prewarm_test.go`（HTTP→WS 预热）：lite / 非 lite 两组抓包逐字节比对预热帧与真实帧（`client_metadata`
+按集合比）；标题线程组的预热帧把抓包的 effort（`reasoning.effort` 与 turn-metadata 的
+`reasoning_effort`，官方标题预热用模型默认值）换成真实帧的值后逐字节比，真实帧除 `client_metadata`
+外逐字节比（真实帧带预热 id 与预热 ts，或 text 不等时全量）；复用、后续请求、槽位 `First=false`、
+匿名不预热，缓存命中但连接已死的重拨要预热；completed 的 response id 兜底、预热 ts 取首值；
+失败三类（EOF / ctx 取消与超时 / 空闲超时 → 连接类错误；429 → `*HTTPError` 不重拨且连接已收尾；
+failed / incomplete / 5xx / 无状态 → 先关旧连接、turn 形态握手重拨一次全量、带预热已拿到的 ts；
+调用方已取消则不重拨）；预热事件不进结果、不计用量、真实帧终态前不归还；缓存键含 routing-hint 且
 `RetireThread` 仍生效；客户端身份哨兵不出网（预热帧、真实帧、握手头）。
 
 `transport_ws_contract_test.go`（连接内核验收面，W1–W16）：
