@@ -313,7 +313,8 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   （全量帧经 `Prepare` 或增量帧连接内开轮）没有同 owner 的 ts 时带上它（只用一次；会话簿
   开的轮次同时交给会话簿 Sink；官方抓包 log169b-tui seq35）。在写闸内、写帧**之前**
   发布快照并把"本帧身份"压入容量 16 的 FIFO（FIFO 顺序 = 线上顺序，上游再快的
-  `response.created` 也不会先于登记到达；写失败在闸内撤销：FIFO 条目标记撤销、快照换回，
+  `response.created` 也不会先于登记到达；取得写闸时 ctx 已取消则不登记、不写（撤销条目
+  不会因已取消的 Send 堆积占满 FIFO）；写失败在闸内撤销：FIFO 条目标记撤销、快照换回，
   无让出等待）；`Recv`：`response.created` 取最早一份绑定，
   completed/failed/incomplete 清除绑定；没有已绑定 response 时的 `error` 弹掉一份（该
   create 被拒），流中途的 `error` 只结束绑定；`response.metadata` 只交给 id 匹配的身份：

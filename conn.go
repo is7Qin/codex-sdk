@@ -317,11 +317,16 @@ func (c *conn) writeGated(ctx context.Context, wire []byte, off int, g gatedWrit
 	if cause := c.err(); cause != nil {
 		return cause
 	}
-	if g != nil {
-		g.beforeWrite()
-	}
 	if hook := writeStampHook.Load(); hook != nil {
 		(*hook)()
+	}
+	if g != nil {
+		// ctx 已取消：不登记、不写。coder 在取锁处因 ctx 失败时不关连接，若先
+		// 登记，撤销的身份会一直占着 FIFO 槽位，直到填满让整条连接停止捕获 ts。
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		g.beforeWrite()
 	}
 	stampStartMs(wire, off, time.Now())
 	if err := c.ws.Write(ctx, coderws.MessageText, wire); err != nil {
@@ -333,7 +338,8 @@ func (c *conn) writeGated(ctx context.Context, wire []byte, off int, g gatedWrit
 	return nil
 }
 
-// writeStampHook 是测试挂点（生产恒为 nil）：取得写闸之后、覆写发送时刻之前调用。
+// writeStampHook 是测试挂点（生产恒为 nil）：取得写闸之后、写闸内登记（beforeWrite）
+// 与覆写发送时刻之前调用。
 // 原子指针：测试在连接存活期间设置/清除它，与写帧的 goroutine 无数据竞争。
 var writeStampHook atomic.Pointer[func()]
 

@@ -533,6 +533,39 @@ func TestWSConversationFrames(t *testing.T) {
 		}
 	})
 
+	// 已取消 ctx 的 Send：不登记、不写；撤销条目不得占住 FIFO，连接照常捕获 ts。
+	t.Run("CanceledSendDoesNotFillFIFO", func(t *testing.T) {
+		book := newTestBook(NewMemoryConversationStore(), nil)
+		up := newTSUpstream(t, func(i int, _ []byte) []string {
+			return respondTurn("r"+strconv.Itoa(i), "ts-"+strconv.Itoa(i))
+		})
+		c := dialConversationClient(t, up, book, wsFullFrame)
+		mustSend(t, c, wsFullFrame)
+		recvUntil(t, c, 1)
+		before := c.conv.state.Load()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		for i := 0; i < 200; i++ {
+			if err := c.Send(ctx, []byte(wsNewUserIncr)); !errors.Is(err, context.Canceled) {
+				t.Fatalf("第 %d 次已取消 ctx 的 Send: err=%v", i, err)
+			}
+		}
+		if n := len(c.conv.fifo); n != 0 || c.conv.untracked.Load() || book.Stats().WSUntrackedConnections != 0 {
+			t.Fatalf("已取消 ctx 的 Send 占住了 FIFO: fifo=%d untracked=%v", n, c.conv.untracked.Load())
+		}
+		if c.conv.state.Load() != before || c.cn.err() != nil {
+			t.Fatal("已取消 ctx 的 Send 不得改快照或终止连接")
+		}
+		mustSend(t, c, wsNewUserIncr) // 连接内新轮：照常捕获 ts
+		recvUntil(t, c, 1)
+		mustSend(t, c, wsFollowIncr)
+		up.waitFrames(t, 3)
+		fs := up.sentFrames(t)
+		if frameTurnID(t, fs[2]) != frameTurnID(t, fs[1]) || frameTurnState(t, fs[2]) != "ts-1" {
+			t.Fatalf("取消的 Send 之后未捕获 ts: turn=%q/%q ts=%q", frameTurnID(t, fs[2]), frameTurnID(t, fs[1]), frameTurnState(t, fs[2]))
+		}
+	})
+
 	t.Run("FIFOFullStopsCapture", func(t *testing.T) {
 		book := newTestBook(NewMemoryConversationStore(), nil)
 		up := newTSUpstream(t, func(i int, _ []byte) []string {
