@@ -452,16 +452,17 @@ func (c *Client) Send(ctx context.Context, frame []byte) error {
 	}
 	// 指令/工具插入的连接级去重：全量帧（不带 previous_response_id）照常插入并
 	// 记下哈希；增量帧的插入项与本连接上次相同则只删顶层字段、不再插入，不同则
-	// 插入并计数。
+	// 插入；只有本连接此前已记录过插入项（与上次不同）才计入
+	// IncrementalReinjects——连接上的第一次插入不算"重新插入"。
 	hash, record := sh.injectHash(), true
 	if sh.clientPrevID != "" {
-		switch {
+		switch last := c.lastInject.Load(); {
 		case hash == 0:
 			record = false
-		case hash == c.lastInject.Load():
+		case hash == last:
 			sh.inputPrefix, record = nil, false
 		default:
-			if c.shape.stats != nil {
+			if last != 0 && c.shape.stats != nil {
 				c.shape.stats.incrementalReinjects.Add(1)
 			}
 		}

@@ -497,7 +497,7 @@ func TestS8DialIdentity(t *testing.T) {
 	up.waitFrames(t, 1)
 	frame := up.sentFrames(t)[0]
 	if got := frameTurnState(t, frame); got != "T-req" {
-		t.Fatalf("帧内 ts = %q, 期望 T-req（Identity.TurnState）", got)
+		t.Fatalf("帧内 ts = %q, 期望 T-req（Identity.Turn.State）", got)
 	}
 }
 

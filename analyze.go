@@ -45,15 +45,18 @@ func AnalyzeConversationInput(payload []byte) ConversationInput {
 	if !gjson.ValidBytes(payload) {
 		return out
 	}
-	input, ok := objectMember(payload, "input")
-	if !ok || len(input) == 0 {
+	// input 的值从起点直接交给 forEachElement（它在匹配的 ']' 处停止），不先
+	// 跳过整个值再回头扫——整个 input 只遍历一次。
+	start, ok := memberValueStart(payload, "input")
+	if !ok {
 		return out
 	}
+	input := payload[start:]
 	switch input[0] {
 	case '"':
 		out.Items = 1
 		out.Anchor = 0
-		out.TurnKey = turnKeyOf(0, input)
+		out.TurnKey = turnKeyOf(0, input[:skipJSONValue(input, 0)])
 		return out
 	case '[':
 	default:
@@ -61,22 +64,69 @@ func AnalyzeConversationInput(payload []byte) ConversationInput {
 	}
 	lastKind := itemOther
 	idx := 0
+	var anchor, compaction []byte
+	hasCompaction := false
 	forEachElement(input, func(el []byte) bool {
 		kind := classifyInputItem(el)
 		switch kind {
 		case itemOther:
-			out.Anchor = idx
-			out.TurnKey = turnKeyOf(idx, el)
+			out.Anchor, anchor = idx, el
 		case itemCompaction:
-			out.Compaction = fnv64a(el)
+			compaction, hasCompaction = el, true
 		}
 		lastKind = kind
 		idx++
 		return true
 	})
+	// 哈希只对最终的锚点 / 压缩项各算一次（元素片段引用 payload，不复制）。
+	if out.Anchor >= 0 {
+		out.TurnKey = turnKeyOf(out.Anchor, anchor)
+	}
+	if hasCompaction {
+		out.Compaction = fnv64a(compaction)
+	}
 	out.Items = idx
 	out.followUp = idx > 0 && lastKind == itemToolOutput
 	return out
+}
+
+// memberValueStart 返回对象 obj（合法、对象根）顶层第一个名为 name 的成员
+// （键按解码后的名字比较）其值的起始下标。与 objectMember 不同，命中时不跳过
+// 该值，调用方可从起点直接流式遍历。
+func memberValueStart(obj []byte, name string) (int, bool) {
+	i := skipSpace(obj, 0)
+	if i >= len(obj) || obj[i] != '{' {
+		return 0, false
+	}
+	i++
+	for i < len(obj) {
+		i = skipSpace(obj, i)
+		if i >= len(obj) || obj[i] == '}' {
+			return 0, false
+		}
+		if obj[i] == ',' {
+			i++
+			continue
+		}
+		keyEnd := skipJSONString(obj, i)
+		if keyEnd < 0 {
+			return 0, false
+		}
+		key := obj[i+1 : keyEnd-1]
+		i = skipSpace(obj, skipSpace(obj, keyEnd)+1)
+		if i >= len(obj) {
+			return 0, false
+		}
+		if keyIs(key, bytes.IndexByte(key, '\\') >= 0, name) {
+			return i, true
+		}
+		end := skipJSONValue(obj, i)
+		if end < 0 {
+			return 0, false
+		}
+		i = end
+	}
+	return 0, false
 }
 
 type inputItemKind uint8
@@ -90,12 +140,28 @@ const (
 
 // classifyInputItem 只读元素顶层的 type / role（首现）。非对象元素与非字符串
 // type 按锚点候选处理。
+//
+// 成员只遍历一次：type 找到且不是 "message" 即停止（role 只在 message 分支
+// 用到）；type 与 role 都找到也停止。只有 type 缺失或为 message 时才可能扫到
+// 元素末尾——工具输出、reasoning 这类无 role 的大元素因此不会被多扫一遍。
 func classifyInputItem(el []byte) inputItemKind {
 	if len(el) == 0 || el[0] != '{' {
 		return itemOther
 	}
-	typTok, hasType := objectMember(el, "type")
-	roleTok, hasRole := objectMember(el, "role")
+	var typTok, roleTok []byte
+	hasType, hasRole := false, false
+	forEachMember(el, func(key, val []byte, escaped bool) bool {
+		switch {
+		case !hasType && keyIs(key, escaped, "type"):
+			typTok, hasType = val, true
+			if s, _ := jsonStringValue(val); string(s) != "message" {
+				return false
+			}
+		case !hasRole && keyIs(key, escaped, "role"):
+			roleTok, hasRole = val, true
+		}
+		return !(hasType && hasRole)
+	})
 	var t []byte
 	if hasType {
 		t, _ = jsonStringValue(typTok)

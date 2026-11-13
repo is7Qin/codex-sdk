@@ -156,6 +156,52 @@ func TestWSStaticIdentityIncrementalNoReinject(t *testing.T) {
 	}
 }
 
+// TestWSFirstIncrementalInjectNotCounted：连接上的第一个插入发生在增量帧上
+// （此前没有全量帧、lastInject==0）时照常插入，但不计入 IncrementalReinjects；
+// 之后插入项变化才计数。
+func TestWSFirstIncrementalInjectNotCounted(t *testing.T) {
+	up := newTSUpstream(t, func(i int, _ []byte) []string {
+		rid := "resp_fi_" + strconv.Itoa(i)
+		return []string{tsCreatedFrame(rid), tsCompletedFrame(rid)}
+	})
+	c, err := Dial(context.Background(), PAT("p"), testID(), WithTransport(newFixedTransport(t, DefaultResponsesURL, up.srv.URL)))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.CloseNow()
+	send := func(b string) {
+		t.Helper()
+		if err := c.Send(context.Background(), []byte(b)); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		for i := 0; i < 2; i++ { // created / completed
+			if _, err := c.Recv(context.Background()); err != nil {
+				t.Fatalf("Recv: %v", err)
+			}
+		}
+	}
+	inc := `{"model":"gpt-6.1-sol","previous_response_id":"resp_x","instructions":"sys A","tools":[{"type":"function","name":"f"}],"input":[{"type":"function_call_output","call_id":"c","output":"ok"}]}`
+	r0 := ShapeStatsSnapshot().IncrementalReinjects
+	send(inc)
+	if d := ShapeStatsSnapshot().IncrementalReinjects - r0; d != 0 {
+		t.Fatalf("首个增量帧的插入不应计数，增量 = %d", d)
+	}
+	send(inc) // 相同：不插、不计
+	send(strings.Replace(inc, "sys A", "sys B", 1))
+	if d := ShapeStatsSnapshot().IncrementalReinjects - r0; d != 1 {
+		t.Fatalf("插入项变化后计数增量 = %d，期望 1", d)
+	}
+	frames := up.sentFrames(t)
+	if len(frames) != 3 {
+		t.Fatalf("上游帧数 = %d", len(frames))
+	}
+	for i, want := range []int{2, 0, 2} {
+		if got := len(gjson.GetBytes(frames[i], "input").Array()) - 1; got != want {
+			t.Fatalf("帧 %d 插入项 = %d，期望 %d: %s", i, got, want, frames[i])
+		}
+	}
+}
+
 // TestEmptyInstallationIDOmitted：InstallationID 为空时 client_metadata 与
 // turn-metadata 两处都省略该键（键序其余不变）。
 func TestEmptyInstallationIDOmitted(t *testing.T) {

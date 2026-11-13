@@ -583,7 +583,7 @@ func TestSessionHeaders(t *testing.T) {
 }
 
 // TestWSTurnState：Dial 的 Identity 直接决定请求身份——握手响应头签发的 ts
-// 只进 Sink；帧内 ts 来自当次 Identity.TurnState（SDK 不保留状态、不自动回传）。
+// 只进 Sink；帧内 ts 来自当次 Identity.Turn.State（SDK 不保留状态、不自动回传）。
 func TestWSTurnState(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderTurnState, "st-1")
@@ -624,6 +624,6 @@ func TestWSTurnState(t *testing.T) {
 		t.Fatalf("Recv: %v", err)
 	}
 	if v := gjson.GetBytes(ev, "client_metadata.x-codex-turn-state").String(); v != "st-req" {
-		t.Fatalf("帧内 x-codex-turn-state = %q, 期望 st-req（Identity.TurnState）", v)
+		t.Fatalf("帧内 x-codex-turn-state = %q, 期望 st-req（Identity.Turn.State）", v)
 	}
 }

@@ -268,8 +268,8 @@ func replaceXMLElement(value, name, replacement string) string {
 // Session 是会话级标识（真实 codex 客户端 WS 握手恒带
 // x-client-request-id / session-id / thread-id / x-codex-window-id）。
 // 会话内稳定，新会话换新值（UUIDv7，见 NewUUIDv7）。经 Identity.Session
-// 注入握手头，并补齐帧内 client_metadata 的 session_id / thread_id /
-// x-codex-window-id（Identity.Meta 中同 key 优先）。
+// 注入握手头，并写入帧内 client_metadata 的 session_id / thread_id /
+// x-codex-window-id（client_metadata 全部由 Identity 合成，客户端自带的整体丢弃）。
 type Session struct {
 	SessionID       string // 头 session-id / metadata session_id
 	ThreadID        string // 头 thread-id / metadata thread_id

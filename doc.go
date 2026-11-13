@@ -105,8 +105,10 @@
 //   - HTTP /responses 请求体 zstd 压缩：编码器（WithLowerEncoderMem，单个约
 //     3.7MB，输出字节与默认编码器相同）放在容量 = GOMAXPROCS 的有界空闲列表里复用：
 //     列表空时临时新建，满时多余的丢弃，常驻不超过 GOMAXPROCS 个；放回前 Reset(nil)
-//     断开对输出缓冲的引用。每次 Reset → Write → Flush → Close（帧头与官方一致
-//     28b52ffd0058）
+//     断开对输出缓冲的引用。空闲列表里的编码器不随 GC 释放：常驻量 = 历史峰值
+//     并发（上限 GOMAXPROCS）× 约 3.7MB，满载时 20 核约 75MB；突发并发超出上限的
+//     部分临时新建、用完交给 GC（瞬时峰值仍随并发数增长）。每次 Reset → Write →
+//     Flush → Close（帧头与官方一致 28b52ffd0058）
 //   - 请求体的前置条件：StreamBody / Stream / Responses / Client.Send、
 //     AnalyzeConversationInput 与 RewriteEnvironmentContextTime 用 gjson 校验 JSON，
 //     它是递归实现、不设深度上限，也不做 UTF-8 全量检查（不为此再扫一遍整包）。
@@ -176,7 +178,8 @@
 //     additional_tools 项（按官方分组规则，Chat Completions 风格先拍平）。
 //   - WS→WS：插入项（指令消息、工具项）按连接去重——带 previous_response_id 的
 //     增量帧与本连接上次插入的内容相同时只删顶层 instructions / tools、不再插入；
-//     不同则插入并计入 ShapeStats.IncrementalReinjects。
+//     不同则插入，并在本连接此前已有插入记录时计入 ShapeStats.IncrementalReinjects
+//     （连接上的第一次插入不计）。
 //   - client_metadata 与 x-codex-turn-metadata 全部由 Identity 合成（客户端自带的
 //     整个丢弃，其中的 sandbox / workspaces 也不取）：client_metadata 键序每次随机
 //     （官方是 HashMap），turn-metadata 固定键序、纯 ASCII，sandbox 恒为 none、

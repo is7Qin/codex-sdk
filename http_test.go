@@ -301,7 +301,7 @@ func TestHTTPConnectionReuse(t *testing.T) {
 	}
 }
 
-// TestHTTPTurnStateIdentityHeader：HTTP 面请求侧 ts 只来自 Identity.TurnState，
+// TestHTTPTurnStateIdentityHeader：HTTP 面请求侧 ts 只来自 Identity.Turn.State，
 // 响应头签发值只回调 Identity.Sink（Do 不接收 Identity，也不暴露 ts）。
 func TestHTTPTurnStateIdentityHeader(t *testing.T) {
 	var gotEcho atomic.Value // string：上游看到的请求头
@@ -332,7 +332,7 @@ func TestHTTPTurnStateIdentityHeader(t *testing.T) {
 		t.Fatalf("匿名请求不应携带 x-codex-turn-state, got %q", got)
 	}
 
-	// (b) 每请求身份：同一 client 两次不同 Identity.TurnState，各自进请求头；
+	// (b) 每请求身份：同一 client 两次不同 Identity.Turn.State，各自进请求头；
 	// 响应头签发值进入各自 Sink。
 	var sink1, sink2 turnStateSink
 	stream(identityFor("t-ts", "t-ts:0", "ts-req-1", &sink1))
@@ -352,7 +352,7 @@ func TestHTTPTurnStateIdentityHeader(t *testing.T) {
 	// (c) 下一次不带 ts ⇒ 不重放上一轮值。
 	stream(Identity{})
 	if got := echo(); got != "" {
-		t.Fatalf("未带 Identity.TurnState 时不得重放旧值, got %q", got)
+		t.Fatalf("未带 Identity.Turn.State 时不得重放旧值, got %q", got)
 	}
 }
 

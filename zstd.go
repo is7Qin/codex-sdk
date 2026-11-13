@@ -34,7 +34,7 @@ func newZstdEncoder() *zstd.Encoder {
 // 不用 sync.Pool：单个编码器带窗口与哈希表（约 3.7MB），sync.Pool 不设上限，
 // 突发并发会让堆按"并发数 × 编码器"上涨，GC 后又整体清空重建。这里空闲列表
 // 有上限：列表空时临时新建，用完放回；列表满时多余的直接丢弃（交给 GC）。
-// 常驻内存因此不超过 GOMAXPROCS 个编码器。
+// 常驻内存因此不超过 GOMAXPROCS 个编码器——但它们不随 GC 释放（20 核约 75MB）。
 var zstdIdle = make(chan *zstd.Encoder, max(1, runtime.GOMAXPROCS(0)))
 
 func getZstdEncoder() *zstd.Encoder {

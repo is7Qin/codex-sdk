@@ -12,7 +12,8 @@ type ShapeStats struct {
 	DualToolSources       int64 // input 已有 additional_tools 而顶层 tools 被丢弃的请求数
 	UnknownModels         int64 // 模型表外的请求数
 	// IncrementalReinjects 是 WS→WS 带 previous_response_id 的增量帧因指令/工具
-	// 插入项与本连接上次不同而重新插入的次数（相同则不插，不计）。
+	// 插入项与本连接上次不同而重新插入的次数（相同则不插，不计；连接上此前没有
+	// 插入记录时的第一次插入也不计）。
 	IncrementalReinjects int64
 }
 

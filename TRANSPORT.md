@@ -302,11 +302,14 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   不再引用它，首帧不随连接常驻。
 - **WS→WS 插入项去重**：连接记下上次实际插入的指令/工具项哈希；带
   `previous_response_id` 的增量帧哈希相同则只删顶层 `instructions` / `tools`、
-  不再插入，不同则插入并计入 `ShapeStats.IncrementalReinjects`。哈希只在 WS→WS
+  不再插入，不同则插入；本连接此前已有插入记录时计入
+  `ShapeStats.IncrementalReinjects`（连接上的第一次插入不计）。哈希只在 WS→WS
   计算。
 - **zstd 编码器**：容量 = `GOMAXPROCS` 的有界空闲列表（不是 `sync.Pool`）；单个
   编码器约 3.7MB（`WithLowerEncoderMem`，输出字节与默认编码器相同），并发超过
-  上限时临时新建、用完丢弃。
+  上限时临时新建、用完丢弃。空闲编码器不随 GC 释放：常驻量 = 历史峰值并发（上限
+  `GOMAXPROCS`）× 约 3.7MB（20 核约 75MB，实测两轮 GC 后 HeapInuse 净增 75.6MB）；
+  突发期间的瞬时峰值仍随并发数增长（64 并发约 +237MB）。
 - **转发到拨号的选项**：`WithTransport` / `WithHeader`（保留键在构造期 panic；
   Go 管理的头 Host / Content-Length / Transfer-Encoding / Connection /
   Accept-Encoding / TE / Trailer / Upgrade / User-Agent 保持规范写法交给 Go）/
