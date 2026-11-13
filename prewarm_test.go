@@ -796,7 +796,11 @@ func TestPrewarmFailure(t *testing.T) {
 			})
 			go func() {
 				defer close(finished)
-				resp, err := hc.StreamBody(context.Background(), payload, prewarmIdentity("thread-pw-redial", &sink))
+				// 带超时：回归（重拨挂住/不放行）时请求 goroutine 快速结束，
+				// 而不是让 Cleanup 一直等到 300s 空闲超时。
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				resp, err := hc.StreamBody(ctx, payload, prewarmIdentity("thread-pw-redial", &sink))
 				if err != nil {
 					rerr = err
 					return
