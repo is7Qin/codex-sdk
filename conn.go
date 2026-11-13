@@ -290,13 +290,20 @@ func (c *conn) write(ctx context.Context, wire []byte) error {
 // wire[off:off+13]（x-codex-ws-stream-request-start-ms 的数字；off<0 不覆写，
 // 零分配）。在写闸上排队的时间因此不会算进"发送时刻"之前。
 func (c *conn) writeStamped(ctx context.Context, wire []byte, off int) error {
-	return c.writeStampedThen(ctx, wire, off, nil)
+	return c.writeGated(ctx, wire, off, nil)
 }
 
-// writeStampedThen 同 writeStamped；写成功后在仍持有写闸时调用 after（nil =
-// 不调用）。WS→WS 会话用它按线上顺序登记"本帧身份"（并发 Send 时 FIFO 顺序与
-// 帧的写出顺序一致）。after 不得阻塞。
-func (c *conn) writeStampedThen(ctx context.Context, wire []byte, off int, after func()) error {
+// gatedWrite 是在写闸内、围绕 ws.Write 执行的登记（WS→WS 会话按线上顺序登记
+// "本帧身份"）。两个方法都不得阻塞。
+type gatedWrite interface {
+	beforeWrite() // 取得写闸、确认连接未终止之后，ws.Write 之前
+	writeFailed() // ws.Write 失败时（仍持写闸），撤销 beforeWrite 的登记
+}
+
+// writeGated 同 writeStamped；g 非 nil 时在写闸内、写帧之前调用 g.beforeWrite，
+// 写失败时在写闸内调用 g.writeFailed。登记先于写出，上游再快的回帧也不会先于
+// 登记到达；写闸串行化，登记顺序即帧在线上的顺序。
+func (c *conn) writeGated(ctx context.Context, wire []byte, off int, g gatedWrite) error {
 	if cause := c.err(); cause != nil {
 		return cause
 	}
@@ -310,15 +317,18 @@ func (c *conn) writeStampedThen(ctx context.Context, wire []byte, off int, after
 	if cause := c.err(); cause != nil {
 		return cause
 	}
+	if g != nil {
+		g.beforeWrite()
+	}
 	if hook := writeStampHook.Load(); hook != nil {
 		(*hook)()
 	}
 	stampStartMs(wire, off, time.Now())
 	if err := c.ws.Write(ctx, coderws.MessageText, wire); err != nil {
+		if g != nil {
+			g.writeFailed()
+		}
 		return err
-	}
-	if after != nil {
-		after()
 	}
 	return nil
 }

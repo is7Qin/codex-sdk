@@ -2,9 +2,14 @@ package codexsdk
 
 import (
 	"context"
+	"errors"
+	"net"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,6 +182,9 @@ func TestWSConversationFrames(t *testing.T) {
 	t.Run("FullFrameOpensTurnIncrementalCarriesFirstTS", func(t *testing.T) {
 		book := newTestBook(NewMemoryConversationStore(), nil)
 		up := newTSUpstream(t, func(i int, _ []byte) []string {
+			if i == 0 {
+				return respondTurn("r0", "") // 预热不回 ts（预热 ts 的带入见 PrewarmTSCarriedIntoNewTurn）
+			}
 			return respondTurn("r"+strconv.Itoa(i), "ts-"+strconv.Itoa(i))
 		})
 		c := dialConversationClient(t, up, book, wsPrewarmFrame)
@@ -260,6 +268,76 @@ func TestWSConversationFrames(t *testing.T) {
 		}
 	})
 
+	// 客户端预热帧拿到的 ts 存进连接快照；随后本连接新开的一轮没有同 owner 的
+	// ts 时带上它（官方抓包 log169b-tui seq35：预热后的第一帧带预热响应给的 ts）。
+	t.Run("PrewarmTSCarriedIntoNewTurn", func(t *testing.T) {
+		prewarmFirst := func(t *testing.T) (*ConversationBook, *tsUpstream, *Client) {
+			book := newTestBook(NewMemoryConversationStore(), nil)
+			up := newTSUpstream(t, func(i int, _ []byte) []string {
+				if i == 0 {
+					return respondTurn("r0", "ts-pw")
+				}
+				return respondTurn("r"+strconv.Itoa(i), "ts-"+strconv.Itoa(i))
+			})
+			c := dialConversationClient(t, up, book, wsPrewarmFrame)
+			mustSend(t, c, wsPrewarmFrame)
+			recvUntil(t, c, 1)
+			if got := c.conv.state.Load().prewarmTS; got != "ts-pw" {
+				t.Fatalf("预热 ts 未进连接快照: %q", got)
+			}
+			return book, up, c
+		}
+		t.Run("IncrementalNewTurn", func(t *testing.T) {
+			book, up, c := prewarmFirst(t)
+			mustSend(t, c, wsNewUserIncr) // 官方形态：previous_response_id = 预热 id，新用户消息
+			recvUntil(t, c, 1)
+			mustSend(t, c, wsFollowIncr)
+			recvUntil(t, c, 1)
+			mustSend(t, c, wsNewUserIncr) // 再开一轮：预热 ts 只用一次
+			up.waitFrames(t, 4)
+			fs := up.sentFrames(t)
+			if frameTurnState(t, fs[1]) != "ts-pw" || frameTurnState(t, fs[2]) != "ts-pw" {
+				t.Fatalf("预热后新轮应带预热 ts（同轮首值）: %q %q", frameTurnState(t, fs[1]), frameTurnState(t, fs[2]))
+			}
+			if frameTurnID(t, fs[2]) != frameTurnID(t, fs[1]) || frameTurnState(t, fs[3]) != "" {
+				t.Fatalf("预热 ts 不应带入下一轮: turn=%q/%q ts=%q", frameTurnID(t, fs[2]), frameTurnID(t, fs[1]), frameTurnState(t, fs[3]))
+			}
+			if len(book.queue) != 0 {
+				t.Fatalf("连接内新轮不写存储: queue=%d", len(book.queue))
+			}
+		})
+		t.Run("FullFrameNewTurn", func(t *testing.T) {
+			book, up, c := prewarmFirst(t)
+			mustSend(t, c, wsFullFrame) // 经 Prepare 开轮，会话簿记录里没有 ts
+			recvUntil(t, c, 1)
+			mustSend(t, c, wsFollowIncr)
+			up.waitFrames(t, 3)
+			fs := up.sentFrames(t)
+			if frameTurnState(t, fs[1]) != "ts-pw" || frameTurnState(t, fs[2]) != "ts-pw" {
+				t.Fatalf("全量新轮应带预热 ts: %q %q", frameTurnState(t, fs[1]), frameTurnState(t, fs[2]))
+			}
+			// 会话簿开的轮次：预热 ts 也记进会话簿（跨副本后续请求带同一个 ts）。
+			id := book.Prepare(bgctx, ConversationRequest{Key: wsConvKey, Owner: ownerA, Input: AnalyzeConversationInput([]byte(followPayload))})
+			if id.Turn.ID != frameTurnID(t, fs[1]) || id.Turn.State != "ts-pw" {
+				t.Fatalf("会话簿 = %+v, 期望轮次 %q 带 ts-pw", id.Turn, frameTurnID(t, fs[1]))
+			}
+		})
+		t.Run("BookTSWins", func(t *testing.T) {
+			// 会话簿记录里已有同 owner 的 ts（另一连接拿到的）：用记录里的，不用预热 ts。
+			book, up, c := prewarmFirst(t)
+			id := book.Prepare(bgctx, ConversationRequest{Key: wsConvKey, Owner: ownerA, Input: AnalyzeConversationInput([]byte(turnPayload))})
+			id.Sink.SetTurnState("ts-book")
+			mustSend(t, c, wsFullFrame)
+			up.waitFrames(t, 2)
+			if got := frameTurnState(t, up.sentFrames(t)[1]); got != "ts-book" {
+				t.Fatalf("会话簿已有 ts 时应带它: %q", got)
+			}
+			if c.conv.state.Load().prewarmTS != "ts-pw" {
+				t.Fatal("未用掉的预热 ts 应保留")
+			}
+		})
+	})
+
 	t.Run("PrewarmThenFollowupIncrementalIsTemporary", func(t *testing.T) {
 		book := newTestBook(NewMemoryConversationStore(), nil)
 		up := newTSUpstream(t, nil)
@@ -327,26 +405,115 @@ func TestWSConversationFrames(t *testing.T) {
 	})
 
 	t.Run("MidStreamErrorDoesNotPop", func(t *testing.T) {
+		// 帧 0 已绑定（created 到达）尚未结束时帧 1 写出，FIFO 里有帧 1 的身份；
+		// 这时帧 0 的流中途 error 不得弹走它，帧 1 的 ts 仍归帧 1 的轮次。
 		book := newTestBook(NewMemoryConversationStore(), nil)
 		up := newTSUpstream(t, func(i int, _ []byte) []string {
-			if i == 0 {
-				return []string{tsCreatedFrame("r0"), `{"type":"error","status":500,"error":{"message":"boom"}}`}
+			switch i {
+			case 0:
+				return []string{tsCreatedFrame("r0")}
+			case 1:
+				return append([]string{`{"type":"error","status":500,"error":{"message":"boom"}}`}, respondTurn("r1", "ts-1")...)
 			}
-			return respondTurn("r"+strconv.Itoa(i), "ts-"+strconv.Itoa(i))
+			return nil
 		})
 		c := dialConversationClient(t, up, book, wsFullFrame)
 		mustSend(t, c, wsFullFrame)
-		recvUntil(t, c, 1)
-		mustSend(t, c, wsNewUserIncr)
-		recvUntil(t, c, 1)
+		mustSend(t, c, wsNewUserIncr) // 连接内新轮；身份入 FIFO 后上游才回 error
+		recvUntil(t, c, 2)            // error + 帧 1 的 completed
 		if n := len(c.conv.fifo); n != 0 {
 			t.Fatalf("FIFO 残留 %d", n)
 		}
 		mustSend(t, c, wsFollowIncr)
 		up.waitFrames(t, 3)
 		fs := up.sentFrames(t)
-		if frameTurnState(t, fs[2]) != "ts-1" {
-			t.Fatalf("流中途 error 不得弹 FIFO: ts=%q", frameTurnState(t, fs[2]))
+		if frameTurnID(t, fs[2]) != frameTurnID(t, fs[1]) || frameTurnState(t, fs[2]) != "ts-1" {
+			t.Fatalf("流中途 error 不得弹 FIFO: turn=%q/%q ts=%q", frameTurnID(t, fs[2]), frameTurnID(t, fs[1]), frameTurnState(t, fs[2]))
+		}
+	})
+
+	// 上游在帧写出的瞬间就回完整响应（created、metadata、completed），写方还没
+	// 从 ws.Write 返回：测试连接在帧 1 的字节交给内核之后、Write 返回之前停住，
+	// 直到 Recv 处理完整个响应。本帧身份与快照都在写闸内、写帧之前登记，ts 归属
+	// 正确（任何"写后登记"的实现都会把 created 绑到空身份上）。
+	t.Run("CreatedBeforeWriteReturns", func(t *testing.T) {
+		book := newTestBook(NewMemoryConversationStore(), nil)
+		up := newTSUpstream(t, func(i int, _ []byte) []string {
+			return respondTurn("r"+strconv.Itoa(i), "ts-"+strconv.Itoa(i))
+		})
+		tr := newStallTransport(t, up.srv.URL)
+		c, err := Dial(context.Background(), PAT("pat-conv"), Identity{}, WithTransport(tr),
+			WithConversation(book, ConversationRequest{Key: wsConvKey, InstallationID: "inst-ws", Owner: ownerA}, []byte(wsFullFrame)))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.CloseNow() })
+		mustSend(t, c, wsFullFrame)
+		recvUntil(t, c, 1)
+
+		seen := make(chan struct{}) // Recv 已处理完帧 1 的整个响应
+		done := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			for {
+				data, err := c.Recv(ctx)
+				if err != nil {
+					done <- err
+					return
+				}
+				if gjson.GetBytes(data, "type").String() == responseEventCompleted {
+					close(seen)
+					done <- nil
+					return
+				}
+			}
+		}()
+		tr.stallNext(seen)
+		mustSend(t, c, wsNewUserIncr) // 连接内新轮：ts 只进连接快照
+		if err := <-done; err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if !tr.stalled.Load() {
+			t.Fatal("写帧未在 Write 返回前停住（测试无效）")
+		}
+		mustSend(t, c, wsFollowIncr)
+		up.waitFrames(t, 3)
+		fs := up.sentFrames(t)
+		if frameTurnID(t, fs[2]) != frameTurnID(t, fs[1]) || frameTurnState(t, fs[2]) != "ts-1" {
+			t.Fatalf("极快 created 下 ts 归属错位: turn=%q/%q ts=%q", frameTurnID(t, fs[2]), frameTurnID(t, fs[1]), frameTurnState(t, fs[2]))
+		}
+		if st := book.Stats(); st.WSLateTurnStates != 0 {
+			t.Fatalf("不应有迟到 ts: %+v", st)
+		}
+	})
+
+	// 写闸内写帧失败：本帧身份撤销（pop 跳过）、快照换回。
+	t.Run("WriteFailureInsideGateRollsBack", func(t *testing.T) {
+		book := newTestBook(NewMemoryConversationStore(), nil)
+		up := newTSUpstream(t, nil)
+		tr := newStallTransport(t, up.srv.URL)
+		c, err := Dial(context.Background(), PAT("pat-conv"), Identity{}, WithTransport(tr),
+			WithConversation(book, ConversationRequest{Key: wsConvKey, InstallationID: "inst-ws", Owner: ownerA}, []byte(wsFullFrame)))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.CloseNow() })
+		mustSend(t, c, wsFullFrame)
+		up.waitFrames(t, 1)
+		before := c.conv.state.Load()
+		tr.failNext.Store(true) // 已登记、网络写失败
+		if err := c.Send(context.Background(), []byte(wsNewUserIncr)); err == nil {
+			t.Fatal("写帧应失败")
+		}
+		if c.conv.state.Load() != before {
+			t.Fatal("写失败应换回原快照")
+		}
+		if f := c.conv.pop(); f == nil || f.turnID != before.turn.ID {
+			t.Fatalf("FIFO 头应是帧 0 的身份: %+v", f)
+		}
+		if f := c.conv.pop(); f != nil {
+			t.Fatalf("写失败的身份应已撤销: %+v", f)
 		}
 	})
 
@@ -506,4 +673,64 @@ func TestWSConversationClientValuesNeverEgress(t *testing.T) {
 			}
 		}
 	}
+}
+
+// stallTransport 把请求改写到测试服务器，并能让下一次网络写在字节交给内核之后、
+// Write 返回之前停住（直到给定通道关闭）：模拟"帧已上线、写方尚未返回"时上游
+// 立即回包。
+type stallTransport struct {
+	srv      *url.URL
+	rt       *http.Transport
+	gate     atomic.Pointer[chan struct{}]
+	failNext atomic.Bool // 下一次网络写直接失败
+	stalled  atomic.Bool // 确实停住过、且等到了通道关闭
+}
+
+func newStallTransport(t *testing.T, srvBase string) *stallTransport {
+	t.Helper()
+	u, err := url.Parse(srvBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &stallTransport{srv: u}
+	var d net.Dialer
+	st.rt = &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		cn, err := d.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &stallConn{Conn: cn, st: st}, nil
+	}}
+	t.Cleanup(st.rt.CloseIdleConnections)
+	return st
+}
+
+func (st *stallTransport) stallNext(until chan struct{}) { st.gate.Store(&until) }
+
+func (st *stallTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	u := *req.URL
+	u.Scheme, u.Host = st.srv.Scheme, st.srv.Host
+	clone.URL = &u
+	return st.rt.RoundTrip(clone)
+}
+
+type stallConn struct {
+	net.Conn
+	st *stallTransport
+}
+
+func (c *stallConn) Write(p []byte) (int, error) {
+	if c.st.failNext.CompareAndSwap(true, false) {
+		return 0, errors.New("stallConn: write failed")
+	}
+	n, err := c.Conn.Write(p)
+	if g := c.st.gate.Swap(nil); g != nil {
+		select {
+		case <-*g:
+			c.st.stalled.Store(true)
+		case <-time.After(5 * time.Second):
+		}
+	}
+	return n, err
 }
