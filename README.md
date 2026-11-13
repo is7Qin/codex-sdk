@@ -147,13 +147,21 @@ A follow-up request served by the replica that saw the turn touches the store
 zero times; on another replica it costs exactly one `Load`. Store calls have a
 30ms budget and a 5-failures/5-seconds circuit breaker. `redisstore` uses only
 `redis.Scripter` (Lua via `EVALSHA`, falling back to `EVAL` on `NOSCRIPT`) and
-supports single-node Redis only.
+supports single-node Redis only; go-redis clients must set
+`ContextTimeoutEnabled: true` (otherwise `redisstore.New` panics, because the
+30ms budget would not apply). If the store stays slower than the 2s flush
+budget, the bounded write queue fills up and new writes (including captured
+turn-state) are dropped and counted (`QueueDrops`).
 
 For WS→WS, `Dial(ctx, auth, codexsdk.Identity{}, codexsdk.WithConversation(book, req, first))`
 synthesizes identity per frame (mutually exclusive with `WithFirstFrame`; the
 `Identity` argument must be zero). Full frames go through `Prepare`,
-incremental frames continue or open turns locally, and upstream turn-state is
-attributed to the frame that produced each `response.created`.
+incremental frames continue or open turns locally (an incremental first frame
+first resolves the conversation record), turn-state captured by a client
+prewarm frame is carried into the next turn opened on the connection, and
+upstream turn-state is attributed to the frame that produced each
+`response.created` (each frame's identity is registered under the write gate
+before the frame is written).
 
 For the full API reference, see the package documentation in
 [doc.go](./doc.go).

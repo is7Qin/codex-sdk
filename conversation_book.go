@@ -280,7 +280,8 @@ func (b *ConversationBook) prepare(ctx context.Context, req ConversationRequest)
 }
 
 // prepareConversation 只取对话记录（缓存或 Open），不碰轮次：WS→WS 客户端预热
-// 首帧用。失败降级为不进缓存的一次性对话记录。
+// 首帧与增量首帧用。失败降级为不进缓存的一次性对话记录（与命中无法区分；该连接
+// 随后的全量帧会重新 Prepare，可能换成真实线程号——降级本就不保证一致）。
 func (b *ConversationBook) prepareConversation(ctx context.Context, req ConversationRequest) *convEntry {
 	now := req.Now
 	if now.IsZero() {
@@ -299,7 +300,8 @@ func (b *ConversationBook) prepareConversation(ctx context.Context, req Conversa
 	return b.mergeConv(req.Key, rec, nowMs, true)
 }
 
-// oneShot 是降级身份：新线程、窗口 0、新轮次、Sink 为 nil；不进缓存。
+// oneShot 是降级身份：新线程、窗口 0、新轮次、Sink 为 nil；不进缓存。First 为
+// !FollowUp()（按请求本身判断，不因换了线程而恒为 true）。
 func (b *ConversationBook) oneShot(req ConversationRequest, now time.Time, first bool) Identity {
 	b.stats.oneShot.Add(1)
 	thread := NewUUIDv7()
@@ -584,7 +586,8 @@ func (s *bookSink) SetTurnState(v string) {
 // Flush 排空写入队列（本次调用开始时的长度），按 256 一批调 SaveTurns（每批
 // 预算 2s），用返回值回填本地缓存；距上次清扫 ≥30s 时顺带清扫本地缓存。调用方
 // worker 每 50ms 调一次；同一时刻只应有一个 Flush 在跑。返回各批失败的合并错误
-// （失败的批次已丢弃并计数）。
+// （失败的批次已丢弃并计数）。2s 是每批预算：队列满（8192 = 32 批）且存储持续
+// 卡住时一次 Flush 最坏约 64s，调用方可用 ctx 给整次 Flush 设上限（ctx 取消即停）。
 func (b *ConversationBook) Flush(ctx context.Context) error {
 	n := len(b.queue)
 	var errs error
@@ -731,12 +734,12 @@ type ConversationStats struct {
 	SaveTurnsCalls    int64
 	SaveTurnsFailures int64 // 整批失败数
 	SaveItemFailures  int64 // 单条失败数（TurnResult.OK=false）
-	TurnStateIgnored  int64 // ts 首值已生效（同 owner）或轮次号不符而被忽略的次数
+	TurnStateIgnored  int64 // 被丢弃的 SetTurnState 次数（该轮已有同 owner 的 ts，或本地轮次号已不同）
 
 	WSUntrackedConnections int64 // WS FIFO 满、整条连接停止捕获 ts 的次数
-	WSIncrementalInjects   int64 // WS 增量帧因指令/工具变化而重新插入的次数
+	WSIncrementalInjects   int64 // WS 增量帧因指令/工具变化而"重新插入"的次数（连接上的第一次插入不计）
 	WSLocalTemporaryTurns  int64 // WS 增量后续帧在连接内无当前轮次时的临时轮次数
-	WSLateTurnStates       int64 // 迟到的旧轮 ts（连接快照已换轮，不更新快照）
+	WSLateTurnStates       int64 // 迟到的旧轮 ts（连接快照已换轮，不更新快照；含客户端在响应结束前就开新轮的正常情形）
 
 	Sweeps       int64
 	SweepDeleted int64 // 清扫删除条数（TTL + 容量）

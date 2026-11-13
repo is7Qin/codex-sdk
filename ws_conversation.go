@@ -59,8 +59,8 @@ const (
 
 // wsConvState 是连接的会话快照（不可变，整体替换）。
 type wsConvState struct {
-	conv    *convEntry
-	turn    Turn // ID / StartedAtMs / First（State 见 ts）
+	conv    *convEntry // 快照时刻的对话条目：Flush 回填不追（下一次全量帧 Prepare 时更新）
+	turn    Turn       // ID / StartedAtMs / First（State 见 ts）
 	source  wsTurnSource
 	sink    TurnStateSink // 会话簿 Sink（source==turnSourceBook；nil = 丢弃）
 	ts      string
@@ -152,6 +152,7 @@ func (cv *wsConversation) prepareFrame(ctx context.Context, p *parsedRequest, cu
 		if cur.turn.ID != "" {
 			return cur
 		}
+		// 临时轮次 First=false：它不是一轮的第一个请求，而是查不到当前轮次的后续请求。
 		cv.book.stats.wsLocalTemporary.Add(1)
 		ns := *cur
 		ns.turn = Turn{ID: NewUUIDv7(), StartedAtMs: now.UnixMilli()}
@@ -393,6 +394,7 @@ func (cv *wsConversation) observe(raw []byte) {
 		if !cv.open {
 			cv.pop() // 该 create 被上游拒绝，不会再有 created
 		}
+		// error 一律结束当前绑定（该 response 若还有迟到的 metadata 则丢弃，不会写错 ts）。
 		cv.bound, cv.boundID, cv.open = nil, "", false
 	case bytes.HasSuffix(typ, metadataEventSuffix):
 		if cv.bound == nil || !bytes.Contains(raw, turnStateHeaderKey) {

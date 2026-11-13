@@ -304,23 +304,32 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   不再引用它，首帧不随连接常驻。
 - **WS→WS 会话（`WithConversation`）**：身份由会话簿逐帧合成（`Dial` 的 `id` 必须为
   零值，与 `WithFirstFrame` 互斥，构造期 panic）。首帧在 `Dial` 时算一次：
-  `generate:false` 只取对话记录（握手 prewarm 形态），否则 `Prepare`（turn 形态）；首次
+  `generate:false` 只取对话记录（握手 prewarm 形态）；带 `previous_response_id` 的增量首帧
+  先取对话记录、再按增量帧规则定轮次；否则 `Prepare`（turn 形态）；首次
   `Send` 复用，不再 `Prepare`。之后：`generate:false` 帧不开轮；不带
   `previous_response_id` 的全量帧 `Prepare`；增量帧以工具输出结尾 → 沿用当前轮次（没有
   则连接内临时轮次，计数），否则连接内开新轮（不读不写存储），ts 取连接快照。连接状态
-  是 `atomic.Pointer` 不可变快照。写帧成功后（仍持写闸，FIFO 顺序 = 线上顺序）"本帧
-  身份"进容量 16 的 FIFO；`Recv`：`response.created` 取最早一份绑定，
+  是 `atomic.Pointer` 不可变快照。客户端预热帧拿到的 ts 存进快照，随后本连接新开的一轮
+  （全量帧经 `Prepare` 或增量帧连接内开轮）没有同 owner 的 ts 时带上它（只用一次；会话簿
+  开的轮次同时交给会话簿 Sink；官方抓包 log169b-tui seq35）。在写闸内、写帧**之前**
+  发布快照并把"本帧身份"压入容量 16 的 FIFO（FIFO 顺序 = 线上顺序，上游再快的
+  `response.created` 也不会先于登记到达；写失败在闸内撤销：FIFO 条目标记撤销、快照换回，
+  无让出等待）；`Recv`：`response.created` 取最早一份绑定，
   completed/failed/incomplete 清除绑定；没有已绑定 response 时的 `error` 弹掉一份（该
   create 被拒），流中途的 `error` 只结束绑定；`response.metadata` 只交给 id 匹配的身份：
   快照当前轮次号相同且 ts 空或 owner 不同时 CAS 写入，轮次已换则计数（迟到），会话簿
   开的轮次无论如何再交给会话簿 Sink。FIFO 满 ⇒ 整条连接停止捕获 ts（计数）。
-  `response.created` 到达而 FIFO 为空、且有 `Send` 正在写时，`Recv` 短暂让出等入队
-  （写成功与入队之间只隔几条指令）。
+  并发 `Send` 时各帧的轮次推进顺序不保证（快照在写闸外计算），调用方应串行 `Send`；
+  `Dial` 先做一次会话簿查询（Load/Open/Advance 各 ≤30ms），存储慢时推迟拨号。
+- **会话簿写入积压**：`Flush` 每批 `SaveTurns` 预算 2s（最坏一次 `Flush` 32 批 × 2s）；
+  存储持续 >2s 时写入队列（8192）会满，新的写入（含上游 ts）丢弃并计 `QueueDrops`，
+  跨副本表现为丢 ts（下一轮重新拿）。`redisstore` 要求 go-redis 客户端开启
+  `ContextTimeoutEnabled`（否则 30ms 预算失效，`New` panic）。
 - **WS→WS 插入项去重**：连接记下上次实际插入的指令/工具项哈希；带
   `previous_response_id` 的增量帧哈希相同则只删顶层 `instructions` / `tools`、
   不再插入，不同则插入；本连接此前已有插入记录时计入
   `ShapeStats.IncrementalReinjects`（连接上的第一次插入不计；会话连接另计入
-  `ConversationStats.WSIncrementalInjects`）。哈希只在 WS→WS 计算。
+  `ConversationStats.WSIncrementalInjects`，口径相同：只计"重新插入"）。哈希只在 WS→WS 计算。
 - **zstd 编码器**：容量 = `GOMAXPROCS` 的有界空闲列表（不是 `sync.Pool`）；单个
   编码器约 3.7MB（`WithLowerEncoderMem`，输出字节与默认编码器相同），并发超过
   上限时临时新建、用完丢弃。空闲编码器不随 GC 释放：常驻量 = 历史峰值并发（上限

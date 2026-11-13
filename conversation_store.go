@@ -100,7 +100,8 @@ const (
 
 // NewMemoryConversationStore 返回进程内的 ConversationStore（单进程部署与测试
 // 用；多副本必须用共享存储，如 redisstore）。过期按访问惰性判定，另在
-// SaveTurns 中每分钟至多一次清掉已过期条目。
+// SaveTurns 中每分钟至多一次清掉已过期条目（没有容量上限；只读不写时过期条目
+// 不会被清，单进程部署也应让 worker 定期 Flush）。
 func NewMemoryConversationStore() ConversationStore { return newMemoryStore(time.Now) }
 
 // memoryStore 是无锁实现：两个 sync.Map，值为不可变条目指针，用

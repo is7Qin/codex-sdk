@@ -209,8 +209,12 @@
 //     新一轮的轮次记录与上游 turn-state 进有界写入队列（8192，满则丢弃计数），由
 //     调用方 worker 每 50ms 调 Flush 批量 SaveTurns（256 一批）。SDK 不起 goroutine。
 //   - 降级：Open/Advance/Load 预算 30ms；连续失败 5 次熔断 5 秒，到期半开只放一个
-//     探测。失败、超时、熔断一律降级为一次性身份（新线程、窗口 0、Sink 为 nil），
-//     不进缓存，Prepare 永不返回错误。
+//     探测。需要读存储而本地没有对应对话记录时，失败、超时、熔断降级为一次性身份
+//     （新线程、窗口 0、Sink 为 nil），不进缓存；后续请求本地已有对话记录、只是
+//     轮次未命中且 Load 失败时，沿用本地对话记录并给临时轮次（不换线程）。
+//     Prepare 永不返回错误。
+//   - 写入：Flush 每批 SaveTurns 预算 2s；存储持续变慢时写入队列会满、新的写入
+//     （含上游 turn-state）被丢弃计数（QueueDrops），跨副本会丢这些 ts。
 //   - turn-state：Sink 绑定（对话键、轮次键、轮次号、凭据 owner）；同 owner 首值
 //     生效、换 owner 覆盖；Turn.State 只在记录 owner 等于本次 owner 时带。
 //   - 本地缓存是两个 sync.Map（不可变条目指针 + 原子 lastUsed），热路径只有
@@ -221,11 +225,14 @@
 // WS→WS：Dial 的 WithConversation(book, req, first) 让连接逐帧合成身份（Dial 的 id
 // 必须为零值，与 WithFirstFrame 互斥）。首帧在 Dial 时算一次（generate:false 只取
 // 对话记录、握手为 prewarm 形态；否则 Prepare），首次 Send 复用；之后全量帧
-// Prepare，增量帧在连接内续轮或开轮（不读不写存储）。帧写成功后"本帧身份"进容量
-// 16 的 FIFO，Recv 在 response.created 时按顺序绑定（只回 error、没有 created 的帧
-// 被弹掉；FIFO 满则整条连接停止捕获 ts），response.metadata 的 ts 先按轮次号 CAS
-// 进连接快照，会话簿开的轮次再交给会话簿 Sink。Send 与 Recv 可并发。计数见
-// ConversationBook.Stats。
+// Prepare，增量帧在连接内续轮或开轮（不读不写存储；增量首帧先取对话记录）。客户端
+// 预热帧拿到的 ts 存进连接快照，随后本连接新开的一轮没有同 owner 的 ts 时带上它
+// （只用一次）。每帧在写闸内、写帧之前发布快照并把"本帧身份"压入容量 16 的
+// FIFO（写失败在闸内撤销），因此 FIFO 顺序等于线上顺序、created 不会先于登记到达；
+// Recv 在 response.created 时按顺序绑定（只回 error、没有 created 的帧被弹掉；FIFO
+// 满则整条连接停止捕获 ts），response.metadata 的 ts 先按轮次号 CAS 进连接快照，
+// 会话簿开的轮次再交给会话簿 Sink。Send 与 Recv 可并发（并发 Send 时轮次推进顺序
+// 不保证）。计数见 ConversationBook.Stats。
 //
 // WS 传输臂的连接身份 = (threadKey, readLimit)：连接是 thread 级、跨轮跨窗口
 // 复用，ts 是轮级、每请求下发。turn-state 的发现通道只有 Sink：HTTP 响应头在解析
