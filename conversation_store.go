@@ -67,7 +67,7 @@ type TurnWrite struct {
 type TurnResult struct {
 	Conv ConversationRecord
 	Turn TurnRecord
-	OK   bool // false = 本条失败；SaveTurns 返回 error 时整批失败
+	OK   bool // false = 本条失败（Conv/Turn 无意义，会话簿不回填）；SaveTurns 返回 error 时整批失败
 }
 
 // ConversationStore 是会话簿的共享存储（跨副本）。实现必须尊重 ctx 的期限：

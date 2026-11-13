@@ -22,6 +22,7 @@ type countingStore struct {
 	hold                          chan struct{} // 非 nil：Open 先等它关闭（或 ctx 结束）
 	entered                       chan struct{} // hold 时每次进入 Open 发一个信号
 	staleConv                     atomic.Bool   // SaveTurns 返回的对话记录窗口号置 0
+	failItems                     atomic.Int64  // SaveTurns 前 N 条结果 OK=false（附无意义的值）
 }
 
 func newCountingStore(inner ConversationStore) *countingStore {
@@ -89,6 +90,16 @@ func (s *countingStore) SaveTurns(ctx context.Context, batch []TurnWrite) ([]Tur
 	if err == nil && s.staleConv.Load() {
 		for i := range res {
 			res[i].Conv.WindowN = 0
+		}
+	}
+	if n := s.failItems.Swap(0); err == nil && n > 0 {
+		// 单条失败：OK=false 时其余字段无意义，这里故意填上看似更新的垃圾值，
+		// 会话簿用了就会被测出来。
+		for i := range min(int(n), len(res)) {
+			res[i] = TurnResult{
+				Conv: ConversationRecord{Thread: "garbage-thread", WindowN: 1 << 40, ContextWindowID: "garbage-win"},
+				Turn: TurnRecord{TurnID: "garbage-turn", StartedMs: 1, TS: "garbage-ts", TSOwner: ownerA},
+			}
 		}
 	}
 	return res, err
@@ -614,4 +625,34 @@ func BenchmarkBookPrepareHit(b *testing.B) {
 			_ = book.Prepare(bgctx, r)
 		}
 	})
+}
+
+// Flush 回填：TurnResult.OK=false 的条目只计数，不得回填本地缓存。
+func TestBookFlushSkipsFailedItems(t *testing.T) {
+	s := newCountingStore(NewMemoryConversationStore())
+	b := newTestBook(s, nil)
+	key := NewConversationKey("dom", 3, "flush-fail")
+	id := b.Prepare(bgctx, convReq(key, turnPayload, ownerA))
+	id.Sink.SetTurnState("ts-1")
+	if len(b.queue) != 2 {
+		t.Fatalf("写入队列 = %d", len(b.queue))
+	}
+	before := b.Stats()
+	s.failItems.Store(2)
+	mustFlush(t, b)
+	st := b.Stats()
+	if st.SaveItemFailures != 2 || st.SaveTurnsFailures != 0 {
+		t.Fatalf("单条失败计数: %+v", st)
+	}
+	if st.ConversationEntries != before.ConversationEntries || st.TurnEntries != before.TurnEntries {
+		t.Fatalf("条目数变化: %+v → %+v", before, st)
+	}
+	calls := s.calls()
+	f := b.Prepare(bgctx, convReq(key, followPayload, ownerA))
+	if s.calls() != calls {
+		t.Fatal("本地缓存应仍命中")
+	}
+	if f.Session != id.Session || f.Window != id.Window || f.Turn.ID != id.Turn.ID || f.Turn.State != "ts-1" {
+		t.Fatalf("失败条目回填了本地缓存: %+v / %+v", f, id)
+	}
 }
