@@ -36,7 +36,11 @@ channel API.
   UUIDv5 id), responses-lite `additional_tools` conversion from a static model
   table, randomized `client_metadata` key order, ASCII turn-metadata, and
   `permessage-deflate` negotiation on the WS handshake (outbound frames are not
-  compressed). Invalid bodies fail locally with `ErrInvalidRequestBody`.
+  compressed; `WithCompression` only affects negotiation). Invalid bodies
+  (non-object root, missing/empty `model` or one with control bytes, control
+  bytes in `service_tier`) fail locally with `ErrInvalidRequestBody` — no
+  request is sent and no dial happens. Request bodies must already be validated
+  by a depth-limited validator such as `encoding/json`'s `json.Valid`.
   Counters: `ShapeStatsSnapshot()`. `HTTPClient.Do` is **not** shaped and must
   not be used for Codex responses.
 - **Request-scoped identity**: `Identity` (`InstallationID`, `Session`,
@@ -114,7 +118,11 @@ with `first = !AnalyzeConversationInput(payload).FollowUp()`.
 
 For WS→WS (`Dial`), pass the first frame with `WithFirstFrame(frame)` so the
 handshake carries `x-codex-routing-hint` and the first frame's
-`x-codex-turn-metadata`. Callers should give the SDK a transport with
+`x-codex-turn-metadata`. The SDK does not copy `frame`: it must not be modified
+before the first `Send`, and is released after it. On a WS→WS connection,
+`instructions`/`tools` items are inserted once: an incremental frame (with
+`previous_response_id`) whose inserted items equal the connection's previous
+insertion only has the top-level fields removed. Callers should give the SDK a transport with
 `DisableCompression` (official clients send no `Accept-Encoding`).
 
 For the full API reference, see the package documentation in

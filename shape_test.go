@@ -99,6 +99,42 @@ func TestShapeThirdPartyRequests(t *testing.T) {
 		}
 	}
 
+	// 重复 input：只认第一次出现；被丢弃的那份不参与 lite 判定与元素计数。
+	d0 := ShapeStatsSnapshot().DuplicateKeys
+	sh = mustShape(t, []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":"a"}],"input":[{"type":"additional_tools"}]}`), surfaceHTTP, testID())
+	out = assembleHTTP(&sh)
+	if sh.lite || sh.inputItems != 1 || ShapeStatsSnapshot().DuplicateKeys != d0+1 ||
+		bytes.Contains(out, []byte("additional_tools")) || gjson.GetBytes(out, "parallel_tool_calls").Raw != "true" {
+		t.Fatalf("重复 input 不应影响 lite 判定与计数: lite=%v items=%d out=%s", sh.lite, sh.inputItems, out)
+	}
+	sh = mustShape(t, []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":"a"}],"input":[ 1 , 2 ]}`), surfaceHTTP, testID())
+	if sh.inputItems != 1 || !sh.inputCompact {
+		t.Fatalf("重复 input 不应影响元素数与紧凑标记: items=%d compact=%v", sh.inputItems, sh.inputCompact)
+	}
+
+	// model 必须是非空、不含控制字节的字符串；service_tier 非字符串丢弃、含控制
+	// 字节拒绝。三个面一致。
+	for _, s := range []surface{surfaceHTTP, surfaceWSFromHTTP, surfaceWSNative} {
+		for _, bad := range []string{
+			`{"model":"gpt\r\nX-Evil: 1","input":"hi"}`,
+			`{"model":"a\u0000","input":"hi"}`,
+			`{"model":"a\u007f"}`,
+			"{\"model\":\"a\x7f\"}",
+			`{"model":"a\tb"}`,
+			`{"model":""}`,
+			`{"model":"gpt-5.5","service_tier":"pri\nority"}`,
+			`{"model":"gpt-5.5","service_tier":"a\u001f"}`,
+		} {
+			if _, err := shapeBody([]byte(bad), s, testID(), time.Now(), shapeConfig{}); !errors.Is(err, ErrInvalidRequestBody) {
+				t.Fatalf("surface %d %s: 期望 ErrInvalidRequestBody, got %v", s, bad, err)
+			}
+		}
+	}
+	sh = mustShape(t, []byte(`{"model":"gpt-5.5","service_tier":5}`), surfaceHTTP, testID())
+	if out = assembleHTTP(&sh); gjson.GetBytes(out, "service_tier").Exists() || sh.routingHint() != "model=gpt-5.5" {
+		t.Fatalf("非字符串 service_tier 应丢弃: hint=%q out=%.120s", sh.routingHint(), out)
+	}
+
 	// 匿名：不写 client_metadata、删除 prompt_cache_key、指令消息不带 id。
 	sh = mustShape(t, []byte(`{"model":"gpt-5.5","prompt_cache_key":"k","instructions":"x","client_metadata":{"a":"b"}}`), surfaceHTTP, Identity{})
 	out = assembleHTTP(&sh)
@@ -152,12 +188,17 @@ func TestShapeLiteRules(t *testing.T) {
 	if !strings.HasPrefix(atID, "at_01a1d4d8-0000-7") {
 		t.Fatalf("lite 工具项 id = %s，期望时间戳取 Window.ContextID", atID)
 	}
-	if again := mustShape(t, []byte(req), surfaceWSFromHTTP, testID()); !bytes.Equal(again.inputPrefix[0], sh.inputPrefix[0]) || again.injectHash != sh.injectHash {
+	if again := mustShape(t, []byte(req), surfaceWSFromHTTP, testID()); !bytes.Equal(again.inputPrefix[0], sh.inputPrefix[0]) || again.injectHash() != sh.injectHash() {
 		t.Fatal("同一内容的插入项应逐字节相同")
 	}
 	instr := gjson.GetBytes(frame, "input.1")
 	if instr.Get("role").String() != "developer" || !strings.HasPrefix(instr.Get("id").String(), "msg_01a1d4d8-0000-7") {
 		t.Fatalf("lite 指令消息 = %s", instr.Raw)
+	}
+	// lite 指令消息不带 passthrough（官方 lite 的这条消息来自历史，网关不合成）。
+	if instr.Get("internal_chat_message_metadata_passthrough").Exists() ||
+		strings.Join(topKeys(t, []byte(instr.Raw)), ",") != "type,id,role,content" {
+		t.Fatalf("lite 指令消息不应带 passthrough: %s", instr.Raw)
 	}
 	for path, want := range map[string]string{
 		"parallel_tool_calls": "false",
@@ -190,6 +231,11 @@ func TestShapeLiteRules(t *testing.T) {
 		if got := gjson.GetBytes(out, path).Raw; got != want {
 			t.Fatalf("非 lite %s = %s，期望 %s", path, got, want)
 		}
+	}
+	// 非 lite 指令消息带常量 passthrough（官方每请求重建，gpt-5.5 抓包）。
+	sh = mustShape(t, []byte(`{"model":"gpt-5.5","instructions":"sys"}`), surfaceHTTP, testID())
+	if got := gjson.GetBytes(assembleHTTP(&sh), "input.0.internal_chat_message_metadata_passthrough").Raw; got != `{"content_item_kinds":["model.base_instructions"]}` {
+		t.Fatalf("非 lite 指令消息 passthrough = %s", got)
 	}
 	// 非 lite 没有 tools：官方恒写 tools（空数组）。
 	sh = mustShape(t, []byte(`{"model":"gpt-5.5"}`), surfaceHTTP, testID())

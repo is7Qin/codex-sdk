@@ -102,8 +102,18 @@
 //     （3.7KB 体约 20–30µs / 11 allocs，84KB 官方体整形 + zstd 约 0.8ms）。
 //     含 <environment_context> 的请求先改写值内时间文本（线性扫描，只解码含标签
 //     的字符串）
-//   - HTTP /responses 请求体 zstd 压缩：编码器经 sync.Pool 复用，每次
-//     Reset → Write → Flush → Close（帧头与官方一致 28b52ffd0058）
+//   - HTTP /responses 请求体 zstd 压缩：编码器（WithLowerEncoderMem，单个约
+//     3.7MB，输出字节与默认编码器相同）放在容量 = GOMAXPROCS 的有界空闲列表里复用：
+//     列表空时临时新建，满时多余的丢弃，常驻不超过 GOMAXPROCS 个；放回前 Reset(nil)
+//     断开对输出缓冲的引用。每次 Reset → Write → Flush → Close（帧头与官方一致
+//     28b52ffd0058）
+//   - 请求体的前置条件：StreamBody / Stream / Responses / Client.Send、
+//     AnalyzeConversationInput 与 RewriteEnvironmentContextTime 用 gjson 校验 JSON，
+//     它是递归实现、不设深度上限，也不做 UTF-8 全量检查（不为此再扫一遍整包）。
+//     调用方须先用有深度上限的校验器（如 encoding/json 的 json.Valid，迭代实现、
+//     上限 10000 层）校验客户端请求体
+//   - WithFirstFrame 不复制首帧：整形结果直接引用调用方切片，该切片在第一次 Send
+//     之前不得被修改；第一次 Send 之后 SDK 不再引用它
 //   - WS 出站帧不压缩（协商 permessage-deflate，阈值 MaxInt）：不建常驻 flate
 //     写入器（context takeover 每连接约 1.2MB）
 //   - WS 帧收发零额外分配：Send 直传帧字节；Recv 返回 coder/websocket 每次 Read
@@ -151,26 +161,35 @@
 //     reasoning, store, stream, stream_options, include, service_tier,
 //     prompt_cache_key, text, access_programs；WS→WS 另认 previous_response_id、
 //     generate（原样，由上游判断）。type、client_metadata 与白名单外键丢弃；同名键
-//     只认第一次出现（按解码后的名字，转义拼写同样）。请求体不是 JSON 对象或缺少
-//     字符串 model → ErrInvalidRequestBody（本地拒绝）。
+//     只认第一次出现（按解码后的名字，转义拼写同样；重复的值不参与任何判断）。
+//     请求体不是 JSON 对象、model 缺失 / 非字符串 / 为空 / 含控制字节（<0x20、
+//     0x7f），或 service_tier 含控制字节 → ErrInvalidRequestBody（本地拒绝：不发
+//     请求、不拨号，不会变成拨号类或传输错误）；非字符串 service_tier 丢弃。
 //   - stream:true、store:false；reasoning 恒写（effort 按模型表补，lite 写
 //     context:"all_turns"，非 lite 删 context）；include、tool_choice、
 //     parallel_tool_calls、text.verbosity 按官方缺省补；键序按官方
 //     ResponsesApiRequest / ResponseCreateWsRequest。
 //   - 顶层 instructions → developer 消息（非 lite 的 id 与官方 UUIDv5 逐字节一致，
-//     lite 由窗口 UUID 时间戳 + 内容哈希派生）；lite 模型（静态表 models.go，或
-//     input 已有 additional_tools）的顶层 tools 转成 additional_tools 项（按官方
-//     分组规则，Chat Completions 风格先拍平）。
+//     lite 由窗口 UUID 时间戳 + 内容哈希派生；非 lite 另带官方常量
+//     internal_chat_message_metadata_passthrough，lite 不带）；lite 模型（静态表
+//     models.go，或 input 已有 additional_tools）的顶层 tools 转成
+//     additional_tools 项（按官方分组规则，Chat Completions 风格先拍平）。
+//   - WS→WS：插入项（指令消息、工具项）按连接去重——带 previous_response_id 的
+//     增量帧与本连接上次插入的内容相同时只删顶层 instructions / tools、不再插入；
+//     不同则插入并计入 ShapeStats.IncrementalReinjects。
 //   - client_metadata 与 x-codex-turn-metadata 全部由 Identity 合成（客户端自带的
 //     整个丢弃，其中的 sandbox / workspaces 也不取）：client_metadata 键序每次随机
 //     （官方是 HashMap），turn-metadata 固定键序、纯 ASCII，sandbox 恒为 none、
-//     sandbox_mode 恒为 danger-full-access。匿名（Session.SessionID 为空）不写
+//     sandbox_mode 恒为 danger-full-access。InstallationID 为空时两处都省略该键。
+//     匿名（Session.SessionID 为空）不写
 //     client_metadata、不发身份头与 turn-metadata、删除 prompt_cache_key。
 //   - 请求头小写直接赋值（User-Agent 除外）：version、x-codex-beta-features、
 //     x-codex-routing-hint、身份头、x-codex-turn-metadata；HTTP 另有 accept、
 //     content-encoding: zstd、lite 标记头；WS 握手带这条连接第一帧的 turn-metadata
 //     （WS→WS 经 WithFirstFrame 提供首帧）。Accept-Encoding 由调用方 Transport 的
-//     DisableCompression 关闭。
+//     DisableCompression 关闭。WithHeader 覆盖 Go 管理的头（Host、Content-Length、
+//     Transfer-Encoding、Connection、Accept-Encoding、TE、Trailer、Upgrade、
+//     User-Agent）时保持规范写法交给 Go 处理，不会以两种写法重复发出。
 //   - WS 帧的 x-codex-ws-stream-request-start-ms 在取得写闸之后写入发送时刻。
 //   - 计数见 ShapeStatsSnapshot（进程级；SDK 不打日志）。
 //

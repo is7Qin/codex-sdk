@@ -129,7 +129,7 @@ func skipJSONValue(raw []byte, i int) int {
 		}
 		return -1
 	default:
-		// 数字：跳过至空白 / ',' / '}' / ']'（gjson.ValidBytes 前置保证合法终止）。
+		// 数字：跳过至空白 / ',' / '}' / ']'（调用方前置校验保证合法终止）。
 		for i < len(raw) && !isJSONSpace(raw[i]) && raw[i] != ',' && raw[i] != '}' && raw[i] != ']' {
 			i++
 		}
@@ -157,6 +157,9 @@ var envContextTag = []byte("<environment_context>")
 // 只替换 <current_date> 与 <timezone> 的文本内容，其余字节保持不变；被改写的
 // 字符串按 serde_json 规则重新编码（不做 HTML 转义，与官方请求体一致）。
 // 非法 JSON 原样返回。
+//
+// 前置条件：调用方须已用有深度上限的校验器（如 encoding/json 的 json.Valid）
+// 校验过 raw；这里的 gjson 校验是递归实现，不设深度上限。
 func RewriteEnvironmentContextTime(raw []byte, now time.Time) []byte {
 	if len(raw) == 0 || !bytes.Contains(raw, envContextTag) || !gjson.ValidBytes(raw) {
 		return raw

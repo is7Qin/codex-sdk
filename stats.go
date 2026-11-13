@@ -11,6 +11,9 @@ type ShapeStats struct {
 	NonStringInstructions int64 // 非字符串 instructions（丢弃）数
 	DualToolSources       int64 // input 已有 additional_tools 而顶层 tools 被丢弃的请求数
 	UnknownModels         int64 // 模型表外的请求数
+	// IncrementalReinjects 是 WS→WS 带 previous_response_id 的增量帧因指令/工具
+	// 插入项与本连接上次不同而重新插入的次数（相同则不插，不计）。
+	IncrementalReinjects int64
 }
 
 // shapeCounters 是 ShapeStats 的原子计数器。
@@ -21,6 +24,7 @@ type shapeCounters struct {
 	nonStringInstructions atomic.Int64
 	dualToolSources       atomic.Int64
 	unknownModels         atomic.Int64
+	incrementalReinjects  atomic.Int64
 }
 
 func (c *shapeCounters) snapshot() ShapeStats {
@@ -31,6 +35,7 @@ func (c *shapeCounters) snapshot() ShapeStats {
 		NonStringInstructions: c.nonStringInstructions.Load(),
 		DualToolSources:       c.dualToolSources.Load(),
 		UnknownModels:         c.unknownModels.Load(),
+		IncrementalReinjects:  c.incrementalReinjects.Load(),
 	}
 }
 

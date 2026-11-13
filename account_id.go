@@ -19,17 +19,34 @@ func applyDefaultHeaders(h http.Header) {
 	h["originator"] = []string{DefaultOriginator}
 }
 
+// goManagedHeaders 是由 Go（net/http、coder/websocket）自己写出或按规范键读取的
+// 头。WithHeader 覆盖这些头时保持规范写法交给 Go：Go 按规范键识别（Host /
+// Content-Length / Transfer-Encoding 被忽略，Accept-Encoding 存在时不再自动加
+// gzip，Connection / Upgrade 由 WS 库 Set 覆盖），不会以小写写法再发出一份。
+var goManagedHeaders = map[string]bool{
+	"user-agent":        true, // 小写会让 Go 再补一个默认 UA
+	"host":              true,
+	"content-length":    true,
+	"transfer-encoding": true,
+	"connection":        true,
+	"accept-encoding":   true,
+	"te":                true,
+	"trailer":           true,
+	"upgrade":           true,
+}
+
 // applyHeaderOverrides 应用调用方 WithHeader 注入项：按小写键覆盖——覆盖前同时
 // 删除规范写法与小写写法（同一头不会以两种写法重复发出），同名多次调用为扩展
-// （多个值）。User-Agent 例外保持规范写法（否则 Go 会补默认 UA）。WS 升级头与
+// （多个值）。goManagedHeaders 例外保持规范写法（交给 Go 处理）。WS 升级头与
 // HTTP 请求头共用。
 func applyHeaderOverrides(h http.Header, overrides http.Header) {
 	for k, vals := range overrides {
 		lk := strings.ToLower(k)
-		delete(h, http.CanonicalHeaderKey(k))
+		ck := http.CanonicalHeaderKey(k)
+		delete(h, ck)
 		delete(h, lk)
-		if lk == "user-agent" {
-			lk = "User-Agent"
+		if goManagedHeaders[lk] {
+			lk = ck
 		}
 		h[lk] = append([]string(nil), vals...)
 	}

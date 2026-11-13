@@ -1,9 +1,8 @@
 package codexsdk
 
 import (
+	"bytes"
 	"encoding/binary"
-	"hash/fnv"
-	"strings"
 
 	"github.com/tidwall/gjson"
 )
@@ -33,33 +32,43 @@ func (c ConversationInput) FollowUp() bool { return c.followUp }
 
 // AnalyzeConversationInput 分析请求体的 input（WS 帧同样适用）。input 为字符串时
 // 视为 1 个 user 消息；省略 type 的 {"role":...} 视为 message。不解析
-// generate:false（预热由调用方另判）。非法 JSON / 无 input 返回零值（Anchor=-1）。
+// generate:false（预热由调用方另判）。非法 JSON、根不是对象、无 input 返回零值
+// （Anchor=-1）。
+//
+// 顶层同名键只认第一次出现（与整形一致，键按解码后的名字匹配）；扫描零拷贝，
+// 不复制 input。
+//
+// 前置条件：调用方须已用有深度上限的校验器（如 encoding/json 的 json.Valid）
+// 校验过 payload；这里的 gjson 校验是递归实现，不设深度上限。
 func AnalyzeConversationInput(payload []byte) ConversationInput {
 	out := ConversationInput{Anchor: -1}
 	if !gjson.ValidBytes(payload) {
 		return out
 	}
-	input := gjson.GetBytes(payload, "input")
-	switch {
-	case input.Type == gjson.String:
+	input, ok := objectMember(payload, "input")
+	if !ok || len(input) == 0 {
+		return out
+	}
+	switch input[0] {
+	case '"':
 		out.Items = 1
 		out.Anchor = 0
-		out.TurnKey = turnKeyOf(0, []byte(input.Raw))
+		out.TurnKey = turnKeyOf(0, input)
 		return out
-	case !input.IsArray():
+	case '[':
+	default:
 		return out
 	}
 	lastKind := itemOther
 	idx := 0
-	input.ForEach(func(_, el gjson.Result) bool {
-		raw := []byte(el.Raw)
+	forEachElement(input, func(el []byte) bool {
 		kind := classifyInputItem(el)
 		switch kind {
 		case itemOther:
 			out.Anchor = idx
-			out.TurnKey = turnKeyOf(idx, raw)
+			out.TurnKey = turnKeyOf(idx, el)
 		case itemCompaction:
-			out.Compaction = fnv64a(raw)
+			out.Compaction = fnv64a(el)
 		}
 		lastKind = kind
 		idx++
@@ -79,43 +88,58 @@ const (
 	itemToolOutput                       // 工具输出
 )
 
-func classifyInputItem(el gjson.Result) inputItemKind {
-	typ := el.Get("type")
-	t := typ.String()
-	if !typ.Exists() && el.Get("role").Exists() {
-		t = "message"
+// classifyInputItem 只读元素顶层的 type / role（首现）。非对象元素与非字符串
+// type 按锚点候选处理。
+func classifyInputItem(el []byte) inputItemKind {
+	if len(el) == 0 || el[0] != '{' {
+		return itemOther
 	}
-	switch t {
+	typTok, hasType := objectMember(el, "type")
+	roleTok, hasRole := objectMember(el, "role")
+	var t []byte
+	if hasType {
+		t, _ = jsonStringValue(typTok)
+	} else if hasRole {
+		t = []byte("message")
+	}
+	switch string(t) {
 	case "compaction", "compaction_summary", "context_compaction":
 		return itemCompaction
 	case "reasoning", "additional_tools":
 		return itemModelOutput
 	case "message":
-		if el.Get("role").String() == "assistant" {
+		if role, _ := jsonStringValue(roleTok); string(role) == "assistant" {
 			return itemModelOutput
 		}
 		return itemOther
 	}
-	if strings.HasSuffix(t, "_call_output") {
+	if bytes.HasSuffix(t, []byte("_call_output")) {
 		return itemToolOutput
 	}
-	if strings.HasSuffix(t, "_call") {
+	if bytes.HasSuffix(t, []byte("_call")) {
 		return itemModelOutput
 	}
 	return itemOther
 }
 
-func turnKeyOf(idx int, raw []byte) uint64 {
-	h := fnv.New64a()
-	var b [4]byte
-	binary.LittleEndian.PutUint32(b[:], uint32(idx))
-	_, _ = h.Write(b[:])
-	_, _ = h.Write(raw)
-	return h.Sum64()
+// FNV-64a（内联实现，零分配）。
+const (
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
+)
+
+func fnv64aAppend(h uint64, b []byte) uint64 {
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= fnvPrime64
+	}
+	return h
 }
 
-func fnv64a(raw []byte) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write(raw)
-	return h.Sum64()
+func turnKeyOf(idx int, raw []byte) uint64 {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(idx))
+	return fnv64aAppend(fnv64aAppend(fnvOffset64, b[:]), raw)
 }
+
+func fnv64a(raw []byte) uint64 { return fnv64aAppend(fnvOffset64, raw) }

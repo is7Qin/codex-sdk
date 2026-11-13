@@ -598,11 +598,12 @@ func TestStreamStartStampedAtWrite(t *testing.T) {
 	}
 	defer c.CloseNow()
 	var gateAt []time.Time
-	writeStampHook = func() {
+	hook := func() {
 		time.Sleep(40 * time.Millisecond) // 模拟在写闸后、写出前的延迟
 		gateAt = append(gateAt, time.Now())
 	}
-	t.Cleanup(func() { writeStampHook = nil })
+	writeStampHook.Store(&hook)
+	t.Cleanup(func() { writeStampHook.Store(nil) })
 	var before []time.Time
 	for i := 0; i < 2; i++ {
 		before = append(before, time.Now())
@@ -610,7 +611,7 @@ func TestStreamStartStampedAtWrite(t *testing.T) {
 			t.Fatalf("Send: %v", err)
 		}
 	}
-	writeStampHook = nil
+	writeStampHook.Store(nil)
 	up.waitFrames(t, 2)
 	var prev int64
 	for i, f := range up.sentFrames(t) {

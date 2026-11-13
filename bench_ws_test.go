@@ -29,9 +29,8 @@ var benchSink int
 // wsBenchPayload 是 P1 的输入：3.7KB 量级的 Responses 请求体。
 //
 // 顶层键覆盖 spec 要求的面（model / instructions / input / tools / reasoning /
-// text / stream:true / store:false / client_metadata），且全部落在 WS 白名单内——
-// 否则 buildResponsesCreateFrame 的过滤会把它们删掉，帧会缩水成"只剩 type"，
-// 3.7KB 口径立刻失真。
+// text / stream:true / store:false / client_metadata），且全部落在整形白名单内——
+// 否则 parseRequest 会把它们丢弃，3.7KB 口径立刻失真。
 var wsBenchPayload = buildWSBenchPayload(3700)
 
 // wsBenchFrame 是 P2 的输入：1024B 的 response.output_text.delta 帧（1KB 级）。
@@ -158,7 +157,6 @@ func benchWSClient(b *testing.B, up *benchWSUpstream) *HTTPClient {
 
 // BenchmarkWSShape3KB：HTTP→WS 每帧整形（parseRequest + shapeRequest + assembleWS）
 // 的完整成本，3.7KB 请求体、非匿名身份（client_metadata 与 turn-metadata 都合成）。
-// 取代旧 BenchmarkFrameCodecPrepare3KB（单遍编码器已删除）。
 func BenchmarkWSShape3KB(b *testing.B) {
 	if n := len(wsBenchPayload); n < 3600 || n > 3800 {
 		b.Fatalf("wsBenchPayload 长度 %d 越界（要求 3600–3800）", n)

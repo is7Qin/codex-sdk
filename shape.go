@@ -3,7 +3,6 @@ package codexsdk
 import (
 	"bytes"
 	"errors"
-	"hash/fnv"
 	"math/rand/v2"
 	"strconv"
 	"strings"
@@ -13,7 +12,8 @@ import (
 )
 
 // ErrInvalidRequestBody 表示请求体不能整形成 Codex responses 请求：不是 JSON
-// 对象、白名单过滤后为空、缺少字符串 model，或 input 既不是数组也不是字符串。
+// 对象、缺少 model 或 model 不是非空且不含控制字节（<0x20、0x7f）的字符串、
+// service_tier 含控制字节，或 input 既不是数组、字符串也不是 null。
 // HTTP 与 WS 都在本地拒绝（不发上游、不烧握手）。
 var ErrInvalidRequestBody = errors.New("codexsdk: 请求体无效：必须是带字符串 model 的 JSON 对象")
 
@@ -117,8 +117,24 @@ type parsedRequest struct {
 	duplicates         int
 }
 
-// parseRequest 是第一段：环境时间改写 → 校验对象根 → 一次扫描顶层成员（键按
-// 解码后的名字匹配，同名键只认第一次出现）→ 白名单 → model 必须是字符串。
+// validHeaderToken 报告解码后的 model / service_tier 能安全进入请求头与
+// turn-metadata：不含 <0x20 与 0x7f 字节。
+func validHeaderToken(s []byte) bool {
+	for _, c := range s {
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// parseRequest 是第一段：校验 JSON 对象根 → 环境时间改写 → 一次扫描顶层成员
+// （键按解码后的名字匹配，同名键只认第一次出现，重复的值不参与任何判断）→
+// 白名单 → model / service_tier 校验。
+//
+// 前置条件：调用方须已用有深度上限的校验器（如 encoding/json 的 json.Valid，
+// 迭代实现、上限 10000 层）校验过请求体。这里的 gjson 校验是递归实现，不设深度
+// 上限；也不做 UTF-8 全量检查（不为此再扫一遍整包）。
 func parseRequest(raw []byte, s surface, now time.Time) (parsedRequest, error) {
 	p := parsedRequest{surface: s, compact: true, inputCompact: true}
 	if len(raw) == 0 || !gjson.ValidBytes(raw) {
@@ -177,13 +193,6 @@ func parseRequest(raw []byte, s surface, now time.Time) (parsedRequest, error) {
 		} else {
 			k, ok = shapeKeyOf(string(key), s)
 		}
-		var valEnd int
-		if ok && k == keyInput && raw[valStart] == '[' {
-			valEnd = p.scanInput(raw, valStart)
-		} else {
-			valEnd = skipJSONValue(raw, valStart)
-		}
-		i = valEnd
 		bit := uint32(0)
 		switch {
 		case ok:
@@ -193,20 +202,36 @@ func parseRequest(raw []byte, s surface, now time.Time) (parsedRequest, error) {
 		case name == clientMetadataKey || string(key) == clientMetadataKey:
 			bit = 1 << 31
 		}
-		if bit != 0 {
-			if seen&bit != 0 {
-				p.duplicates++
-				continue
-			}
-			seen |= bit
+		dup := bit != 0 && seen&bit != 0
+		seen |= bit
+		// 先判重再扫值：只有首现的 input 参与元素计数与 lite 判定。
+		var valEnd int
+		if ok && !dup && k == keyInput && raw[valStart] == '[' {
+			valEnd = p.scanInput(raw, valStart)
+		} else {
+			valEnd = skipJSONValue(raw, valStart)
+		}
+		i = valEnd
+		if dup {
+			p.duplicates++
+			continue
 		}
 		if ok {
 			p.vals[k] = raw[valStart:valEnd]
 		}
 	}
-	m := p.vals[keyModel]
-	if len(m) == 0 || m[0] != '"' {
+	m, ok := jsonStringValue(p.vals[keyModel])
+	if !ok || len(m) == 0 || !validHeaderToken(m) {
 		return p, ErrInvalidRequestBody
+	}
+	if v := p.vals[keyServiceTier]; v != nil {
+		st, ok := jsonStringValue(v)
+		switch {
+		case !ok: // 非字符串：丢弃（官方字段是 Option<String>）
+			p.vals[keyServiceTier] = nil
+		case !validHeaderToken(st):
+			return p, ErrInvalidRequestBody
+		}
 	}
 	if in := p.vals[keyInput]; in != nil {
 		switch in[0] {
@@ -407,7 +432,6 @@ type shapedRequest struct {
 	textPrewarm  []byte // 预热帧用的 text（去掉 format；空对象 = nil）
 	turnMeta     []byte // turn 形态 turn-metadata（匿名 = nil）
 	prewarmMeta  []byte // prewarm 形态 turn-metadata（匿名 = nil）
-	injectHash   uint64 // 本次插入项（指令 + 工具）内容哈希
 	anonymous    bool
 
 	// client_metadata 的身份值（匿名不写 client_metadata）。
@@ -421,6 +445,19 @@ type shapedRequest struct {
 	// nativePrewarm：WS→WS 客户端自己的预热帧（generate:false）。client_metadata
 	// 与握手 turn-metadata 用 prewarm 形态，不带 turn-state；输入按客户端原样。
 	nativePrewarm bool
+}
+
+// injectHash 是本次插入项（工具项 + 指令消息）内容的 FNV-64a；无插入项为 0。
+// 只有 WS→WS 增量帧去重用到，按需计算（HTTP 与 HTTP→WS 不算）。
+func (sh *shapedRequest) injectHash() uint64 {
+	if len(sh.inputPrefix) == 0 {
+		return 0
+	}
+	h := uint64(fnvOffset64)
+	for _, it := range sh.inputPrefix {
+		h = fnv64aAppend(h, it)
+	}
+	return h
 }
 
 // turnState 返回要带给上游的 turn-state（匿名不带）。
@@ -623,24 +660,24 @@ func shapeRequest(p *parsedRequest, id Identity, now time.Time, cfg shapeConfig)
 			}
 			instrItem = append(instrItem, `"role":"developer","content":[{"type":"input_text","text":`...)
 			instrItem = appendJSONStringBytes(instrItem, text)
-			// 官方每请求重建的指令消息带这一段元数据（gpt-5.5 抓包）；lite 官方是
-			// 窗口开始时写进历史的版本（另带 turn_id / create_time），网关没有历史，
-			// 两类模型都用这份稳定形态，保证同一内容同一字节。
-			instrItem = append(instrItem, `}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["model.base_instructions"]}}`...)
+			if sh.lite {
+				// lite 官方的这条消息来自历史（带轮次相关的 passthrough），网关不合成。
+				instrItem = append(instrItem, `}]}`...)
+			} else {
+				// 非 lite：官方每请求重建指令消息，带这段只取决于项类型的常量元数据
+				// （gpt-5.5 抓包；core/src/client.rs）。
+				instrItem = append(instrItem, `}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["model.base_instructions"]}}`...)
+			}
 		}
 	}
 	if atItem != nil || instrItem != nil {
 		sh.inputPrefix = make([][]byte, 0, 2)
-		h := fnv.New64a()
 		if atItem != nil {
 			sh.inputPrefix = append(sh.inputPrefix, atItem)
-			_, _ = h.Write(atItem)
 		}
 		if instrItem != nil {
 			sh.inputPrefix = append(sh.inputPrefix, instrItem)
-			_, _ = h.Write(instrItem)
 		}
-		sh.injectHash = h.Sum64()
 	}
 
 	// reasoning：恒写；键序 effort, summary, context, 其余。
@@ -966,8 +1003,9 @@ type turnMetaInput struct {
 }
 
 // appendTurnMetadata 按官方固定键序写 turn-metadata（ASCII JSON，等价
-// to_ascii_json_string）。prewarm 形态：turn_id 为空串，不写 root_turn_id、
-// turn_trigger、turn_started_at_unix_ms，request_kind 为 prewarm。
+// to_ascii_json_string）。InstallationID 为空时省略 installation_id。
+// prewarm 形态：turn_id 为空串，不写 root_turn_id、turn_trigger、
+// turn_started_at_unix_ms，request_kind 为 prewarm。
 // sandbox / sandbox_mode 固定为 none / danger-full-access（官方
 // PermissionProfile::Disabled 的组合）；workspaces 恒不写。
 func appendTurnMetadata(b []byte, m *turnMetaInput, prewarm bool) []byte {
@@ -983,9 +1021,16 @@ func appendTurnMetadata(b []byte, m *turnMetaInput, prewarm bool) []byte {
 		b = append(b, '"', ':')
 		b = strconv.AppendBool(b, v)
 	}
-	b = append(b, `{"installation_id":`...)
-	b = appendASCIIJSONString(b, m.installationID)
-	str("session_id", m.sessionID)
+	// 空 InstallationID：省略 installation_id（与 client_metadata 的
+	// x-codex-installation-id 一致）。
+	if m.installationID != "" {
+		b = append(b, `{"installation_id":`...)
+		b = appendASCIIJSONString(b, m.installationID)
+		str("session_id", m.sessionID)
+	} else {
+		b = append(b, `{"session_id":`...)
+		b = appendASCIIJSONString(b, m.sessionID)
+	}
 	str("thread_id", m.threadID)
 	str("agent_name", "/root")
 	if prewarm {
@@ -1320,7 +1365,7 @@ func (sh *shapedRequest) writeMeta(w *jsonWriter, kind metaKind, a *wsAssembly) 
 	add("session_id", sh.sessionID)
 	add("thread_id", sh.threadID)
 	add("x-codex-window-id", sh.windowID)
-	if sh.installationID != "" {
+	if sh.installationID != "" { // 空 = 省略（turn-metadata 同样省略 installation_id）
 		add("x-codex-installation-id", sh.installationID)
 	}
 	if kind == metaWSPrewarm {

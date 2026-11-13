@@ -141,7 +141,9 @@ data:<帧字节 verbatim>\n
   只有 `CloseStatus == -1`（对端没发 close frame：直接断 TCP / 连接重置 / 超
   ReadLimit）才是传输错误，且原样返回底层错误。
 
-帧构造规则：JSON 合法 + **对象根** + 字符串 `model` → 白名单（同名键只认第一次）→
+帧构造规则：JSON 合法 + **对象根** + 非空且不含控制字节（`<0x20`、`0x7f`）的字符串
+`model`（`service_tier` 若是字符串同样不得含控制字节，非字符串丢弃；否则
+`ErrInvalidRequestBody`，不拨号）→ 白名单（同名键只认第一次，重复的值不参与判断）→
 覆写 `type:"response.create"`、`stream:true`、`store:false` → 丢弃客户端
 `previous_response_id` / `generate`（HTTP→WS）→ 官方键序写出。**全部在拨号之前完成**；
 握手头 `x-codex-routing-hint` 与 `x-codex-turn-metadata` 取自这一帧的整形结果。
@@ -291,15 +293,28 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
   若 `seenID` 仍为空（`response.created` 未到）或 `response_id` 不归属本轮，一律不捕获（`dropped`
   计数 +1，帧照旧透传；不带 ts 的 metadata 连计数都不加）。`Sink` 只在调用/`Read` 栈内同步回调，
   `Body.Close` 返回后不再回调——所以不需要代际标志。
-- **回退链的白名单扫描是两次**（`buildResponsesCreateFrame` 内一次 + `normalize`
-  再一次，与 T3 完全一致）：只有形态不在单遍覆盖内（非紧凑 / 转义键 / 重复键 /
-  白名单外键）才走到；真实 codex 帧恒走单遍，那是 1 次。代价是这类形态比 T3 多付
-  一次 `gjson.ValidBytes`（单遍的前置校验），3.7KB 体上约 +2µs——"不劣化"只对
-  主路径成立（P1 测的正是主路径）。
-- **转发到拨号的选项**：`WithTransport` / `WithHeader`（身份保留键会在构造期 panic）/
-  trace / turn / compression / ping / beta；身份（session/thread/window/metadata/ts）
-  不在此列——它随 `Dial` / `StreamBody` / `Responses` 的 `Identity` 实参进入握手头与帧/体的
-  `client_metadata`。
+- **请求体前置条件**：整形、`AnalyzeConversationInput`、`RewriteEnvironmentContextTime`
+  用 gjson 校验 JSON（递归实现，不设深度上限），也不做 UTF-8 全量检查——不为此
+  再扫一遍整包。调用方须先用有深度上限的校验器（如 `encoding/json` 的 `json.Valid`）
+  校验客户端请求体。
+- **WS→WS 首帧**：`WithFirstFrame(first)` 不复制 `first`（整形结果直接引用它），
+  该切片在第一次 `Send` 之前不得被修改；第一次 `Send` 用 `Swap(nil)` 取出后 SDK
+  不再引用它，首帧不随连接常驻。
+- **WS→WS 插入项去重**：连接记下上次实际插入的指令/工具项哈希；带
+  `previous_response_id` 的增量帧哈希相同则只删顶层 `instructions` / `tools`、
+  不再插入，不同则插入并计入 `ShapeStats.IncrementalReinjects`。哈希只在 WS→WS
+  计算。
+- **zstd 编码器**：容量 = `GOMAXPROCS` 的有界空闲列表（不是 `sync.Pool`）；单个
+  编码器约 3.7MB（`WithLowerEncoderMem`，输出字节与默认编码器相同），并发超过
+  上限时临时新建、用完丢弃。
+- **转发到拨号的选项**：`WithTransport` / `WithHeader`（保留键在构造期 panic；
+  Go 管理的头 Host / Content-Length / Transfer-Encoding / Connection /
+  Accept-Encoding / TE / Trailer / Upgrade / User-Agent 保持规范写法交给 Go）/
+  trace（`WithTraceContext`、`WithTraceAuto`）/ compression（只影响协商，出站恒
+  不压缩）/ ping（无效果）/ beta / `WithFirstFrame`（仅 `Dial`）；身份
+  `Identity{InstallationID, Session, Window, Turn, Sink}` 不在此列——它随 `Dial` /
+  `StreamBody` / `Responses` 的 `Identity` 实参进入握手头与帧/体的 `client_metadata`
+  和 `x-codex-turn-metadata`。
   `WithTimeout` 现在**对 WS 臂生效**：`>0` 时设在请求 exchange 的 ctx 上，
   覆盖请求使用期，含拨号/升级（T5 起）；`=0` 时沿用调用方的取消与 deadline。
   两者是**独立预算**，不承诺墙钟严格"先到"：同时就绪时调用方 ctx 优先
@@ -311,20 +326,28 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
 
 ## 性能预算
 
-三条 benchmark 是硬门槛（`bench_ws_test.go`，T0 基线固化在同一文件里；数字为
+以下 benchmark 是门槛（`bench_ws_test.go`、`bench_shape_test.go`；T0 基线数字为
 AMD Ryzen 7 7840H 上 `-count=10` 的中位数，换机器只比"与基线的比值"，不比绝对值）：
 
 | 门槛 | benchmark | T0 基线 | 现值 | 判据 |
 |---|---|---|---|---|
-| P1 帧编码（3.7KB 体） | `BenchmarkFrameCodecPrepare3KB` | 34,930 ns / 21,992 B / 26 allocs | **6,782 ns / 5,040 B / 5 allocs** | ≤20µs / ≤12KB / ≤12 allocs |
+| P1 帧整形（3.7KB 体，非匿名） | `BenchmarkWSShape3KB` | 34,930 ns / 21,992 B / 26 allocs | **18–30 µs / 17,176 B / 11 allocs** | 不劣化：≤ T0 分配数；字节与 ns 只与上一版比值 |
+| P1' HTTP 整形 + zstd（官方 84KB 体） | `BenchmarkHTTPShapeZstd84KB` | — | **0.78–0.86 ms / 272 KB / 20 allocs** | zstd 约占 60% |
 | P2 帧→SSE 渲染（1KB 帧） | `BenchmarkSSEViewRender1KB` | 2,312 ns / 2,720 B / 3 allocs | **72 ns / 0 B / 0 allocs** | 只判 `0 B / 0 allocs`（口径从"构建一块"变成"三段渲染 + 读尽"，ns/op 不与 T0 纵向比） |
-| P3 WS 每请求（整链路含握手） | `BenchmarkWSStreamBodyPerRequest` | 468 allocs | **456–459 allocs** | 不得劣化：≤ T0 × 1.05 |
+| P3 WS 每请求（整链路含握手） | `BenchmarkWSStreamBodyPerRequest` | 468 allocs | **475 allocs**（整形新增 client_metadata / turn-metadata 合成） | 不得劣化：≤ T0 × 1.05 |
+
+P1 的 11 allocs 来自整形本身必需的工作（官方形态重建）：输出缓冲、
+`prompt_cache_key`、两种 turn-metadata 合一的缓冲、指令 developer 消息、插入项切片、
+UUIDv5 id 字符串与两层 SHA-1、基准身份未给 `Turn.ID` / `Window.ContextID` 时每请求
+生成的两个 UUIDv7。旧的单遍编码器只做白名单 + 注入（5 allocs），不可比。
+数字取自负载较高的 20 核机器（`-count=5`），ns/op 波动大。
 
 P3 的绝对值里 ~35% 是假上游（`httptest` 侧）、~22% 是握手，SDK 可控面只有 ~31
 allocs——所以 P3 只保证**不劣化**，真正的分配改善在 P1/P2。
 
 ```bash
-go test -run '^$' -bench '^BenchmarkFrameCodecPrepare3KB$'  -benchmem -count=10 .
+go test -run '^$' -bench '^BenchmarkWSShape3KB$'            -benchmem -count=10 .
+go test -run '^$' -bench '^BenchmarkHTTPShapeZstd84KB$'      -benchmem -count=10 .
 go test -run '^$' -bench '^BenchmarkSSEViewRender1KB$'       -benchmem -count=10 .
 go test -run '^$' -bench '^BenchmarkWSStreamBodyPerRequest$' -benchmem -benchtime=20x -count=3 .
 ```

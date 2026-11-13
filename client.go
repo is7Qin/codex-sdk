@@ -267,7 +267,10 @@ func WithTraceAuto(enabled bool) Option {
 // 的帧逐字节相同。Dial 用它整形一次，握手带 x-codex-routing-hint 与
 // x-codex-turn-metadata（first 是 generate:false 时为 prewarm 形态，否则 turn
 // 形态）；第一次 Send 复用这次整形（同一个 turn_id）。未设置时握手不带这两个头。
-// first 不是合法请求体时 Dial 返回 ErrInvalidRequestBody。
+// first 不是合法请求体时 Dial 返回 ErrInvalidRequestBody（不拨号）。
+//
+// 契约：Dial 不复制 first（整形结果直接引用它），传入的切片在第一次 Send 之前
+// 不得被修改（与 io.Writer 等 Go 惯例一致）；第一次 Send 之后 SDK 不再引用它。
 func WithFirstFrame(first []byte) Option {
 	return func(o *options) { o.firstFrame = first }
 }
@@ -350,10 +353,15 @@ type Client struct {
 	shape shapeConfig
 	id    Identity
 
-	// first 是 WithFirstFrame 的首帧与 Dial 时对它的整形；第一次 Send 的帧与
-	// first 逐字节相同时复用（同一个 turn_id），之后清空。
-	first       []byte
-	firstShaped atomic.Pointer[shapedRequest]
+	// first 是 WithFirstFrame 的首帧（调用方切片，不复制）与 Dial 时对它的整形。
+	// 第一次 Send 用 Swap(nil) 取出：帧与首帧逐字节相同则复用这次整形（同一个
+	// turn_id），否则重新整形。取出后不再有任何引用，首帧不随连接常驻。
+	first atomic.Pointer[firstFrameState]
+
+	// lastInject 是本连接上次实际插入的指令/工具项的 injectHash（0 = 无）。
+	// 带 previous_response_id 的增量帧哈希相同则不再插入（上游已在上下文里），
+	// 不同则插入并计数。
+	lastInject atomic.Uint64
 
 	// observer 只在 Recv 里使用（至多一个 goroutine 同时 Recv）：把属于本次
 	// response 的 response.metadata turn-state 交给 id.Sink。
@@ -361,6 +369,13 @@ type Client struct {
 
 	// closed 标记本地已发起关闭（Close/CloseNow）。对端关闭由常驻读者观测。
 	closed atomic.Bool
+}
+
+// firstFrameState 是 WithFirstFrame 的首帧与 Dial 时对它的整形（整形结果的
+// 切片指向 frame，二者同寿命）。
+type firstFrameState struct {
+	frame []byte
+	sh    shapedRequest
 }
 
 // Closed 报告连接是否已被本地关闭（Close / CloseNow 置位）。
@@ -395,13 +410,15 @@ func Dial(ctx context.Context, auth Auth, id Identity, opts ...Option) (*Client,
 		identity:  id,
 	}
 	if cfg.firstFrame != nil {
-		sh, err := shapeBody(cfg.firstFrame, surfaceWSNative, id, time.Now(), c.shape)
-		if err != nil {
+		// 不复制：整形结果是指向首帧的零拷贝切片，契约见 WithFirstFrame。
+		st := &firstFrameState{frame: cfg.firstFrame}
+		spec.opts.firstFrame = nil // 首帧只经 c.first 引用，首次 Send 后释放
+		var err error
+		if st.sh, err = shapeBody(st.frame, surfaceWSNative, id, time.Now(), c.shape); err != nil {
 			return nil, err
 		}
-		spec.shaped = &sh
-		c.first = cfg.firstFrame
-		c.firstShaped.Store(&sh)
+		spec.shaped = &st.sh
+		c.first.Store(st)
 	}
 	cn, _, err := dialConn(ctx, spec)
 	if err != nil {
@@ -417,18 +434,36 @@ func Dial(ctx context.Context, auth Auth, id Identity, opts ...Option) (*Client,
 // 每帧按官方形态整形（两段式：白名单、同名键首现、官方键序、client_metadata
 // 由 Identity 合成——客户端自带的整个丢弃）；previous_response_id 与 generate
 // 原样保留（由上游判断）。generate:false 的帧按预热形态写 client_metadata
-// （turn_id 为空串、prewarm 形态 turn-metadata、不带 turn-state）。
+// （turn_id 为空串、prewarm 形态 turn-metadata、不带 turn-state）。顶层
+// instructions / tools 生成的插入项按连接去重：带 previous_response_id 的增量帧
+// 与本连接上次插入的内容相同时不再插入（顶层字段照样删除）。
 // 请求体无效返回 ErrInvalidRequestBody（不入网）。
 // x-codex-ws-stream-request-start-ms 在取得写闸之后写入发送时刻。Write 同步
 // 消费——Send 返回前不得复用 frame。
 func (c *Client) Send(ctx context.Context, frame []byte) error {
 	var sh shapedRequest
-	if p := c.firstShaped.Swap(nil); p != nil && bytes.Equal(c.first, frame) {
-		sh = *p
+	if p := c.first.Swap(nil); p != nil && bytes.Equal(p.frame, frame) {
+		sh = p.sh
 	} else {
 		var err error
 		if sh, err = shapeBody(frame, surfaceWSNative, c.id, time.Now(), c.shape); err != nil {
 			return err
+		}
+	}
+	// 指令/工具插入的连接级去重：全量帧（不带 previous_response_id）照常插入并
+	// 记下哈希；增量帧的插入项与本连接上次相同则只删顶层字段、不再插入，不同则
+	// 插入并计数。
+	hash, record := sh.injectHash(), true
+	if sh.clientPrevID != "" {
+		switch {
+		case hash == 0:
+			record = false
+		case hash == c.lastInject.Load():
+			sh.inputPrefix, record = nil, false
+		default:
+			if c.shape.stats != nil {
+				c.shape.stats.incrementalReinjects.Add(1)
+			}
 		}
 	}
 	a := wsAssembly{prevID: sh.clientPrevID, generate: sh.clientGenerate}
@@ -436,7 +471,13 @@ func (c *Client) Send(ctx context.Context, frame []byte) error {
 		a.turnState = sh.turnState(c.id)
 	}
 	wire, off := assembleWS(&sh, a)
-	return c.cn.writeStamped(ctx, wire, off)
+	if err := c.cn.writeStamped(ctx, wire, off); err != nil {
+		return err
+	}
+	if record {
+		c.lastInject.Store(hash)
+	}
+	return nil
 }
 
 // Recv 读取下一帧字节（文本/二进制帧原样透传，不改写）。

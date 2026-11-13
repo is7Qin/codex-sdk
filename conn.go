@@ -303,15 +303,16 @@ func (c *conn) writeStamped(ctx context.Context, wire []byte, off int) error {
 	if cause := c.err(); cause != nil {
 		return cause
 	}
-	if writeStampHook != nil {
-		writeStampHook()
+	if hook := writeStampHook.Load(); hook != nil {
+		(*hook)()
 	}
 	stampStartMs(wire, off, time.Now())
 	return c.ws.Write(ctx, coderws.MessageText, wire)
 }
 
 // writeStampHook 是测试挂点（生产恒为 nil）：取得写闸之后、覆写发送时刻之前调用。
-var writeStampHook func()
+// 原子指针：测试在连接存活期间设置/清除它，与写帧的 goroutine 无数据竞争。
+var writeStampHook atomic.Pointer[func()]
 
 // probe 发送 WS 层 ping 并等待 pong：公开 Ping 用，完全沿用调用方 ctx
 // （与既有 Client.Ping 语义一致，不加任何封顶）。

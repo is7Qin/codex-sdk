@@ -72,7 +72,6 @@ func TestRewriteEnvironmentContextCursorGuard(t *testing.T) {
 	}
 }
 
-// TestFilterCodexWsPayload：WS 顶层 key 白名单过滤（纯函数）。
 // TestNewTraceContext：W3C traceparent 格式 + 每次调用新链路 id。
 func TestNewTraceContext(t *testing.T) {
 	a := NewTraceContext()
