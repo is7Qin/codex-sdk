@@ -7,7 +7,7 @@ channel API.
 ## Features
 
 - **Responses WebSocket**: dial, raw frame send/receive (text and binary
-  passthrough), heartbeat keepalive, close-code passthrough.
+  passthrough), answers pings (no active heartbeat), close-code passthrough.
 - **Responses HTTP**: request construction, non-streaming responses, streaming
   SSE event-frame extraction.
 - **Image generation**: `GenerateImage` (non-streaming, direct images endpoint)

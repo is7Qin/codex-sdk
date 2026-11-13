@@ -185,7 +185,7 @@ data:<帧字节 verbatim>\n
 | 复用连接写失败 | — | 原始错误链（终止连接，不重试、不轮转）；**复用命中**时错误文案额外带「连接年龄 + 本轮已交付帧数」诊断（`%w` 包装，分类不变） |
 | 复用连接的首帧 | — | **不做任何判定**：首帧就是普通帧，不认识的事件由消费者忽略（旧尾帧也一样） |
 | 服务端 60min 上限 | — | 本地 30min 在空闲时提前退役；若仍收到 `websocket_connection_limit_reached`（该帧不带 status），按普通 in-band error 透传，不重试 |
-| 坏请求体（坏 JSON / 非对象根 / 缺字符串 `model`） | 本地错误 `ErrInvalidRequestBody`：**不发请求** | 本地错误 `ErrInvalidRequestBody`：**不拨号、不发帧** |
+| 坏请求体（坏 JSON / 非对象根 / 缺字符串 `model` / 空或含控制字节的 `model` / 含控制字节的 `service_tier`） | 本地错误 `ErrInvalidRequestBody`：**不发请求** | 本地错误 `ErrInvalidRequestBody`：**不拨号、不发帧** |
 
 `ErrInvalidRequestBody` 是本地输入错误（裸 error，不是 `*HTTPError`），两臂一致。
 
@@ -280,7 +280,7 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
 **计数**（进程级，`ShapeStatsSnapshot()`）：`Prewarms`、`PrewarmConnFailures`、`PrewarmRejections`、
 `PrewarmRedials`、`PrewarmChained`（真实帧带预热 id）、`PrewarmUnchained`（预热成功但真实帧不带）。
 
-**代价**：每条新连接多一次往返；判定只比较已整形的 `text` 部件、真实帧在预热后组装一次
+**代价**：每条新连接多一次往返（每请求增量见「性能预算」P5）；判定只比较已整形的 `text` 部件、真实帧在预热后组装一次
 （不预热的路径组装次数不变），没有额外整包扫描或复制。
 
 ## 已知限制
@@ -402,7 +402,7 @@ bench 的 P6 验证一次 accept 与每个计时请求命中，R18 验证 `accep
 
 ## 性能预算
 
-以下 benchmark 是门槛（`bench_ws_test.go`、`bench_shape_test.go`；T0 基线数字为
+以下 benchmark 是门槛（`bench_ws_test.go`、`bench_shape_test.go`、`bench_ws_prewarm_test.go`；T0 基线数字为
 AMD Ryzen 7 7840H 上 `-count=10` 的中位数，换机器只比"与基线的比值"，不比绝对值）：
 
 | 门槛 | benchmark | T0 基线 | 现值 | 判据 |
@@ -412,6 +412,7 @@ AMD Ryzen 7 7840H 上 `-count=10` 的中位数，换机器只比"与基线的比
 | P2 帧→SSE 渲染（1KB 帧） | `BenchmarkSSEViewRender1KB` | 2,312 ns / 2,720 B / 3 allocs | **72 ns / 0 B / 0 allocs** | 只判 `0 B / 0 allocs`（口径从"构建一块"变成"三段渲染 + 读尽"，ns/op 不与 T0 纵向比） |
 | P3 WS 每请求（整链路含握手） | `BenchmarkWSStreamBodyPerRequest` | 468 allocs | **475 allocs**（整形新增 client_metadata / turn-metadata 合成） | 不得劣化：≤ T0 × 1.05 |
 | P4 会话簿命中（后续请求，两缓存命中） | `BenchmarkBookPrepareHit`（`RunParallel`，`-cpu 1,8,20`） | — | **1 alloc / 96 B，零存储调用**；ns/op 随核数下降（见实现报告） | `TestBookPrepareHitBounds`：≤ 4 allocs、零存储调用 |
+| P5 HTTP→WS 预热（新连接每请求，含握手与假上游两侧） | `BenchmarkWSNewConnPrewarm` 对 `BenchmarkWSNewConnNoPrewarm` | — | **589–591 vs 507–508 allocs / ~110 KB vs ~89 KB**（增量 ≈ 82 allocs / 21 KB；ns/op 多一次往返，波动大） | 预热 − 不预热 ≤ 100 allocs（只比两者差值，同一次运行内取）；不预热一侧不得劣化 |
 
 P1 的 11 allocs 来自整形本身必需的工作（官方形态重建）：输出缓冲、
 `prompt_cache_key`、两种 turn-metadata 合一的缓冲、指令 developer 消息、插入项切片、
@@ -427,6 +428,7 @@ go test -run '^$' -bench '^BenchmarkWSShape3KB$'            -benchmem -count=10 
 go test -run '^$' -bench '^BenchmarkHTTPShapeZstd84KB$'      -benchmem -count=10 .
 go test -run '^$' -bench '^BenchmarkSSEViewRender1KB$'       -benchmem -count=10 .
 go test -run '^$' -bench '^BenchmarkWSStreamBodyPerRequest$' -benchmem -benchtime=20x -count=3 .
+go test -run '^$' -bench '^BenchmarkWSNewConn(No)?Prewarm$'  -benchmem -count=3 .
 ```
 
 整形的官方一致性不靠"读代码相信"，靠 `shape_official_test.go`：用
