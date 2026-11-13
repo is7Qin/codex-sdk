@@ -53,6 +53,10 @@ type prewarmUpstream struct {
 
 	upgrades atomic.Int64
 	frameSig chan struct{}
+	// live 是仍在运行的 handler 数；exited[i] 在第 i 条连接的 handler 返回时关闭
+	// （客户端终止连接 ⇒ handler 的 Read 出错返回：断言"连接已关"的屏障）。
+	live   atomic.Int64
+	exited []chan struct{}
 }
 
 func newPrewarmUpstream(t *testing.T) *prewarmUpstream {
@@ -87,8 +91,34 @@ func (u *prewarmUpstream) defaultReply(conn int, frame []byte) prewarmReply {
 	return prewarmReply{events: []string{tsCreatedFrame(id), tsCompletedFrame(id)}}
 }
 
+// exitedCh 返回第 conn 条连接的 handler 退出屏障（惰性创建）。
+func (u *prewarmUpstream) exitedCh(conn int) chan struct{} {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for len(u.exited) <= conn {
+		u.exited = append(u.exited, make(chan struct{}))
+	}
+	return u.exited[conn]
+}
+
+// waitConnClosed 等第 conn 条连接的 handler 退出（屏障 + deadline 兜底）。
+func (u *prewarmUpstream) waitConnClosed(t *testing.T, conn int, why string) {
+	t.Helper()
+	select {
+	case <-u.exitedCh(conn):
+	case <-time.After(3 * time.Second):
+		t.Fatalf("第 %d 条上游连接未关闭（%s）", conn, why)
+	}
+}
+
 func (u *prewarmUpstream) handle(w http.ResponseWriter, r *http.Request) {
 	conn := int(u.upgrades.Add(1)) - 1
+	u.live.Add(1)
+	done := u.exitedCh(conn)
+	defer func() {
+		u.live.Add(-1)
+		close(done)
+	}()
 	c, err := coderws.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -229,6 +259,11 @@ func officialFirstIdentity(t *testing.T, turnFixture string, sink TurnStateSink)
 	return id
 }
 
+// sinkFunc 把函数适配成 TurnStateSink（用来在预热读循环内插入屏障）。
+type sinkFunc func(string)
+
+func (f sinkFunc) SetTurnState(v string) { f(v) }
+
 func isPrewarmFrame(frame []byte) bool {
 	return gjson.GetBytes(frame, "generate").Type == gjson.False
 }
@@ -356,11 +391,19 @@ func TestPrewarmMismatchSendsFull(t *testing.T) {
 	if len(frames) != 2 {
 		t.Fatalf("上游收到 %d 帧, 期望 2", len(frames))
 	}
-	// 预热帧不与抓包逐字节比：官方标题线程的预热用模型默认 reasoning.effort，
-	// 真实帧用 low（客户端行为，网关不产生标题线程请求）；这里只验 text 去掉 format。
-	if !isPrewarmFrame(frames[0]) || gjson.GetBytes(frames[0], "text.verbosity").String() != "low" {
-		t.Fatalf("预热帧形态不符: %.200s", frames[0])
+	// 预热帧与抓包的唯一差别是 effort（reasoning.effort 与 turn-metadata 的
+	// reasoning_effort）：官方标题线程的预热用模型默认 effort（medium），SDK 的
+	// 预热帧与真实帧同出一份整形（low；网关不产生标题线程请求）。把抓包的这两处
+	// 换成真实帧的值后逐字节比。
+	effort := gjson.GetBytes(frames[1], "reasoning.effort").String()
+	wantPrewarm, err := sjson.SetBytes(prewarmExpect(t, "title-prewarm.json"), "reasoning.effort", effort)
+	if err != nil {
+		t.Fatal(err)
 	}
+	official := gjson.GetBytes(loadOfficial(t, "title-prewarm.json"), "reasoning.effort").String()
+	wantPrewarm = bytes.Replace(wantPrewarm,
+		[]byte(`\"reasoning_effort\":\"`+official+`\"`), []byte(`\"reasoning_effort\":\"`+effort+`\"`), 1)
+	assertSameAsOfficial(t, "预热帧", frames[0], wantPrewarm)
 	if gjson.GetBytes(frames[0], "text.format").Exists() {
 		t.Fatalf("预热帧的 text 不得带 format: %.160s", frames[0])
 	}
@@ -464,6 +507,55 @@ func TestNoPrewarmOnReuseOrFollowup(t *testing.T) {
 		doStreamBodyPayload(t, up.client(t), state.Identity(nil, true), payload)
 		if frames := up.sentFrames(t); len(frames) != 4 || !isPrewarmFrame(frames[2]) {
 			t.Fatalf("新建连接且 First=true 时必须预热: %d 帧", len(frames))
+		}
+	})
+
+	t.Run("匿名身份", func(t *testing.T) {
+		before := ShapeStatsSnapshot()
+		up := newPrewarmUpstream(t)
+		hc := up.client(t)
+		doStreamBodyPayload(t, hc, Identity{Turn: Turn{First: true}}, payload) // 没有会话 ⇒ 匿名
+		frames := up.sentFrames(t)
+		if len(frames) != 1 || isPrewarmFrame(frames[0]) {
+			t.Fatalf("匿名身份不得预热: %d 帧", len(frames))
+		}
+		if got := ShapeStatsSnapshot().Prewarms - before.Prewarms; got != 0 {
+			t.Fatalf("Prewarms 增量 = %d, 期望 0", got)
+		}
+	})
+
+	t.Run("缓存命中但连接已死", func(t *testing.T) {
+		// 命中的连接在取用复查时已不可用 ⇒ 重拨，算新建连接 ⇒ First=true 时预热。
+		up := newPrewarmUpstream(t)
+		hc := up.client(t, WithWSConnCache(2))
+		doStreamBodyPayload(t, hc, followUpIdentity("thread-pw-dead", "", nil), payload) // 不预热、归还
+		hc.wsCache.mu.Lock()
+		if len(hc.wsCache.idles) != 1 {
+			hc.wsCache.mu.Unlock()
+			t.Fatalf("idle = %d, 期望 1", len(hc.wsCache.idles))
+		}
+		cn := hc.wsCache.idles[0].cn
+		hc.wsCache.mu.Unlock()
+		cn.terminate(io.EOF) // 连接在表里死掉（不摘表：留给取用复查发现）
+		<-cn.closeDone
+		hits, misses := hc.wsCache.hits.Load(), hc.wsCache.misses.Load()
+
+		doStreamBodyPayload(t, hc, prewarmIdentity("thread-pw-dead", nil), payload)
+		if d := hc.wsCache.hits.Load() - hits; d != 0 {
+			t.Fatalf("hits 增量 = %d, 期望 0（死连接不算命中）", d)
+		}
+		if d := hc.wsCache.misses.Load() - misses; d != 1 {
+			t.Fatalf("misses 增量 = %d, 期望 1（取用复查失败）", d)
+		}
+		if n := up.upgrades.Load(); n != 2 {
+			t.Fatalf("upgrades = %d, 期望 2（重拨）", n)
+		}
+		frames := up.sentFrames(t)
+		if len(frames) != 3 || !isPrewarmFrame(frames[1]) || isPrewarmFrame(frames[2]) {
+			t.Fatalf("死连接命中后的新连接必须先预热: %d 帧", len(frames))
+		}
+		if got := gjson.GetBytes(frames[2], "previous_response_id").String(); got != "resp_pw" {
+			t.Fatalf("真实帧 previous_response_id = %q, 期望预热响应 id", got)
 		}
 	})
 }
@@ -583,32 +675,142 @@ func TestPrewarmFailure(t *testing.T) {
 		if got := after.PrewarmRejections - before.PrewarmRejections; got != 1 {
 			t.Fatalf("PrewarmRejections 增量 = %d, 期望 1", got)
 		}
+		// 直接返回前 exchange 已收尾：连接关闭（父 ctx 是 Background、没有预算，
+		// 不收尾的话连接与 exchange ctx 永远挂着）。
+		up.waitConnClosed(t, 0, "4xx 直接返回必须收尾连接")
+		if n := up.live.Load(); n != 0 {
+			t.Fatalf("上游仍有 %d 个 handler 存活", n)
+		}
+	})
+
+	t.Run("调用方已取消不重拨", func(t *testing.T) {
+		// 失败终态已入队、调用方随后取消：不得再拨一次（白烧握手与鉴权），
+		// 按连接类失败返回，取消错误链保留。
+		before := ShapeStatsSnapshot()
+		queued := make(chan struct{})
+		var upgrades atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upgrades.Add(1)
+			c, err := coderws.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+			if _, _, rerr := c.Read(r.Context()); rerr != nil {
+				return
+			}
+			for _, f := range []string{
+				tsCreatedFrame("resp_pw"),
+				tsMetadataFrame("resp_pw", "T-held"),
+				`{"type":"response.failed","response":{"id":"resp_pw","object":"response","status":"failed"}}`,
+			} {
+				if werr := c.Write(r.Context(), coderws.MessageText, []byte(f)); werr != nil {
+					return
+				}
+			}
+			// 客户端 pump 顺序读：它回 pong 时一定已把 failed 帧入队（屏障）。
+			ctx := c.CloseRead(r.Context())
+			if c.Ping(ctx) == nil {
+				close(queued)
+			}
+			<-ctx.Done()
+		}))
+		t.Cleanup(srv.Close)
+		hc := NewHTTPClient(PAT("pat-pw"),
+			WithResponsesTransport(TransportWS),
+			WithTransport(newFixedTransport(t, "https://chatgpt.com/backend-api/codex/responses", srv.URL)),
+			WithTraceAuto(false))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// 预热 metadata 交给 Sink 时（预热读循环内、failed 帧之前）：等 failed 入队后取消。
+		sink := sinkFunc(func(string) {
+			select {
+			case <-queued:
+			case <-time.After(3 * time.Second):
+				t.Error("failed 帧入队屏障超时")
+			}
+			cancel()
+		})
+		_, err := hc.StreamBody(ctx, payload, prewarmIdentity("thread-pw-cancel-redial", sink))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("errors.Is(err, Canceled) 必须成立: %v", err)
+		}
+		var he *HTTPError
+		if errors.As(err, &he) {
+			t.Fatalf("取消不得是 *HTTPError: %v", err)
+		}
+		after := ShapeStatsSnapshot()
+		if got := after.PrewarmRedials - before.PrewarmRedials; got != 0 {
+			t.Fatalf("PrewarmRedials 增量 = %d, 期望 0（已取消不重拨）", got)
+		}
+		if got := after.PrewarmConnFailures - before.PrewarmConnFailures; got != 1 {
+			t.Fatalf("PrewarmConnFailures 增量 = %d, 期望 1", got)
+		}
+		if n := upgrades.Load(); n != 1 {
+			t.Fatalf("upgrades = %d, 期望 1", n)
+		}
 	})
 
 	for _, c := range []struct {
 		name   string
 		events []string
+		ts     string // 预热已签发、重拨后的真实帧必须照样带上的 ts（"" = 预热没给）
 	}{
 		{"response.failed", []string{
-			`{"type":"response.created","response":{"id":"resp_pw","object":"response","status":"in_progress"}}`,
+			tsCreatedFrame("resp_pw"),
+			tsMetadataFrame("resp_pw", "T-held"),
 			`{"type":"response.failed","response":{"id":"resp_pw","object":"response","status":"failed","error":{"code":"server_error","message":"boom"}}}`,
-		}},
-		{"5xx error 帧", []string{`{"type":"error","status":503,"error":{"type":"server_error","message":"unavailable"}}`}},
-		{"无状态 error 帧", []string{`{"type":"error","error":{"type":"server_error","message":"no status"}}`}},
+		}, "T-held"},
+		{"response.incomplete", []string{
+			tsCreatedFrame("resp_pw"),
+			tsMetadataFrame("resp_pw", "T-held-inc"),
+			`{"type":"response.incomplete","response":{"id":"resp_pw","object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`,
+		}, "T-held-inc"},
+		{"5xx error 帧", []string{`{"type":"error","status":503,"error":{"type":"server_error","message":"unavailable"}}`}, ""},
+		{"无状态 error 帧", []string{`{"type":"error","error":{"type":"server_error","message":"no status"}}`}, ""},
 	} {
 		t.Run("重拨-"+c.name, func(t *testing.T) {
 			before := ShapeStatsSnapshot()
 			up := newPrewarmUpstream(t)
+			gate := make(chan struct{})
 			up.script(func(conn, _ int, frame []byte) prewarmReply {
 				if isPrewarmFrame(frame) {
 					return prewarmReply{events: c.events}
 				}
-				return prewarmReply{events: []string{tsCreatedFrame("resp_real_" + strconv.Itoa(conn)), tsCompletedFrame("resp_real_" + strconv.Itoa(conn))}}
+				// 重拨后的真实帧先挂住：此刻旧连接必须已经关掉（重拨前 abandon），
+				// 而不是等 exchange 结束才被取消守卫收尾。
+				return prewarmReply{
+					events: []string{tsCreatedFrame("resp_real_" + strconv.Itoa(conn)), tsCompletedFrame("resp_real_" + strconv.Itoa(conn))},
+					gate:   gate,
+				}
 			})
 			hc := up.client(t)
-			resp, body := doStreamBodyPayload(t, hc, prewarmIdentity("thread-pw-redial", nil), payload)
-			if resp.StatusCode != http.StatusOK || !strings.Contains(body, "response.completed") {
-				t.Fatalf("重拨后必须成功: %d %q", resp.StatusCode, body)
+			var sink turnStateSink
+			var body string
+			var rerr error
+			finished := make(chan struct{})
+			var release sync.Once
+			t.Cleanup(func() { // 断言失败提前退出时也放行并等请求 goroutine 结束
+				release.Do(func() { close(gate) })
+				<-finished
+			})
+			go func() {
+				defer close(finished)
+				resp, err := hc.StreamBody(context.Background(), payload, prewarmIdentity("thread-pw-redial", &sink))
+				if err != nil {
+					rerr = err
+					return
+				}
+				defer resp.Body.Close()
+				b, err := io.ReadAll(resp.Body)
+				body, rerr = string(b), err
+			}()
+			up.waitFrames(t, 2) // 重拨后的真实帧已到上游
+			up.waitConnClosed(t, 0, "重拨前必须放弃预热失败的连接")
+			release.Do(func() { close(gate) })
+			<-finished
+			if rerr != nil || !strings.Contains(body, "response.completed") {
+				t.Fatalf("重拨后必须成功: %v %q", rerr, body)
 			}
 			if n := up.upgrades.Load(); n != 2 {
 				t.Fatalf("upgrades = %d, 期望 2（重拨一次）", n)
@@ -629,12 +831,79 @@ func TestPrewarmFailure(t *testing.T) {
 			if got := gjson.GetBytes(frames[1], "input.#").Int(); got != 1 {
 				t.Fatalf("重拨后的输入 = %d 项, 期望全量 1 项", got)
 			}
+			// 预热已拿到的 ts：交给了 Sink，重拨后的真实帧也必须带（两者一致）。
+			if got := frameTurnState(t, frames[1]); got != c.ts {
+				t.Fatalf("重拨后真实帧 ts = %q, 期望 %q（预热已签发的值）", got, c.ts)
+			}
+			if c.ts != "" {
+				if got := sink.values(); len(got) != 1 || got[0] != c.ts {
+					t.Fatalf("Sink = %v, 期望 [%s]", got, c.ts)
+				}
+			}
+			// 握手：第一次是 prewarm 形态，重拨的是 turn 形态。
+			for i, want := range []string{"prewarm", "turn"} {
+				md := up.handshakeHeaders(t, i).Get(HeaderTurnMetadata)
+				if got := gjson.Get(md, "request_kind").String(); got != want {
+					t.Fatalf("第 %d 次握手 request_kind = %q, 期望 %q: %s", i+1, got, want, md)
+				}
+			}
 			after := ShapeStatsSnapshot()
 			if got := after.PrewarmRedials - before.PrewarmRedials; got != 1 {
 				t.Fatalf("PrewarmRedials 增量 = %d, 期望 1", got)
 			}
 		})
 	}
+}
+
+// TestPrewarmResponseIDAndTurnState：预热响应 id 与 ts 的取法。
+func TestPrewarmResponseIDAndTurnState(t *testing.T) {
+	payload := []byte(`{"model":"gpt-6.1-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+
+	t.Run("completed 的 id 兜底", func(t *testing.T) {
+		// created 没给 id：真实帧链到 completed.response.id。
+		up := newPrewarmUpstream(t)
+		up.script(func(_, _ int, frame []byte) prewarmReply {
+			if isPrewarmFrame(frame) {
+				return prewarmReply{events: []string{
+					`{"type":"response.created","response":{"object":"response","status":"in_progress"}}`,
+					tsCompletedFrame("resp_late"),
+				}}
+			}
+			return prewarmReply{events: []string{tsCreatedFrame("resp_real"), tsCompletedFrame("resp_real")}}
+		})
+		doStreamBodyPayload(t, up.client(t), prewarmIdentity("thread-pw-lateid", nil), payload)
+		frames := up.sentFrames(t)
+		if len(frames) != 2 {
+			t.Fatalf("上游收到 %d 帧, 期望 2", len(frames))
+		}
+		if got := gjson.GetBytes(frames[1], "previous_response_id").String(); got != "resp_late" {
+			t.Fatalf("真实帧 previous_response_id = %q, 期望 completed 给的 resp_late", got)
+		}
+	})
+
+	t.Run("ts 取首值", func(t *testing.T) {
+		// 同一预热 response 先后给两个 ts：真实帧带第一个（官方 OnceLock）。
+		up := newPrewarmUpstream(t)
+		up.script(func(_, _ int, frame []byte) prewarmReply {
+			if isPrewarmFrame(frame) {
+				return prewarmReply{events: []string{
+					tsCreatedFrame("resp_pw"),
+					tsMetadataFrame("resp_pw", "T-first"),
+					tsMetadataFrame("resp_pw", "T-second"),
+					tsCompletedFrame("resp_pw"),
+				}}
+			}
+			return prewarmReply{events: []string{tsCreatedFrame("resp_real"), tsCompletedFrame("resp_real")}}
+		})
+		doStreamBodyPayload(t, up.client(t), prewarmIdentity("thread-pw-ts-first", nil), payload)
+		frames := up.sentFrames(t)
+		if len(frames) != 2 {
+			t.Fatalf("上游收到 %d 帧, 期望 2", len(frames))
+		}
+		if got := frameTurnState(t, frames[1]); got != "T-first" {
+			t.Fatalf("真实帧 ts = %q, 期望首值 T-first", got)
+		}
+	})
 }
 
 // TestPrewarmEventsHidden：预热事件不进返回流、不计用量；Release 只在真实帧终态后
@@ -674,14 +943,12 @@ func TestPrewarmEventsHidden(t *testing.T) {
 		_, body := doStreamBodyPayload(t, hc, prewarmIdentity("thread-pw-hidden-a", nil), []byte(`{"model":"gpt-6.1-sol","input":[]}`))
 		done <- outcome{body: body}
 	}()
-	// 预热已完成、真实帧未终态：连接不得归还（Release 只在真实帧终态后判定）。
+	// 屏障：真实帧已到上游 ⇒ 预热已读完；真实帧的事件被 gate 挂住、未终态。
+	// 此刻连接不得在缓存里（预热若调了 Release，连接会进表且 exchange 置
+	// closed，真实帧读到 EOF——下面的 "real" 断言同样会失败）。
 	up.waitFrames(t, 2)
-	deadline := time.Now().Add(2 * time.Second)
-	for cacheIdleCount(hc) != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("真实帧终态前连接被归还")
-		}
-		time.Sleep(time.Millisecond)
+	if n := cacheIdleCount(hc); n != 0 {
+		t.Fatalf("真实帧终态前连接被归还（idle=%d）", n)
 	}
 	close(gate)
 	out := <-done
@@ -693,8 +960,11 @@ func TestPrewarmEventsHidden(t *testing.T) {
 			t.Fatalf("预热事件漏进返回流（%s）: %q", leak, out.body)
 		}
 	}
-	// 预热不触发 Release，真实帧终态后恰好归还一次。
-	waitFor(t, func() bool { return cacheIdleCount(hc) == 1 }) // 真实帧终态后归还
+	// 预热不触发 Release，真实帧终态后恰好归还一次（归还在 body.Close 内同步
+	// 完成，done 收到时已在表里）。
+	if n := cacheIdleCount(hc); n != 1 {
+		t.Fatalf("真实帧终态后 idle = %d, 期望 1", n)
+	}
 
 	// 聚合臂：用量只来自真实帧。
 	var sink turnStateSink

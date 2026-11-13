@@ -181,13 +181,14 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 			return nil, fmt.Errorf("codexsdk: 获取鉴权信息失败: %w", terr)
 		}
 		if cc, ok := cache.get(key, token); ok {
-			frame, startOff := assembleWS(&sh, full)
 			e := c.activate(exchangeCtx, cancel, cc.cn, cc.key,
 				handshake{token: cc.token, bornAt: cc.bornAt}, true, sink)
 			// 复查 + 解栏。顺序是契约：解栏在写 create 帧**之前**——反过来的话，
 			// 一个响应极快的上游会在我们写完的几微秒内回帧，撞上 fenced 被判废。
+			// 全量帧在复查通过后才组装：死连接落到拨号路径时不白组装一次。
 			if cc.cn.releasable() && cc.cn.inbox.unfence() {
 				cache.hits.Add(1)
+				frame, startOff := assembleWS(&sh, full)
 				if werr := cc.cn.writeStamped(exchangeCtx, frame, startOff); werr != nil {
 					e.teardown(werr) // 写失败不重试、不重拨（create 可能已进 socket）
 					return nil, e.writeFailure(werr)
@@ -231,7 +232,8 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 		}
 		if redial {
 			// 预热响应以失败结束：这条连接不再用。重拨一次，握手为 turn 形态，
-			// 不再预热，真实帧发全量、不带 previous_response_id。
+			// 不再预热，真实帧发全量、不带 previous_response_id；预热已拿到的
+			// turn-state 照样带上（a.turnState，官方 OnceLock 重连不重置）。
 			e.abandon(io.EOF)
 			spec.prewarm = false
 			cn, hs, derr = dialConn(exchangeCtx, spec)
@@ -240,7 +242,6 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 				return nil, wsDialError(derr)
 			}
 			e = c.activate(exchangeCtx, cancel, cn, key, hs, false, sink)
-			a = full
 		}
 	}
 	frame, startOff := assembleWS(&sh, a)
@@ -268,7 +269,9 @@ func (c *HTTPClient) openWSExchange(ctx context.Context, wire []byte, id Identit
 //     不是 *HTTPError，调用方按连接错误重试 / 故障转移）；
 //   - 4xx（含 429）error 帧：上游的确定性拒绝，*HTTPError 直接返回，不重拨；
 //   - response.failed / response.incomplete、无状态或 5xx 的 error 帧：redial =
-//     true，exchange 未收尾，由调用方 abandon 后重拨。
+//     true，exchange 未收尾，由调用方 abandon 后重拨；返回的 a 不带
+//     previous_response_id、全量，但带预热已拿到的 turn-state。调用方此时已
+//     取消（exchange ctx 已结束）则不重拨，按连接类失败返回（取消错误链保留）。
 func (e *wsExchange) prewarm(sh *shapedRequest, sink TurnStateSink, real wsAssembly) (a wsAssembly, redial bool, err error) {
 	shapeStats.prewarms.Add(1)
 	frame, off := assembleWS(sh, wsAssembly{prewarm: true})
@@ -308,12 +311,19 @@ func (e *wsExchange) prewarm(sh *shapedRequest, sink TurnStateSink, real wsAssem
 				e.teardown(he)
 				return real, false, he
 			}
-			shapeStats.prewarmRedials.Add(1)
-			return real, true, nil
 		case isFailureTerminal(typ):
-			shapeStats.prewarmRedials.Add(1)
-			return real, true, nil
+		default:
+			continue
 		}
+		// 失败终态（failed / incomplete、无状态或 5xx error）：重拨。
+		if cerr := e.ctx.Err(); cerr != nil {
+			return real, false, e.prewarmConnFailure(cerr) // 调用方已放弃：不白拨一次
+		}
+		shapeStats.prewarmRedials.Add(1)
+		if held.v != "" {
+			real.turnState = held.v
+		}
+		return real, true, nil
 	}
 }
 
